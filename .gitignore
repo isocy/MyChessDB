@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+saved_positions.json
+settings.json
+admin_token.txt
+
+todo.txt
+stockfish/
