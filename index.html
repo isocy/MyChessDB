@@ -55,8 +55,8 @@
     .captured-label { width:112px; color:#bbb; flex:0 0 auto; }
     .captured-pieces { display:flex; align-items:center; flex:1; min-width:0; }
     .captured-piece-group { display:flex; align-items:center; flex:0 0 auto; }
-    .captured-piece-group + .captured-piece-group { margin-left:8px; }
-    .captured-piece { width:23px; height:23px; object-fit:contain; flex:0 0 23px; margin-left:-13px; }
+    .captured-piece-group + .captured-piece-group { margin-left:-8px; }
+    .captured-piece { width:23px; height:23px; object-fit:contain; flex:0 0 23px; margin-left:-17px; }
     .captured-piece:first-child { margin-left:0; }
     .material-advantage { margin-left:5px; color:#d9d9d9; font-variant-numeric:tabular-nums; }
     .annotation-arrow { fill:none; stroke-width:9; stroke-linecap:butt; stroke-linejoin:round; opacity:.78; filter:drop-shadow(0 1px 1px rgba(0,0,0,.4)); }
@@ -99,7 +99,7 @@
       <summary>Position and engine settings</summary>
       <label for="fen">FEN</label>
       <input id="fen">
-      <div class="row"><button id="load">Load position</button></div>
+      <div class="row"><button id="load">Load position</button><button id="copy-fen">Copy FEN</button></div>
       <label for="engine">Stockfish 19 executable (trusted build verified before use)</label>
       <input id="engine" placeholder="Full path to your Stockfish .exe">
       <label for="depth">Analysis depth (admin only; others use depth 46)</label>
@@ -289,10 +289,12 @@ function parseFen(fen, openingMoves=null, positionHistory=null) {
   const last=state.history[state.history.length-1];
   if(positionKey(snapshotFen(last))===positionKey(fen)) {
     last.board=current.board.map(row=>row.slice());
-    last.turn=current.turn; last.castling=current.castling; last.ep=current.ep; last.last=current.last;
+    last.turn=current.turn; last.castling=current.castling; last.ep=current.ep;
     last.openingTracking=current.openingTracking; last.openingMoves=current.openingMoves.slice();
     state.captured=last.captured?{w:[...last.captured.w],b:[...last.captured.b]}:{w:[],b:[]};
     if(typeof last.flipped==="boolean") state.flipped=last.flipped;
+    state.last=last.last||null;
+    current.last=state.last;
     current.lastSound=last.lastSound||"move";
     current.captured={w:[...state.captured.w],b:[...state.captured.b]};
     current.flipped=state.flipped;
@@ -390,7 +392,7 @@ function renderMaterialStatus() {
     row.appendChild(name);
     const pieces=document.createElement("span");
     pieces.className="captured-pieces";
-    for(const type of ["q","r","b","n","p"]) {
+    for(const type of ["p","n","b","r","q"]) {
       const sameType=[...state.captured[color]].filter(piece=>piece.toLowerCase()===type);
       if(!sameType.length) continue;
       const group=document.createElement("span");
@@ -971,7 +973,109 @@ async function saveAnalysisFor(fen, analysis) {
 }
 const activeJobs = new Map();
 const openingLookups = new Map();
+function analysisContextKey() { return `chessdb_analysis_context:${state.userId}`; }
+function readAnalysisContexts() {
+  try {
+    const contexts=JSON.parse(localStorage.getItem(analysisContextKey())||"{}");
+    return contexts&&typeof contexts==="object"&&!Array.isArray(contexts)?contexts:{};
+  } catch(error) {
+    console.warn("Could not read saved analysis context",error);
+    return {};
+  }
+}
+function saveAnalysisContext(jobId, job) {
+  try {
+    const contexts=readAnalysisContexts();
+    contexts[jobId]={
+      openingMoves:job.openingMoves,
+      positionHistory:job.positionHistory,
+      flipped:job.flipped
+    };
+    localStorage.setItem(analysisContextKey(),JSON.stringify(contexts));
+  } catch(error) {
+    console.warn("Could not save analysis context",error);
+  }
+}
+function removeAnalysisContext(jobId) {
+  try {
+    const contexts=readAnalysisContexts();
+    if(!Object.hasOwn(contexts,jobId)) return;
+    delete contexts[jobId];
+    localStorage.setItem(analysisContextKey(),JSON.stringify(contexts));
+  } catch(error) {
+    console.warn("Could not remove saved analysis context",error);
+  }
+}
 function jobMatchesCurrent(job) { return positionKey(job.fen)===positionKey(currentFen()); }
+async function restoreActiveAnalyses() {
+  const response=await fetch("/api/analyze",{headers:authHeaders()});
+  const jobs=await response.json();
+  if(!response.ok) throw Error(jobs.error||"Could not restore running analyses");
+  const contexts=readAnalysisContexts();
+  for(const savedJob of jobs) {
+    if(!savedJob.job_id || !savedJob.fen)
+      throw Error("The server returned an incomplete running analysis.");
+    const key=positionKey(savedJob.fen);
+    if(activeJobs.has(key)) continue;
+    const savedContext=contexts[savedJob.job_id]||{};
+    const target=savedJob.target_depth||46;
+    const depth=savedJob.depth||0;
+    const job={
+      fen:savedJob.fen,
+      flipped:typeof savedJob.flipped==="boolean"?savedJob.flipped:!!savedContext.flipped,
+      cancelled:false,
+      finished:false,
+      completed:false,
+      stockfishJobId:savedJob.job_id,
+      depth,
+      progress:savedJob.progress||0,
+      target,
+      statusText:savedJob.status==="paused"
+        ? `Paused at depth ${depth}/${target}`
+        : `Analyzing Stockfish... depth ${depth}/${target}`,
+      paused:savedJob.status==="paused",
+      openingMoves:Array.isArray(savedJob.opening_moves)
+        ? [...savedJob.opening_moves]
+        : Array.isArray(savedContext.openingMoves)?[...savedContext.openingMoves]:null,
+      positionHistory:Array.isArray(savedJob.position_history)
+        ? savedJob.position_history.map(position=>({
+          ...position,
+          board:Array.isArray(position.board)?position.board.map(row=>[...row]):[],
+          openingMoves:Array.isArray(position.openingMoves)?[...position.openingMoves]:[],
+          captured:position.captured
+            ? {w:[...(position.captured.w||[])],b:[...(position.captured.b||[])]}
+            : {w:[],b:[]}
+        }))
+        : Array.isArray(savedContext.positionHistory)
+          ? savedContext.positionHistory
+          : null
+    };
+    activeJobs.set(key,job);
+    void lookupOpeningForJob(job);
+  }
+  renderActiveJobs();
+  setAnalyzeButtonLabel();
+  syncAnalysisProgressForCurrentPosition();
+  for(const job of activeJobs.values()) {
+    if(!job.stockfishJobId || job.finished) continue;
+    void (async()=>{
+      try {
+        const analysis=await pollStockfishJob(job,job.stockfishJobId);
+        if(!analysis) return;
+        await saveAnalysisFor(job.fen,analysis);
+        completeAnalysisJob(job);
+      } catch(error) {
+        job.statusText=error.message;
+        job.finished=true;
+        updateJobProgressUI(job);
+      } finally {
+        renderActiveJobs();
+        setAnalyzeButtonLabel();
+        if(jobMatchesCurrent(job)) syncAnalysisProgressForCurrentPosition();
+      }
+    })();
+  }
+}
 function setAnalyzeButtonLabel() {
   const job=activeJobs.get(positionKey(currentFen()));
   document.querySelector("#analyze").textContent=job&&!job.finished?"Stop analysis":"Find and save best move";
@@ -986,6 +1090,7 @@ function loadJobPosition(job) {
 }
 function dismissAnalysisJob(job) {
   const key=positionKey(job.fen);
+  if(job.stockfishJobId) removeAnalysisContext(job.stockfishJobId);
   if(activeJobs.get(key)===job) activeJobs.delete(key);
   renderActiveJobs();
   setAnalyzeButtonLabel();
@@ -996,6 +1101,7 @@ function completeAnalysisJob(job) {
   job.finished=true;
   job.progress=100;
   job.statusText="Analysis complete. Best move saved.";
+  if(job.stockfishJobId) removeAnalysisContext(job.stockfishJobId);
   updateJobProgressUI(job);
 }
 function renderActiveJobs() {
@@ -1178,18 +1284,31 @@ async function analyzeWithStockfish(job, fen, target) {
   job.target=target;
   job.statusText=`Analyzing Stockfish... depth 0/${target}`;
   updateJobProgressUI(job);
-  const started=await api("/api/analyze",{fen,engine_path:document.querySelector("#engine").value,depth:target});
+  const started=await api("/api/analyze",{
+    fen,
+    engine_path:document.querySelector("#engine").value,
+    depth:target,
+    opening_moves:job.openingMoves,
+    position_history:job.positionHistory,
+    flipped:job.flipped
+  });
   job.stockfishJobId=started.job_id;
+  saveAnalysisContext(started.job_id,job);
   if(job.cancelled) {
     try { await fetch(`/api/analyze/${started.job_id}/stop`,{method:"POST",headers:authHeaders()}); } catch(e) {}
     job.statusText="Analysis stopped"; updateJobProgressUI(job);
     return null;
   }
+  return pollStockfishJob(job,started.job_id);
+}
+async function pollStockfishJob(job, jobId) {
   let d;
   for(let attempt=0;attempt<86400;attempt++){
     if(job.cancelled) { job.statusText="Analysis stopped"; updateJobProgressUI(job); return null; }
     await new Promise(r=>setTimeout(r,500));
-    d=await fetch(`/api/analyze/${started.job_id}`,{headers:authHeaders()}).then(r=>r.json());
+    const response=await fetch(`/api/analyze/${jobId}`,{headers:authHeaders()});
+    d=await response.json();
+    if(!response.ok) throw Error(d.error||"Could not retrieve Stockfish analysis progress");
     if(d.status==="running"){
       job.paused=false;
       job.depth=d.depth||0;
@@ -1207,14 +1326,29 @@ async function analyzeWithStockfish(job, fen, target) {
     }
     break;
   }
-  if(job.cancelled || d?.status==="stopped") { job.statusText="Analysis stopped"; updateJobProgressUI(job); return null; }
-  if(!d||d.status==="running") throw Error("Stockfish analysis did not finish within 12 hours");
+  if(job.cancelled || d?.status==="stopped") {
+    job.finished=true;
+    job.statusText="Analysis stopped";
+    removeAnalysisContext(jobId);
+    updateJobProgressUI(job);
+    return null;
+  }
+  if(!d||d.status==="running"||d.status==="paused") throw Error("Stockfish analysis did not finish within 12 hours");
   if(d.status==="error") throw Error(d.error);
+  if(d.status!=="complete"||!d.result) throw Error("Stockfish returned an invalid analysis status.");
   job.progress=100;
   updateJobProgressUI(job);
   return {...d.result,source:"Stockfish 19"};
 }
 document.querySelector("#load").onclick=()=>{playMoveSound("ui");try{parseFen(fenEl.value);status("Position loaded")}catch(e){status(e.message)}};
+document.querySelector("#copy-fen").onclick=async()=>{
+  try {
+    await navigator.clipboard.writeText(currentFen());
+    status("Current position FEN copied");
+  } catch(error) {
+    status(`Could not copy FEN: ${error.message}`);
+  }
+};
 document.querySelector("#history-first").onclick=()=>{showHistoryPosition(0);status("Moved to the first position");};
 document.querySelector("#history-back").onclick=()=>undoMove();
 document.querySelector("#history-forward").onclick=()=>{if(state.historyIndex<state.history.length-1){showHistoryPosition(state.historyIndex+1);status("Moved forward one position");}};
@@ -1325,7 +1459,7 @@ document.querySelector("#analyze").onclick=async()=>{
   }
 };
 document.querySelector("#remove").onclick=async()=>{try{state.saved=await api("/api/remove",{fen:currentFen()});state.savedMove=null;renderSaved();render();status("Saved move removed")}catch(e){status(e.message)}};
-(async()=>{try{await refreshSaved();await verifyAdmin();await loadSettings();parseFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");}catch(e){status(e.message);parseFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");}})();
+(async()=>{try{await refreshSaved();await verifyAdmin();await loadSettings();parseFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");await restoreActiveAnalyses();}catch(e){status(e.message);parseFen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");}})();
 </script>
 </body>
 </html>
