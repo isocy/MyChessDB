@@ -4,10 +4,11 @@
 # Run the command shown on the site, which looks like:
 #   curl -fsSL https://SITE/install.sh | MYCHESSDB_SITE=https://SITE sh
 #
-# It downloads the bridge for this computer into your home folder, checks the
-# file against the site's checksum list, adds a launcher, and starts it. The
-# bridge then downloads the official Stockfish 19 by itself. Nothing is
-# installed system-wide and no administrator rights are needed.
+# It downloads the bridge for this computer into ~/.mychessdb, checks the file
+# against the site's checksum list, adds a launcher, and starts it. The bridge
+# then downloads the official Stockfish 19 by itself. Nothing is installed
+# system-wide and no administrator rights are needed.
+# (Set MYCHESSDB_SHORTCUT=no first if you do not want the launcher.)
 set -eu
 
 site="${MYCHESSDB_SITE:-}"
@@ -29,11 +30,7 @@ case "$(uname -m)" in
 esac
 name="mychessdb-bridge-$os-$arch"
 
-if [ "$os" = darwin ]; then
-  dir="$HOME/Library/Application Support/MyChessDB"
-else
-  dir="${XDG_DATA_HOME:-$HOME/.local/share}/mychessdb"
-fi
+dir="$HOME/.mychessdb"
 mkdir -p "$dir"
 target="$dir/mychessdb-bridge"
 download="$target.download"
@@ -69,16 +66,18 @@ chmod +x "$download"
 mv -f "$download" "$target"
 
 # A launcher for next time.
-if [ "$os" = darwin ]; then
-  mkdir -p "$HOME/Applications"
-  launcher="$HOME/Applications/My Chess DB Bridge.command"
-  printf '#!/bin/sh\nexec "%s" -site "%s"\n' "$target" "$site" > "$launcher"
-  chmod +x "$launcher"
-  echo "Next time, open \"My Chess DB Bridge\" in the Applications folder inside your home folder."
-else
-  mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
-  ln -sf "$target" "$HOME/.local/bin/mychessdb-bridge"
-  cat > "$HOME/.local/share/applications/mychessdb-bridge.desktop" <<DESKTOP
+case "${MYCHESSDB_SHORTCUT:-yes}" in
+  n | N | no | NO | No) ;;
+  *)
+    if [ "$os" = darwin ]; then
+      mkdir -p "$HOME/Applications"
+      launcher="$HOME/Applications/My Chess DB Bridge.command"
+      printf '#!/bin/sh\nexec "%s" -site "%s"\n' "$target" "$site" > "$launcher"
+      chmod +x "$launcher"
+      echo "Launcher added: \"My Chess DB Bridge\" in the Applications folder inside your home folder."
+    else
+      mkdir -p "$HOME/.local/share/applications"
+      cat > "$HOME/.local/share/applications/mychessdb-bridge.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=My Chess DB Bridge
@@ -87,8 +86,14 @@ Exec="$target" -site "$site"
 Terminal=true
 Categories=Game;
 DESKTOP
-  echo "Next time, start \"My Chess DB Bridge\" from your applications menu, or run: mychessdb-bridge"
-fi
+      echo "Launcher added: \"My Chess DB Bridge\" in your applications menu."
+    fi
+    ;;
+esac
 
+echo
+echo "Installed. To start the bridge again later, run:  ~/.mychessdb/mychessdb-bridge"
 echo "Starting the bridge. Keep this window open while you analyse."
-exec "$target" -site "$site"
+# -no-open: the site is already open in the browser this command came from.
+# (The launcher does open the site.)
+exec "$target" -site "$site" -no-open

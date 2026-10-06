@@ -249,6 +249,25 @@ func TestNormalizeOrigin(t *testing.T) {
 	}
 }
 
+func TestRememberSite(t *testing.T) {
+	local, live := "http://localhost:8787", "https://chess.example"
+	cases := []struct {
+		have []string
+		add  string
+		want []string
+	}{
+		{nil, live, []string{live}},
+		{[]string{local}, live, []string{local, live}},
+		{[]string{live, local}, live, []string{local, live}}, // named again: becomes the most recent
+		{[]string{local, live}, live, []string{local, live}},
+	}
+	for _, c := range cases {
+		if got := rememberSite(c.have, c.add); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("rememberSite(%v, %q) = %v, want %v", c.have, c.add, got, c.want)
+		}
+	}
+}
+
 func TestResourceSplit(t *testing.T) {
 	totalThreads, totalHash := resourceBudget()
 	if totalThreads < 1 || totalThreads > maxTotalThreads || totalHash < 256 || totalHash > maxTotalHashMB {

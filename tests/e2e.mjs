@@ -187,9 +187,11 @@ try {
     await page.click("#analyze");
     await until(async () => (await jobTexts(page)).some(t => /engine bridge, which is not running/.test(t)), "bridge hint");
     assert.equal(await page.locator("#bridge-setup").isVisible(), true);
-    assert.equal(await text(page, "#install-windows"), `$env:MYCHESSDB_SITE='${SITE}'; iex (New-Object Net.WebClient).DownloadString('${SITE}/install.ps1')`);
+    assert.match(await text(page, "#install-windows"), new RegExp(`^\\$env:MYCHESSDB_SITE='${SITE}'; iex \\(New-Object Net\\.WebClient\\)\\.DownloadString\\('${SITE}/install\\.ps1\\?t=\\d+'\\)$`));
     assert.equal(await text(page, "#install-unix"), `curl -fsSL ${SITE}/install.sh | MYCHESSDB_SITE=${SITE} sh`);
     assert.equal(await page.locator("#safari-note").isVisible(), false, "Safari note is only for Safari");
+    assert.equal(await text(page, "#start-windows"), `& "$env:LOCALAPPDATA\\MyChessDB\\mychessdb-bridge.exe" -site ${SITE} -no-open`);
+    assert.equal(await text(page, "#start-unix"), `~/.mychessdb/mychessdb-bridge -site ${SITE} -no-open`);
     await page.click("#copy-install-unix");
     assert.equal(await page.evaluate(() => navigator.clipboard.readText()), `curl -fsSL ${SITE}/install.sh | MYCHESSDB_SITE=${SITE} sh`);
     assert.deepEqual(await apiSaved(), []);
@@ -206,7 +208,7 @@ try {
       return /Stockfish 19 ready/.test(status);
     }, "engine ready", 30000);
     assert.ok([...seen].some(s => /downloading Stockfish 19\.\.\. N%/.test(s)), `download progress was shown: ${[...seen].join(" | ")}`);
-    assert.match(await text(page, "#bridge-status"), /^Engine bridge connected · Stockfish 19 ready · \d+ threads?, \d+ MB hash$/);
+    assert.match(await text(page, "#bridge-status"), /^Engine bridge \d+\.\d+\.\d+ connected · Stockfish 19 ready · \d+ threads?, \d+ MB hash$/);
     assert.equal(await page.locator("#bridge-setup").isVisible(), false, "setup panel closes once connected");
     assert.match(bridge.output, /is installed/);
   });

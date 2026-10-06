@@ -89,12 +89,13 @@ run the install command again from the new address.
    - Windows: PowerShell
    - macOS / Linux: Terminal
 3. The bridge starts, downloads Stockfish 19 (about 80 MB) and the site shows
-   "Stockfish 19 ready". The browser may ask once whether the site may connect
-   to apps on the device; they choose Allow.
+   "Stockfish 19 ready". The browser asks once whether the site may access
+   other apps and services on the device; they choose Allow.
 
-Next time they start **My Chess DB Bridge** from the Start menu (Windows), the
-Applications folder in their home folder (macOS), or the applications menu
-(Linux), and keep its window open while analysing.
+The installer adds a "My Chess DB Bridge" launcher (Start menu shortcut on
+Windows, Applications entry on macOS and Linux) for next time; the site also
+shows a short start command. The bridge's window has to stay open while
+analysing.
 
 Nothing is installed system-wide and no administrator rights are needed.
 Because the files are fetched by a terminal command instead of being
@@ -106,8 +107,8 @@ Where things go, and how to remove them:
 | System | Bridge | Stockfish and settings |
 |---|---|---|
 | Windows | `%LOCALAPPDATA%\MyChessDB` | `%APPDATA%\MyChessDB` |
-| macOS | `~/Library/Application Support/MyChessDB` | same folder |
-| Linux | `~/.local/share/mychessdb` | `~/.config/MyChessDB` |
+| macOS | `~/.mychessdb` | `~/Library/Application Support/MyChessDB` |
+| Linux | `~/.mychessdb` | `~/.config/MyChessDB` |
 
 Deleting those folders and the launcher uninstalls it.
 

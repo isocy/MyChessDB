@@ -136,13 +136,16 @@
     <div id="bridge-bar"><span id="bridge-status">Engine bridge: not connected</span><button id="bridge-connect">Connect</button><button id="bridge-install" style="display:none">Install Stockfish 19</button></div>
     <div id="bridge-setup">
       <p>Stockfish runs on your own computer. A small helper program, the engine bridge, starts it for this site and downloads the official Stockfish 19 for you. Nothing is installed system-wide.</p>
-      <p><b>Already installed?</b> Start "My Chess DB Bridge" and this panel closes by itself. Your browser may ask once whether this site may connect to apps on your device: choose Allow.</p>
+      <p>Your browser will ask once whether this site may access other apps and services on this device. Choose <b>Allow</b>: that is how this page reaches the bridge, and the bridge only answers this site.</p>
+      <p>The first command installs and starts the bridge. Later, start it from the "My Chess DB Bridge" launcher it adds (the Start menu on Windows), or with the second command. This panel closes by itself once the bridge is running.</p>
       <p id="safari-note" style="display:none"><b>Safari cannot connect to the engine bridge.</b> Saved moves work here, but to analyse with Stockfish open this site in Chrome, Edge or Firefox.</p>
       <div class="install-boxes">
         <div id="install-windows-box"><b>Windows</b>: press Win+X, open Terminal or PowerShell, paste this and press Enter:
-          <code id="install-windows"></code><button id="copy-install-windows">Copy Windows command</button></div>
+          <code id="install-windows"></code><button id="copy-install-windows">Copy install command</button>
+          <code id="start-windows"></code><button id="copy-start-windows">Copy start command</button></div>
         <div id="install-unix-box"><b>macOS / Linux</b>: open Terminal, paste this and press Enter:
-          <code id="install-unix"></code><button id="copy-install-unix">Copy macOS / Linux command</button></div>
+          <code id="install-unix"></code><button id="copy-install-unix">Copy install command</button>
+          <code id="start-unix"></code><button id="copy-start-unix">Copy start command</button></div>
       </div>
     </div>
     <label id="active-jobs-label">Running analyses and results</label><ul id="active-jobs"></ul>

@@ -7,6 +7,7 @@
 # site's checksum list, adds a Start menu shortcut, and starts it. The bridge
 # then downloads the official Stockfish 19 by itself. Nothing is installed
 # system-wide and no administrator rights are needed.
+# (Set $env:MYCHESSDB_SHORTCUT='no' first if you do not want the shortcut.)
 & {
     $ErrorActionPreference = 'Stop'
 
@@ -28,6 +29,8 @@
     # Older Windows PowerShell does not offer TLS 1.2 unless asked.
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     $client = New-Object Net.WebClient
+    # Always fetch the current files, never a copy cached on this computer.
+    $client.CachePolicy = New-Object Net.Cache.RequestCachePolicy([Net.Cache.RequestCacheLevel]::NoCacheNoStore)
 
     Write-Host "Downloading $name ..."
     $client.DownloadFile("$site/bridge/$name", $download)
@@ -50,16 +53,22 @@
     Move-Item -Force $download $exe
 
     # A Start menu shortcut for next time.
-    $programs = [Environment]::GetFolderPath('Programs')
-    $shell = New-Object -ComObject WScript.Shell
-    $shortcut = $shell.CreateShortcut((Join-Path $programs 'My Chess DB Bridge.lnk'))
-    $shortcut.TargetPath = $exe
-    $shortcut.Arguments = "-site $site"
-    $shortcut.WorkingDirectory = $dir
-    $shortcut.Description = 'Runs Stockfish on this computer for the My Chess DB site'
-    $shortcut.Save()
+    if ($env:MYCHESSDB_SHORTCUT -notmatch '^(n|no)$') {
+        $programs = [Environment]::GetFolderPath('Programs')
+        $shell = New-Object -ComObject WScript.Shell
+        $shortcut = $shell.CreateShortcut((Join-Path $programs 'My Chess DB Bridge.lnk'))
+        $shortcut.TargetPath = $exe
+        $shortcut.Arguments = "-site $site"
+        $shortcut.WorkingDirectory = $dir
+        $shortcut.Description = 'Runs Stockfish on this computer for the My Chess DB site'
+        $shortcut.Save()
+        Write-Host 'Added "My Chess DB Bridge" to the Start menu; use it to start the bridge next time.'
+    }
 
-    Write-Host 'Installed. Next time, start "My Chess DB Bridge" from the Start menu.'
-    Write-Host 'Starting the bridge. Keep its window open while you analyse.'
-    Start-Process -FilePath $exe -ArgumentList @('-site', $site) -WorkingDirectory $dir
+    Write-Host ''
+    Write-Host 'Installed. The bridge is starting in a new window:'
+    Write-Host '  keep THAT window open while you analyse. You can close this one.'
+    # -no-open: the site is already open in the browser this command came from.
+    # (The Start menu shortcut does open the site.)
+    Start-Process -FilePath $exe -ArgumentList @('-site', $site, '-no-open') -WorkingDirectory $dir
 }

@@ -6,7 +6,7 @@
 import * as chess from "./chesslib.js";
 
 const BRIDGE_URL = "http://127.0.0.1:8765";
-const BRIDGE_MIN_VERSION = "1.0.0";
+const BRIDGE_MIN_VERSION = "1.0.2";
 
 const symbols = {K:"♔",Q:"♕",R:"♖",B:"♗",N:"♘",P:"♙",k:"♚",q:"♛",r:"♜",b:"♝",n:"♞",p:"♟"};
 const boardEl = document.querySelector("#board"), annotationLayer = document.querySelector("#annotation-layer"), fenEl = document.querySelector("#fen");
@@ -917,8 +917,12 @@ function versionAtLeast(version, minimum) {
 function installCommands() {
   const origin=location.origin;
   return {
-    windows:`$env:MYCHESSDB_SITE='${origin}'; iex (New-Object Net.WebClient).DownloadString('${origin}/install.ps1')`,
-    unix:`curl -fsSL ${origin}/install.sh | MYCHESSDB_SITE=${origin} sh`
+    // The ?t= value only makes sure a stale cached copy of the script is never used.
+    windows:`$env:MYCHESSDB_SITE='${origin}'; iex (New-Object Net.WebClient).DownloadString('${origin}/install.ps1?t=${Date.now()}')`,
+    unix:`curl -fsSL ${origin}/install.sh | MYCHESSDB_SITE=${origin} sh`,
+    // Starting an installed bridge again.
+    startWindows:`& "$env:LOCALAPPDATA\\MyChessDB\\mychessdb-bridge.exe" -site ${origin} -no-open`,
+    startUnix:`~/.mychessdb/mychessdb-bridge -site ${origin} -no-open`
   };
 }
 function renderBridge() {
@@ -945,8 +949,8 @@ function renderBridge() {
     message=`Stockfish is not installed${info.install.error?` (${info.install.error})`:""}`;
     if(info.can_install) install.style.display="";
   }
-  if(!versionAtLeast(info.version,BRIDGE_MIN_VERSION)) message+=" · bridge update available: run the install command again";
-  text.textContent=`Engine bridge connected · ${message}`;
+  if(!versionAtLeast(info.version,BRIDGE_MIN_VERSION)) message+=" · this bridge is out of date: run the install command again";
+  text.textContent=`Engine bridge ${info.version} connected · ${message}`;
   if(bridgeState.waiting){ bridgeState.waiting=false; document.querySelector("#bridge-setup").style.display="none"; }
 }
 function scheduleBridgeCheck() {
@@ -977,6 +981,8 @@ function showBridgeSetup(show=true) {
   panel.style.display=show?"block":"none";
   document.querySelector("#install-windows").textContent=commands.windows;
   document.querySelector("#install-unix").textContent=commands.unix;
+  document.querySelector("#start-windows").textContent=commands.startWindows;
+  document.querySelector("#start-unix").textContent=commands.startUnix;
   const windows=/win/i.test(navigator.userAgentData?.platform||navigator.platform||"");
   document.querySelector("#install-windows-box").style.order=windows?"0":"1";
   // Safari refuses to let a secure page talk to a program on the same
@@ -995,11 +1001,11 @@ document.querySelector("#bridge-install").onclick=async()=>{
   try { await bridge("/api/engine/install",{method:"POST"}); } catch(error) { status(error.message); }
   await checkBridge();
 };
-for(const [button,source] of [["#copy-install-windows","#install-windows"],["#copy-install-unix","#install-unix"]]) {
+for(const [button,source] of [["#copy-install-windows","#install-windows"],["#copy-install-unix","#install-unix"],["#copy-start-windows","#start-windows"],["#copy-start-unix","#start-unix"]]) {
   document.querySelector(button).onclick=async()=>{
     try {
       await navigator.clipboard.writeText(document.querySelector(source).textContent);
-      status("Install command copied");
+      status("Command copied");
     } catch(error) { status(`Could not copy: ${error.message}`); }
   };
 }

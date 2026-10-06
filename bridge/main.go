@@ -27,7 +27,7 @@ import (
 
 const (
 	appName     = "mychessdb-bridge"
-	version     = "1.0.1"
+	version     = "1.0.2"
 	defaultPort = 8765
 	maxBody     = 4 << 20
 )
@@ -283,6 +283,18 @@ func alreadyRunning(port int) bool {
 	return body.App == appName
 }
 
+// rememberSite puts origin at the end of the allowed sites (the end is the
+// most recently used one), without duplicating it.
+func rememberSite(sites []string, origin string) []string {
+	out := make([]string, 0, len(sites)+1)
+	for _, existing := range sites {
+		if existing != origin {
+			out = append(out, existing)
+		}
+	}
+	return append(out, origin)
+}
+
 type siteList []string
 
 func (l *siteList) String() string     { return strings.Join(*l, ",") }
@@ -315,14 +327,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		if err := store.update(func(data *config) {
-			for _, existing := range data.Sites {
-				if existing == origin {
-					return
-				}
-			}
-			data.Sites = append(data.Sites, origin)
-		}); err != nil {
+		if err := store.update(func(data *config) { data.Sites = rememberSite(data.Sites, origin) }); err != nil {
 			log.Fatalf("Could not save settings: %v", err)
 		}
 	}
@@ -330,6 +335,9 @@ func main() {
 	if len(cfg.Sites) == 0 {
 		log.Fatalf("No site is set. Start once with:  %s -site https://your-site-address", appName)
 	}
+	// The site to show in the browser: the one named now, or else the one
+	// used most recently.
+	openSite := cfg.Sites[len(cfg.Sites)-1]
 	if *maxJobs < 1 {
 		*maxJobs = 1
 	}
@@ -339,7 +347,7 @@ func main() {
 		if alreadyRunning(*port) {
 			logf("The bridge is already running.")
 			if !*noOpen {
-				_ = openBrowser(cfg.Sites[0])
+				_ = openBrowser(openSite)
 			}
 			return
 		}
@@ -370,7 +378,7 @@ func main() {
 		}
 	}()
 	if !*noOpen {
-		_ = openBrowser(cfg.Sites[0])
+		_ = openBrowser(openSite)
 	}
 
 	httpServer := &http.Server{Handler: srv, ReadHeaderTimeout: 10 * time.Second}

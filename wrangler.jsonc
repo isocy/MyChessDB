@@ -5,6 +5,11 @@
   "main": "worker/index.js",
   "compatibility_date": "2026-09-01",
 
+  // Publish at https://mychessdb.<subdomain>.workers.dev, without the extra
+  // per-version preview addresses.
+  "workers_dev": true,
+  "preview_urls": false,
+
   // The static site. Files in web/ are served as they are; everything else
   // (the /api/* routes) runs worker/index.js.
   "assets": {
@@ -18,7 +23,7 @@
     {
       "binding": "DB",
       "database_name": "mychessdb",
-      "database_id": "PASTE-THE-DATABASE-ID-HERE",
+      "database_id": "23b65e1f-0cca-4711-9def-6a6270f2a6c3",
       "migrations_dir": "migrations"
     }
   ],
