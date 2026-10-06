@@ -1,0 +1,7 @@
+# Files that other systems read must keep Unix line endings, whatever Git on
+# Windows is set to do: a shell script or checksum list with CRLF breaks the
+# macOS / Linux installer.
+*.sh text eol=lf
+web/bridge/SHA256SUMS text eol=lf
+web/_headers text eol=lf
+web/bridge/mychessdb-bridge-* binary

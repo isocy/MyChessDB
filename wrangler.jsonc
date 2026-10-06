@@ -1,0 +1,33 @@
+// Cloudflare deployment settings. See DEPLOY.md.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mychessdb",
+  "main": "worker/index.js",
+  "compatibility_date": "2026-09-01",
+
+  // The static site. Files in web/ are served as they are; everything else
+  // (the /api/* routes) runs worker/index.js.
+  "assets": {
+    "directory": "./web",
+    "binding": "ASSETS"
+  },
+
+  // The shared best-move database.
+  // Run `npx wrangler d1 create mychessdb` once and paste the id it prints.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "mychessdb",
+      "database_id": "PASTE-THE-DATABASE-ID-HERE",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  // Optional settings (uncomment to change the defaults):
+  // "vars": {
+  //   "MIN_DEPTH": "46",             // lowest depth accepted from non-admins
+  //   "ANON_WRITES_PER_HOUR": "60"   // saves per hour for a visitor without a key
+  // },
+
+  "observability": { "enabled": true }
+}

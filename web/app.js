@@ -1,0 +1,1695 @@
+// My Chess DB - page logic.
+//
+// Saved best moves come from this site's API (/api/*). Opening names are
+// looked up in the browser. Lichess is asked directly. Stockfish runs on the
+// user's own computer through the engine bridge at http://127.0.0.1:8765.
+import * as chess from "./chesslib.js";
+
+const BRIDGE_URL = "http://127.0.0.1:8765";
+const BRIDGE_MIN_VERSION = "1.0.0";
+
+const symbols = {K:"♔",Q:"♕",R:"♖",B:"♗",N:"♘",P:"♙",k:"♚",q:"♛",r:"♜",b:"♝",n:"♞",p:"♟"};
+const boardEl = document.querySelector("#board"), annotationLayer = document.querySelector("#annotation-layer"), fenEl = document.querySelector("#fen");
+const notationEl = document.querySelector("#notation");
+let state = { board: [], turn:"w", castling:"-", ep:"-", selected:null, last:null, lastSound:"move", captured:{w:[],b:[]}, savedMove:null, saved:[], analysis:null, history:[], historyIndex:0, openingMoves:[], openingTracking:false, flipped:false, annotations:[], annotationStart:null, suppressRightAnnotation:false, lichessRetryUntil:0, dragging:false, pointerStart:null, pointerCurrent:null, dragPreview:null, ignoreNextClick:false, savedIndex:new Map(), key: localStorage.getItem("chessdb_key")||"", role:null, roleLabel:null, minDepth:46 };
+let audioContext=null;
+function status(text) { document.querySelector("#status").textContent=text; }
+function playMoveSound(kind) {
+  try {
+    audioContext ||= new (window.AudioContext || window.webkitAudioContext)();
+    if(audioContext.state==="suspended") audioContext.resume();
+    const now=audioContext.currentTime;
+    const patterns={
+      move:[[440,0.06,0.04,0]],
+      capture:[[330,0.08,0.06,0],[220,0.12,0.07,0]],
+      castle:[[392,0.07,0.04,0],[523,0.13,0.07,0]],
+      check:[[660,0.08,0.05,0],[880,0.14,0.08,0]],
+      mate:[[660,0.08,0.06,0],[523,0.08,0.06,0],[330,0.2,0.1,0]],
+      ui:[[520,0.05,0.035,0]],
+      complete:[[523,0.16,0.05,0],[659,0.16,0.05,0.14],[784,0.18,0.06,0.28],[1047,0.6,0.07,0.44]]
+    };
+    for(const [frequency,duration,volume,offset] of patterns[kind]||patterns.move) {
+      const start=now+(offset||0);
+      const oscillator=audioContext.createOscillator();
+      const gain=audioContext.createGain();
+      oscillator.type=kind==="capture"?"square":"sine";
+      oscillator.frequency.value=frequency;
+      gain.gain.setValueAtTime(volume,start);
+      gain.gain.exponentialRampToValueAtTime(0.001,start+duration);
+      oscillator.connect(gain).connect(audioContext.destination);
+      oscillator.start(start); oscillator.stop(start+duration);
+    }
+  } catch(error) {
+    console.warn("Move sound unavailable",error);
+  }
+}
+// Same position => same key, however the en passant square was written.
+function positionKey(fen) { return chess.positionKey(fen); }
+function savedMatch(fen) { return state.savedIndex.get(positionKey(fen)); }
+function pvSan(entry) {
+  if(!entry.pv_san) {
+    try { entry.pv_san=chess.replayUci(entry.fen,entry.pv).san; } catch(error) { entry.pv_san=[]; }
+  }
+  return entry.pv_san;
+}
+function depthLabel(entry) {
+  return `Depth ${entry.depth}${entry.knodes?` | ${entry.knodes}k nodes`:""}${entry.verified?"":" · unverified"}`;
+}
+function applySavedMatch(fen) {
+  const match=savedMatch(fen);
+  state.savedMove=match?.move_uci||null;
+  if(match) {
+    notationEl.textContent=pvSan(match).join(" ");
+    document.querySelector("#evaluation").value=match.evaluation||"";
+    document.querySelector("#depth-result").value=depthLabel(match);
+  } else {
+    notationEl.textContent="";
+    document.querySelector("#evaluation").value="";
+    document.querySelector("#depth-result").value="";
+  }
+}
+function currentFen() {
+  const rows=state.board.map(row=>{let s="", empty=0; for(const p of row){if(!p) empty++; else {if(empty){s+=empty;empty=0} s+=p}} if(empty)s+=empty; return s}).join("/");
+  return `${rows} ${state.turn} ${state.castling} ${state.ep} 0 1`;
+}
+function squareName(index) { return "abcdefgh"[index%8] + (8-Math.floor(index/8)); }
+function positionSnapshot() {
+  return {
+    board:state.board.map(row=>row.slice()),
+    turn:state.turn,
+    castling:state.castling,
+    ep:state.ep,
+    last:state.last,
+    lastSound:state.lastSound,
+    captured:{w:[...state.captured.w],b:[...state.captured.b]},
+    flipped:state.flipped,
+    openingTracking:state.openingTracking,
+    openingMoves:state.openingMoves.slice()
+  };
+}
+function flipPreferenceKey() { return "chessdb_flipped_positions"; }
+function flipPreferences() {
+  try {
+    const preferences=JSON.parse(localStorage.getItem(flipPreferenceKey())||"{}");
+    return preferences&&typeof preferences==="object"&&!Array.isArray(preferences)?preferences:{};
+  }
+  catch(error) { console.warn("Could not read saved board orientations",error); return {}; }
+}
+function rememberFlipForPosition(fen=currentFen()) {
+  try {
+    const preferences=flipPreferences();
+    const key=positionKey(fen);
+    delete preferences[key];
+    preferences[key]=state.flipped;
+    while(Object.keys(preferences).length>256) delete preferences[Object.keys(preferences)[0]];
+    localStorage.setItem(flipPreferenceKey(),JSON.stringify(preferences));
+  } catch(error) { console.warn("Could not save board orientation",error); }
+}
+function snapshotFen(position) {
+  const rows=position.board.map(row=>{let s="",empty=0;for(const piece of row){if(!piece) empty++;else{if(empty){s+=empty;empty=0;}s+=piece;}}if(empty)s+=empty;return s;}).join("/");
+  return `${rows} ${position.turn} ${position.castling} ${position.ep} 0 1`;
+}
+function updateHistoryControls() {
+  document.querySelector("#history-first").disabled=state.historyIndex<=0;
+  document.querySelector("#history-back").disabled=state.historyIndex<=0;
+  document.querySelector("#history-forward").disabled=state.historyIndex>=state.history.length-1;
+  document.querySelector("#history-last").disabled=state.historyIndex>=state.history.length-1;
+}
+function showHistoryPosition(index) {
+  if(index<0||index>=state.history.length) return;
+  if(index===state.historyIndex) return;
+  const previousIndex=state.historyIndex;
+  const previousPosition=state.history[previousIndex];
+  state.historyIndex=index;
+  const position=state.history[index];
+  state.board=position.board.map(row=>row.slice());
+  state.turn=position.turn;
+  state.castling=position.castling;
+  state.ep=position.ep;
+  state.last=position.last;
+  state.lastSound=position.lastSound||"move";
+  state.captured=position.captured
+    ? {w:[...position.captured.w],b:[...position.captured.b]}
+    : {w:[],b:[]};
+  if(typeof position.flipped==="boolean") state.flipped=position.flipped;
+  state.openingTracking=position.openingTracking;
+  state.openingMoves=position.openingMoves.slice();
+  state.selected=null;
+  state.annotations=[];
+  state.annotationStart=null;
+  state.pointerStart=null;
+  state.pointerCurrent=null;
+  state.dragging=false;
+  if(state.dragPreview){state.dragPreview.remove();state.dragPreview=null;}
+  fenEl.value=currentFen();
+  applySavedMatch(fenEl.value);
+  render();
+  updateHistoryControls();
+  playMoveSound(index>previousIndex?position.lastSound||"move":previousPosition?.lastSound||"move");
+  void updateOpeningDisplay();
+}
+function parseFen(fen, openingMoves=null, positionHistory=null) {
+  const parts=fen.trim().split(/\s+/);
+  if(parts.length<4) throw Error("Invalid FEN");
+  const rows=parts[0].split("/");
+  if(rows.length!==8) throw Error("Invalid FEN board");
+  const board=[];
+  for(const row of rows) {
+    const out=[];
+    for(const c of row) c>="1"&&c<="8"?out.push(...Array(+c).fill("")):out.push(c);
+    if(out.length!==8) throw Error("Invalid FEN row");
+    board.push(out);
+  }
+  state.board=board; state.turn=parts[1]; state.castling=parts[2]; state.ep=parts[3]; state.selected=null; state.last=null; state.lastSound="move"; state.captured={w:[],b:[]}; state.analysis=null; state.savedMove=null; state.history=[];
+  const preferences=flipPreferences(), savedFlip=preferences[positionKey(fen)];
+  if(typeof savedFlip==="boolean") state.flipped=savedFlip;
+  state.openingTracking=Array.isArray(openingMoves)||positionKey(fen)===positionKey("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+  state.openingMoves=Array.isArray(openingMoves)?openingMoves.slice():[];
+  const current=positionSnapshot();
+  state.history=Array.isArray(positionHistory)&&positionHistory.length
+    ? positionHistory.map(position=>({...position,board:position.board.map(row=>row.slice()),openingMoves:Array.isArray(position.openingMoves)?[...position.openingMoves]:[],captured:position.captured?{w:[...position.captured.w],b:[...position.captured.b]}:{w:[],b:[]}}))
+    : [current];
+  const last=state.history[state.history.length-1];
+  if(positionKey(snapshotFen(last))===positionKey(fen)) {
+    last.board=current.board.map(row=>row.slice());
+    last.turn=current.turn; last.castling=current.castling; last.ep=current.ep;
+    last.openingTracking=current.openingTracking; last.openingMoves=current.openingMoves.slice();
+    state.captured=last.captured?{w:[...last.captured.w],b:[...last.captured.b]}:{w:[],b:[]};
+    if(typeof last.flipped==="boolean") state.flipped=last.flipped;
+    state.last=last.last||null;
+    current.last=state.last;
+    current.lastSound=last.lastSound||"move";
+    current.captured={w:[...state.captured.w],b:[...state.captured.b]};
+    current.flipped=state.flipped;
+    Object.assign(last,current);
+  } else {
+    state.history.push(current);
+  }
+  state.historyIndex=state.history.length-1;
+  fenEl.value=fen; applySavedMatch(fen); render(); updateHistoryControls(); void updateOpeningDisplay();
+}
+function moveSquares(uci) { return uci ? [("abcdefgh".indexOf(uci[0]) + (8-+uci[1])*8), ("abcdefgh".indexOf(uci[2]) + (8-+uci[3])*8)] : []; }
+function savedMoveSquares(uci) {
+  const squares=moveSquares(uci);
+  if(squares.length!==2) return squares;
+  const [from,to]=squares, fr=Math.floor(from/8), ff=from%8, tr=Math.floor(to/8), tf=to%8;
+  const piece=state.board[fr][ff];
+  if((piece!=="K" && piece!=="k") || fr!==tr || Math.abs(tf-ff)!==2) return squares;
+  // Castling is shown as the king and the rook it castles with.
+  return [from,fr*8+(tf>ff?7:0)];
+}
+function pieceImageUrl(piece) {
+  return `https://raw.githubusercontent.com/lichess-org/lila/master/public/piece/cburnett/${piece===piece.toUpperCase()?"w":"b"}${piece.toUpperCase()}.svg`;
+}
+function createDragPreview(piece) {
+  const preview=document.createElement("img");
+  preview.className="drag-preview";
+  preview.src=pieceImageUrl(piece);
+  document.body.appendChild(preview);
+  return preview;
+}
+function displaySquare(index) {
+  const row=Math.floor(index/8), col=index%8;
+  return state.flipped ? {row:7-row,col:7-col} : {row,col};
+}
+function annotationPoint(index) {
+  const square=displaySquare(index);
+  return {x:square.col*70+35,y:square.row*70+35};
+}
+function renderAnnotations() {
+  annotationLayer.innerHTML="";
+  annotationLayer.setAttribute("viewBox","0 0 560 560");
+  annotationLayer.setAttribute("preserveAspectRatio","none");
+  const ns="http://www.w3.org/2000/svg";
+  for(const annotation of state.annotations) {
+    const start=annotationPoint(annotation.from);
+    const color=annotation.color||"#24a148";
+    if(annotation.type==="circle") {
+      const circle=document.createElementNS(ns,"circle");
+      circle.setAttribute("class","annotation-circle");
+      circle.setAttribute("cx",start.x); circle.setAttribute("cy",start.y); circle.setAttribute("r","27");
+      circle.setAttribute("fill",color); circle.setAttribute("fill-opacity","0.2");
+      circle.setAttribute("stroke",color);
+      annotationLayer.appendChild(circle);
+      continue;
+    }
+    const end=annotationPoint(annotation.to);
+    const dx=end.x-start.x, dy=end.y-start.y, length=Math.hypot(dx,dy);
+    if(!length) continue;
+    const ux=dx/length, uy=dy/length, px=-uy, py=ux;
+    const reverse=state.annotations.some(x=>x.type==="arrow" && x.from===annotation.to && x.to===annotation.from);
+    const bend=reverse ? 12 : 0;
+    const control={x:(start.x+end.x)/2+px*bend,y:(start.y+end.y)/2+py*bend};
+    const headLength=23, headWidth=11;
+    const lineStart=start;
+    const lineEnd={x:end.x-ux*headLength,y:end.y-uy*headLength};
+    const path=document.createElementNS(ns,"path");
+    path.setAttribute("class","annotation-arrow");
+    path.setAttribute("d",`M ${lineStart.x} ${lineStart.y} Q ${control.x} ${control.y} ${lineEnd.x} ${lineEnd.y}`);
+    path.setAttribute("stroke",color);
+    annotationLayer.appendChild(path);
+    const head=document.createElementNS(ns,"polygon");
+    const base={x:end.x-ux*headLength,y:end.y-uy*headLength};
+    head.setAttribute("class","annotation-arrowhead");
+    head.setAttribute("points",`${end.x},${end.y} ${base.x+px*headWidth},${base.y+py*headWidth} ${base.x-px*headWidth},${base.y-py*headWidth}`);
+    head.setAttribute("fill",color);
+    head.setAttribute("opacity",".84");
+    annotationLayer.appendChild(head);
+  }
+}
+function renderMaterialStatus() {
+  const panel=document.querySelector("#material-status");
+  const scoreOf=piece=>({p:1,n:3,b:3,r:5,q:9}[piece.toLowerCase()]||0);
+  const material={w:0,b:0};
+  for(const piece of state.board.flat()) {
+    if(piece) material[piece===piece.toUpperCase()?"w":"b"]+=scoreOf(piece);
+  }
+  const difference=material.w-material.b;
+  const advantagedColor=difference>0?"w":difference<0?"b":null;
+  const advantage=Math.abs(difference);
+  panel.innerHTML="";
+  for(const [color,label] of [["w","White captured"],["b","Black captured"]]) {
+    const row=document.createElement("div");
+    row.className="captured-row";
+    const name=document.createElement("span"); name.className="captured-label"; name.textContent=label;
+    row.appendChild(name);
+    const pieces=document.createElement("span");
+    pieces.className="captured-pieces";
+    for(const type of ["p","n","b","r","q"]) {
+      const sameType=[...state.captured[color]].filter(piece=>piece.toLowerCase()===type);
+      if(!sameType.length) continue;
+      const group=document.createElement("span");
+      group.className="captured-piece-group";
+      group.setAttribute("aria-label",`${sameType.length} captured ${type}`);
+      for(const piece of sameType) {
+        const image=document.createElement("img");
+        image.className="captured-piece";
+        image.src=pieceImageUrl(piece);
+        image.alt=`Captured ${piece}`;
+        image.title=`Captured ${piece}`;
+        group.appendChild(image);
+      }
+      pieces.appendChild(group);
+    }
+    row.appendChild(pieces);
+    if(color===advantagedColor) {
+      const points=document.createElement("span");
+      points.className="material-advantage";
+      points.textContent=`+${advantage}`;
+      row.appendChild(points);
+    }
+    panel.appendChild(row);
+  }
+}
+function render() {
+  boardEl.innerHTML=""; const saved=savedMoveSquares(state.savedMove), last=moveSquares(state.last);
+  const legalMoves=state.selected===null ? [] : getLegalDestinations(state.selected);
+  const castleMoves=state.selected===null ? [] : getCastleHighlights(state.selected);
+  for(let display=0;display<64;display++){
+    const displayRow=Math.floor(display/8), displayCol=display%8;
+    const i=state.flipped?(7-displayRow)*8+(7-displayCol):display;
+    const piece=state.board.flat()[i], castle=castleMoves.includes(i);
+    const b=document.createElement("button");
+    b.dataset.index=String(i);
+    b.className="square "+(((displayRow+displayCol)%2)?"dark":"light");
+    b.setAttribute("aria-label",`${squareName(i)}${piece?` ${piece}`:""}`);
+    if(saved.includes(i))b.classList.add("saved");
+    if(last.includes(i)&&!castle)b.classList.add("last");
+    if(state.selected===i)b.classList.add("selected");
+    if(castle)b.classList.add("legal-castle");
+    else if(legalMoves.includes(i))b.classList.add(piece?"legal-capture":"legal-move");
+    if(piece){
+      const image=document.createElement("img");
+      image.className="piece-image"; image.src=pieceImageUrl(piece); image.alt=piece;
+      b.appendChild(image);
+    }
+    if(displayCol===0){
+      const rank=document.createElement("span");
+      rank.className="coordinate rank";
+      rank.textContent=String(8-Math.floor(i/8));
+      b.appendChild(rank);
+    }
+    if(displayRow===7){
+      const file=document.createElement("span");
+      file.className="coordinate file";
+      file.textContent="abcdefgh"[i%8];
+      b.appendChild(file);
+    }
+    b.draggable=false; b.onclick=e=>{e.preventDefault();handleSquareClick(i);};
+    b.oncontextmenu=e=>e.preventDefault(); b.onpointerdown=e=>pointerDownSquare(e,i,piece);
+    b.onpointermove=e=>pointerMoveSquare(e,i); b.onpointerup=e=>pointerUpSquare(e,i);
+    b.onpointercancel=cancelPieceDrag; boardEl.appendChild(b);
+  }
+  renderAnnotations();
+  renderMaterialStatus();
+  setAnalyzeButtonLabel();
+  syncAnalysisProgressForCurrentPosition();
+}
+function getLegalDestinations(from) {
+  const fr=Math.floor(from/8), ff=from%8, piece=state.board[fr][ff];
+  if(!piece || !isCurrentTurnPiece(piece)) return [];
+  const destinations=[];
+  for(let to=0;to<64;to++) {
+    if(to===from) continue;
+    const tr=Math.floor(to/8), tf=to%8;
+    const castling=legalCastle(piece,fr,ff,tr,tf);
+    if((castling || legalShape(piece,fr,ff,tr,tf)) &&
+       moveKeepsKingSafe(piece,fr,ff,tr,tf,castling)) {
+      destinations.push(to);
+    }
+  }
+  return destinations;
+}
+function isCurrentTurnPiece(piece) {
+  return state.turn==="w" ? piece===piece.toUpperCase() : piece===piece.toLowerCase();
+}
+function getCastleHighlights(from) {
+  const fr=Math.floor(from/8), ff=from%8, piece=state.board[fr][ff], result=[];
+  if(!piece || !isCurrentTurnPiece(piece)) return result;
+  for(const to of [from-2,from+2]) {
+    if(to>=0 && to<64 && legalCastle(piece,fr,ff,Math.floor(to/8),to%8)) {
+      result.push(to);
+      result.push(Math.floor(to/8)*8+(to%8>ff ? 5 : 3));
+    }
+  }
+  return result;
+}
+function moveKeepsKingSafe(piece,fr,ff,tr,tf,castling=false) {
+  const enPassant=legalEnPassant(piece,fr,ff,tr,tf);
+  const captured=state.board[tr][tf];
+  const enPassantCaptured=enPassant?state.board[fr][tf]:"";
+  const rookFrom=castling?(tf>ff?7:0):-1, rookTo=castling?(tf>ff?5:3):-1;
+  const rookPiece=castling?state.board[tr][rookFrom]:"";
+  const rookDestination=castling?state.board[tr][rookTo]:"";
+  state.board[tr][tf]=piece;
+  state.board[fr][ff]="";
+  if(enPassant) state.board[fr][tf]="";
+  if(castling) {
+    state.board[tr][rookTo]=rookPiece;
+    state.board[tr][rookFrom]="";
+  }
+  const safe=!isKingInCheck(piece===piece.toUpperCase()?"w":"b");
+  state.board[fr][ff]=piece;
+  state.board[tr][tf]=captured;
+  if(enPassant) state.board[fr][tf]=enPassantCaptured;
+  if(castling) {
+    state.board[tr][rookFrom]=rookPiece;
+    state.board[tr][rookTo]=rookDestination;
+  }
+  return safe;
+}
+function kingIndex(color) {
+  const king=color==="w"?"K":"k";
+  for(let i=0;i<64;i++) if(state.board[Math.floor(i/8)][i%8]===king) return i;
+  return -1;
+}
+function isKingInCheck(color) {
+  const index=kingIndex(color);
+  return index>=0 && isSquareAttacked(Math.floor(index/8),index%8,color!=="w");
+}
+function hasAnyLegalMove(color) {
+  for(let i=0;i<64;i++) {
+    const piece=state.board[Math.floor(i/8)][i%8];
+    if(piece && (color==="w" ? piece===piece.toUpperCase() : piece===piece.toLowerCase()) &&
+       getLegalDestinations(i).length) return true;
+  }
+  return false;
+}
+function updateSelectionVisual() {
+  const legalMoves=state.selected===null ? [] : getLegalDestinations(state.selected);
+  const castleMoves=state.selected===null ? [] : getCastleHighlights(state.selected);
+  const saved=savedMoveSquares(state.savedMove);
+  document.querySelectorAll("#board .square").forEach(square=>{
+    const index=Number(square.dataset.index), piece=state.board[Math.floor(index/8)][index%8];
+    const castle=castleMoves.includes(index);
+    square.classList.toggle("saved",saved.includes(index));
+    square.classList.toggle("last",state.last && moveSquares(state.last).includes(index) && !castle);
+    square.classList.toggle("selected",state.selected===index);
+    square.classList.toggle("legal-castle",castle);
+    square.classList.toggle("legal-move",legalMoves.includes(index) && !piece && !castle);
+    square.classList.toggle("legal-capture",legalMoves.includes(index) && !!piece && !castle);
+  });
+}
+function cancelPieceDrag() {
+  if(!state.dragging && !state.pointerStart) return;
+  state.dragging=false; state.pointerStart=null; state.pointerCurrent=null; state.annotationStart=null;
+  if(state.dragPreview){state.dragPreview.remove();state.dragPreview=null;}
+  state.selected=null; state.ignoreNextClick=false; render();
+}
+function cancelOnRightButton(e) {
+  if((e.buttons & 2) && (state.dragging || state.pointerStart)) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    state.suppressRightAnnotation=true;
+    cancelPieceDrag();
+    return true;
+  }
+  return false;
+}
+function pointerDownSquare(e,i,piece) {
+  e.preventDefault();
+  if(e.button===2) {
+    if(state.dragging || state.pointerStart) {
+      state.suppressRightAnnotation=true;
+      cancelPieceDrag();
+    }
+    else state.annotationStart=i;
+    return;
+  }
+  if(e.button!==0) return;
+  state.annotations=[];
+  renderAnnotations();
+  if(state.selected!==null && state.selected!==i && getLegalDestinations(state.selected).includes(i)) {
+    state.pointerStart={index:state.selected,x:e.clientX,y:e.clientY,wasSelected:false,target:i};
+    state.pointerCurrent={x:e.clientX,y:e.clientY};
+    return;
+  }
+  if(!piece) {
+    state.selected=null;
+    state.pointerStart=null;
+    state.pointerCurrent=null;
+    render();
+    return;
+  }
+  if(!isCurrentTurnPiece(piece)) {
+    state.selected=null;
+    state.pointerStart=null;
+    state.pointerCurrent=null;
+    render();
+    return;
+  }
+  state.pointerStart={index:i,x:e.clientX,y:e.clientY,wasSelected:state.selected===i};
+  state.pointerCurrent={x:e.clientX,y:e.clientY};
+  state.selected=i;
+  updateSelectionVisual();
+}
+function pointerMoveSquare(e,i) {
+  if(!state.pointerStart) return;
+  state.pointerCurrent={x:e.clientX,y:e.clientY};
+  const distance=Math.hypot(e.clientX-state.pointerStart.x,e.clientY-state.pointerStart.y);
+  if(!state.dragging && distance>=6 && !state.pointerStart.target) {
+    state.dragging=true;
+    state.dragPreview=createDragPreview(state.board.flat()[state.pointerStart.index]);
+  }
+  if(state.dragging && state.dragPreview) {
+    state.dragPreview.style.left=`${e.clientX}px`;
+    state.dragPreview.style.top=`${e.clientY}px`;
+  }
+}
+function pointerUpSquare(e,i) {
+  if(e.button===2 && state.suppressRightAnnotation) {
+    state.suppressRightAnnotation=false;
+    state.annotationStart=null;
+    return;
+  }
+  if(e.button===2 && state.annotationStart!==null) {
+    const from=state.annotationStart;
+    state.annotationStart=null;
+    const to=i;
+    const existing=state.annotations.findIndex(x=>x.from===from && (x.type==="circle" ? from===to : x.to===to));
+    if(existing>=0) state.annotations.splice(existing,1);
+    else state.annotations.push(from===to
+      ? {type:"circle",from,color:e.ctrlKey?"#e5534b":"#24a148"}
+      : {type:"arrow",from,to,color:e.ctrlKey?"#e5534b":"#24a148"});
+    renderAnnotations();
+    return;
+  }
+  if(e.button!==0 || !state.pointerStart) return;
+  const from=state.pointerStart.index, wasDragging=state.dragging, wasSelected=state.pointerStart.wasSelected, clickTarget=state.pointerStart.target;
+  const target=document.elementFromPoint(e.clientX,e.clientY)?.closest(".square");
+  const to=target ? Number(target.dataset.index) : from;
+  state.pointerStart=null; state.pointerCurrent=null; state.dragging=false;
+  if(state.dragPreview){state.dragPreview.remove();state.dragPreview=null;}
+  if(clickTarget!==undefined) movePiece(from,clickTarget);
+  else if(wasDragging && Number.isInteger(to)) movePiece(from,to);
+  else if(!wasDragging && wasSelected) {
+    state.selected=null;
+    updateSelectionVisual();
+  }
+  state.ignoreNextClick=true;
+  setTimeout(()=>{state.ignoreNextClick=false;},0);
+}
+function handleSquareClick(i) {
+  if(state.ignoreNextClick) { state.ignoreNextClick=false; return; }
+  state.annotations=[];
+  const piece=state.board[Math.floor(i/8)][i%8];
+  if(state.selected!==null && getLegalDestinations(state.selected).includes(i)) {
+    movePiece(state.selected,i);
+    return;
+  }
+  if(piece && isCurrentTurnPiece(piece)) state.selected=state.selected===i ? null : i;
+  else state.selected=null;
+  render();
+}
+boardEl.oncontextmenu=e=>{e.preventDefault();};
+boardEl.onpointerdown=e=>{
+  if(e.button===2 && state.dragging) { e.preventDefault(); cancelPieceDrag(); }
+};
+boardEl.onpointerup=e=>{
+  if(e.button===2 && state.annotationStart!==null && !e.target.closest(".square")) state.annotationStart=null;
+};
+document.addEventListener("contextmenu",e=>{
+  if(state.dragging || state.pointerStart) {
+    e.preventDefault();
+    cancelPieceDrag();
+  }
+});
+document.addEventListener("pointermove",e=>{
+  if(cancelOnRightButton(e)) return;
+  if(!state.pointerStart) return;
+  const square=document.elementFromPoint(e.clientX,e.clientY)?.closest(".square");
+  pointerMoveSquare(e,square ? Number(square.dataset.index) : -1);
+}, true);
+document.addEventListener("mousemove",e=>{
+  if(cancelOnRightButton(e)) return;
+}, true);
+document.addEventListener("pointerup",e=>{
+  if(e.button===2 && state.dragging) {
+    e.preventDefault();
+    cancelPieceDrag();
+    return;
+  }
+  if(e.button===2 && state.suppressRightAnnotation) {
+    state.suppressRightAnnotation=false;
+    state.annotationStart=null;
+    e.preventDefault();
+    return;
+  }
+  if(e.button===0 && state.pointerStart) {
+    const square=document.elementFromPoint(e.clientX,e.clientY)?.closest(".square");
+    pointerUpSquare(e,square ? Number(square.dataset.index) : -1);
+  }
+});
+document.addEventListener("pointerdown",e=>{
+  if(e.button===2 && (state.dragging || state.pointerStart)) {
+    e.preventDefault();
+    cancelPieceDrag();
+    state.suppressRightAnnotation=true;
+    e.stopImmediatePropagation();
+  }
+}, true);
+document.addEventListener("mousedown",e=>{
+  if(e.button===2 && (state.dragging || state.pointerStart)) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    state.suppressRightAnnotation=true;
+    cancelPieceDrag();
+  }
+}, true);
+window.addEventListener("mousedown",e=>{
+  if(e.button===2 && (state.dragging || state.pointerStart)) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    state.suppressRightAnnotation=true;
+    cancelPieceDrag();
+  }
+}, true);
+window.addEventListener("pointerdown",e=>{
+  if(e.button===2 && (state.dragging || state.pointerStart)) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    state.suppressRightAnnotation=true;
+    cancelPieceDrag();
+  }
+}, true);
+document.addEventListener("auxclick",e=>{
+  if(e.button===2) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }
+}, true);
+function movePiece(from,to) {
+  const fr=Math.floor(from/8), ff=from%8, tr=Math.floor(to/8), tf=to%8, piece=state.board[fr][ff];
+  if(!piece || !getLegalDestinations(from).includes(to)){state.selected=null;render();return;}
+  state.history=state.history.slice(0,state.historyIndex+1);
+  if(state.openingTracking) state.openingMoves.push(squareName(from)+squareName(to));
+  const castling=legalCastle(piece,fr,ff,tr,tf);
+  const enPassant=legalEnPassant(piece,fr,ff,tr,tf);
+  const capturedPiece=enPassant?state.board[fr][tf]:state.board[tr][tf];
+  const capture=!!capturedPiece;
+  if(capturedPiece) state.captured[state.turn].push(capturedPiece);
+  updateCastlingRights(piece,fr,ff,tr,tf);
+  state.board[tr][tf]=piece; state.board[fr][ff]="";
+  if(enPassant) state.board[fr][tf]="";
+  if(castling){
+    const rookFrom=tf>ff?7:0, rookTo=tf>ff?5:3;
+    state.board[tr][rookTo]=state.board[tr][rookFrom]; state.board[tr][rookFrom]="";
+  }
+  state.ep=(piece.toLowerCase()==="p" && Math.abs(tr-fr)===2)
+    ? squareName(from + (tr>fr?8:-8)) : "-";
+  state.last=squareName(from)+squareName(to); state.turn=state.turn==="w"?"b":"w";
+  const check=isKingInCheck(state.turn);
+  const mate=check && !hasAnyLegalMove(state.turn);
+  state.lastSound=mate?"mate":check?"check":castling?"castle":capture?"capture":"move";
+  playMoveSound(state.lastSound);
+  state.history.push(positionSnapshot());
+  state.historyIndex=state.history.length-1;
+  fenEl.value=currentFen(); applySavedMatch(fenEl.value); state.selected=null; render(); updateHistoryControls(); void updateOpeningDisplay();
+}
+function undoMove() {
+  if(state.historyIndex<=0){status("Already at the first position");return;}
+  showHistoryPosition(state.historyIndex-1);
+  status("Moved back one position");
+}
+function updateCastlingRights(piece,fr,ff,tr,tf) {
+  let rights=state.castling==="-"?"":state.castling;
+  const remove=r=>{rights=rights.replace(r,"");};
+  if(piece==="K"){remove("K");remove("Q");}
+  if(piece==="k"){remove("k");remove("q");}
+  if(piece==="R"&&fr===7&&ff===0)remove("Q");
+  if(piece==="R"&&fr===7&&ff===7)remove("K");
+  if(piece==="r"&&fr===0&&ff===0)remove("q");
+  if(piece==="r"&&fr===0&&ff===7)remove("k");
+  const captured=state.board[tr][tf];
+  if(captured==="R"&&tr===7&&tf===0)remove("Q");
+  if(captured==="R"&&tr===7&&tf===7)remove("K");
+  if(captured==="r"&&tr===0&&tf===0)remove("q");
+  if(captured==="r"&&tr===0&&tf===7)remove("k");
+  state.castling=rights||"-";
+}
+function legalCastle(p,fr,ff,tr,tf) {
+  if(!"Kk".includes(p) || fr!==tr || Math.abs(tf-ff)!==2 || state.board[tr][tf]) return false;
+  const white=p==="K", home=white?7:0, rights=white?["K","Q"]:["k","q"];
+  if(fr!==home || ff!==4) return false;
+  const kingSide=tf>ff, right=kingSide?rights[0]:rights[1], rookFile=kingSide?7:0;
+  if(!state.castling.includes(right) || state.board[home][rookFile]!== (white?"R":"r")) return false;
+  const step=kingSide?1:-1;
+  for(let c=ff+step;c!==rookFile;c+=step) if(state.board[home][c]) return false;
+  if(isSquareAttacked(home,ff,!white)) return false;
+  if(isSquareAttacked(home,ff+step,!white)) return false;
+  if(isSquareAttacked(home,tf,!white)) return false;
+  return true;
+}
+function legalEnPassant(p,fr,ff,tr,tf) {
+  if(!"Pp".includes(p) || state.ep==="-" || state.board[tr][tf]) return false;
+  const direction=p==="P"?-1:1;
+  if(tr-fr!==direction || Math.abs(tf-ff)!==1 || squareName(tr*8+tf)!==state.ep) return false;
+  return state.board[fr][tf] === (p==="P"?"p":"P");
+}
+function isSquareAttacked(row,col,byWhite) {
+  const enemy=byWhite?["P","N","B","R","Q","K"]:["p","n","b","r","q","k"];
+  const pawn=byWhite?"P":"p", pawnRow=row+(byWhite?1:-1);
+  for(const dc of [-1,1]) if(state.board[pawnRow]?.[col+dc]===pawn) return true;
+  for(const [dr,dc] of [[-2,-1],[-2,1],[-1,-2],[-1,2],[1,-2],[1,2],[2,-1],[2,1]])
+    if(enemy[1]===state.board[row+dr]?.[col+dc]) return true;
+  for(const [dr,dc,types] of [[-1,0,"RQ"],[1,0,"RQ"],[0,-1,"RQ"],[0,1,"RQ"],[-1,-1,"BQ"],[-1,1,"BQ"],[1,-1,"BQ"],[1,1,"BQ"]]) {
+    for(let r=row+dr,c=col+dc;r>=0&&r<8&&c>=0&&c<8;r+=dr,c+=dc) {
+      const piece=state.board[r][c];
+      if(piece) { if(types.includes(piece.toUpperCase()) && (byWhite?piece===piece.toUpperCase():piece===piece.toLowerCase())) return true; break; }
+    }
+  }
+  for(const dr of [-1,0,1]) for(const dc of [-1,0,1]) if((dr||dc)&&enemy[5]===state.board[row+dr]?.[col+dc]) return true;
+  return false;
+}
+function legalShape(p,fr,ff,tr,tf) {
+  const dr=tr-fr, dc=tf-ff, ad=Math.abs(dr), ac=Math.abs(dc), target=state.board[tr][tf];
+  if(target && ((p===p.toUpperCase()) === (target===target.toUpperCase()))) return false;
+  if(target && target.toLowerCase()==="k") return false;
+  if("Nn".includes(p)) return (ad===2&&ac===1)||(ad===1&&ac===2);
+  if("Kk".includes(p)) return ad<=1&&ac<=1;
+  if("Rr".includes(p) && !(dr===0||dc===0) || "Bb".includes(p) && ad!==ac || "Qq".includes(p) && !(dr===0||dc===0||ad===ac)) return false;
+  if("Pp".includes(p)) {
+    const direction=p==="P"?-1:1, startRow=p==="P"?6:1;
+    if(dc===0 && !target && dr===direction) return true;
+    if(dc===0 && !target && fr===startRow && dr===2*direction && !state.board[fr+direction][ff]) return true;
+    if(Math.abs(dc)===1 && dr===direction && !!target) {
+      return (p==="P" && target===target.toLowerCase()) || (p==="p" && target===target.toUpperCase());
+    }
+    return legalEnPassant(p,fr,ff,tr,tf);
+  }
+  const stepR=Math.sign(dr),stepC=Math.sign(dc); for(let r=fr+stepR,c=ff+stepC;r!==tr||c!==tf;r+=stepR,c+=stepC) if(state.board[r][c]) return false; return true;
+}
+// ===========================================================================
+// Cloud API (same origin): saved best moves, keys, admin tools.
+// ===========================================================================
+async function api(path, options={}) {
+  const headers={};
+  if(state.key) headers["X-Key"]=state.key;
+  if(options.body!==undefined) headers["Content-Type"]="application/json";
+  let response;
+  try {
+    response=await fetch(path,{
+      method:options.method||(options.body!==undefined?"POST":"GET"),
+      headers,
+      body:options.body!==undefined?JSON.stringify(options.body):undefined
+    });
+  } catch(error) {
+    throw Error("Could not reach the My Chess DB server. Check your internet connection.");
+  }
+  let data=null;
+  try { data=await response.json(); } catch(error) { /* not JSON */ }
+  if(!response.ok) {
+    const failure=Error(data?.error||`The server answered with status ${response.status}`);
+    failure.status=response.status; failure.code=data?.code; failure.data=data;
+    throw failure;
+  }
+  return data;
+}
+function setRoleUI() {
+  const admin=state.role==="admin";
+  document.querySelector("#remove").style.display=admin?"":"none";
+  document.querySelector("#admin-tools").style.display=admin?"":"none";
+  document.querySelector("#key-input").style.display=state.role?"none":"";
+  document.querySelector("#key-login").textContent=state.role?"🔓 Logout":"Login";
+  document.querySelector("#key-role").textContent=admin?"Admin":state.role==="contributor"?`Contributor: ${state.roleLabel||""}`:"";
+  const depthInput=document.querySelector("#depth");
+  depthInput.disabled=!admin;
+  if(!admin) depthInput.value=state.minDepth;
+  document.querySelector("#depth-label").textContent=admin
+    ? "Analysis depth"
+    : `Analysis depth (fixed at ${state.minDepth}; only the admin can change it)`;
+}
+async function loadSession() {
+  const session=await api("/api/session");
+  state.minDepth=session.min_depth;
+  if(state.key && !session.role) {
+    state.key="";
+    localStorage.removeItem("chessdb_key");
+    status("Your saved key is no longer valid; you are logged out.");
+  }
+  state.role=session.role; state.roleLabel=session.label;
+  setRoleUI();
+  return session;
+}
+document.querySelector("#key-login").onclick=async()=>{
+  if(state.role){
+    state.key=""; state.role=null; state.roleLabel=null;
+    localStorage.removeItem("chessdb_key");
+    setRoleUI();
+    status("Logged out");
+    return;
+  }
+  const input=document.querySelector("#key-input");
+  const key=input.value.trim();
+  if(!key){ status("Enter your admin token or contributor key first"); return; }
+  state.key=key;
+  try {
+    const session=await api("/api/session");
+    if(!session.role){
+      state.key="";
+      status(session.admin_configured?"That key is not recognised":"That key is not recognised (the site's admin token has not been set up yet)");
+      return;
+    }
+    localStorage.setItem("chessdb_key",key);
+    input.value="";
+    state.role=session.role; state.roleLabel=session.label; state.minDepth=session.min_depth;
+    setRoleUI();
+    status(session.role==="admin"?"Admin mode enabled":"Contributor key accepted: your analyses are saved as verified");
+  } catch(error) { state.key=""; status(error.message); }
+};
+document.querySelector("#key-input").addEventListener("keydown",e=>{ if(e.key==="Enter") document.querySelector("#key-login").click(); });
+
+async function refreshSaved() {
+  const data=await api("/api/saved");
+  state.saved=data.entries;
+  state.savedIndex=new Map(state.saved.map(entry=>[positionKey(entry.fen),entry]));
+  applySavedMatch(currentFen());
+  render();
+}
+// Sends a finished analysis to the server, which decides whether it replaces
+// what is stored. Returns {saved, reason, entry}.
+async function saveAnalysisFor(fen, analysis) {
+  const body=analysis.source==="lichess"
+    ? {fen,source:"lichess"}
+    : {fen,source:"stockfish",depth:analysis.depth,pv:analysis.pv,evaluation:analysis.evaluation};
+  const outcome=await api("/api/saved",{body});
+  await refreshSaved();
+  playMoveSound("complete");
+  return outcome;
+}
+// Would an analysis of this kind replace what is already saved? Mirrors the
+// server's rule so a long Stockfish run is not started for nothing.
+function blockedByExisting(fen, verified, depth) {
+  const existing=savedMatch(fen);
+  if(!existing) return null;
+  if(existing.verified && !verified)
+    return `A verified analysis (depth ${existing.depth}) is already saved for this position; an unverified one cannot replace it.`;
+  if(existing.verified===verified && existing.depth>=depth)
+    return `An analysis at depth ${existing.depth} is already saved for this position; depth ${depth} would not replace it.`
+      +(state.role==="admin"?" Remove the saved move first to analyse it again.":"");
+  return null;
+}
+
+// ===========================================================================
+// Opening names: looked up in the browser from /openings.json.
+// ===========================================================================
+let openingCatalog=null;
+function loadOpeningCatalog() {
+  if(!openingCatalog) {
+    openingCatalog=fetch("/openings.json")
+      .then(response=>{ if(!response.ok) throw Error("Could not load the opening names"); return response.json(); })
+      .catch(error=>{ openingCatalog=null; throw error; });
+  }
+  return openingCatalog;
+}
+async function lookupOpening(fen, moves) {
+  const catalog=await loadOpeningCatalog();
+  const pick=key=>Object.hasOwn(catalog,key)?{eco:catalog[key][0],name:catalog[key][1]}:null;
+  if(!Array.isArray(moves)) {
+    const hit=pick(positionKey(fen));
+    return {eco:hit?.eco||null,name:hit?.name||null,line:"",continuation:[]};
+  }
+  const replay=chess.replayUci(chess.START_FEN,moves);
+  let latest=null, latestPly=0;
+  replay.keys.forEach((key,index)=>{ const hit=pick(key); if(hit){ latest=hit; latestPly=index+1; } });
+  return {eco:latest?.eco||null,name:latest?.name||null,line:chess.formatSanLine(replay.san),continuation:replay.san.slice(latestPly)};
+}
+let openingRequestId=0;
+async function updateOpeningDisplay() {
+  const panel=document.querySelector("#opening-status");
+  const requestId=++openingRequestId;
+  if(!state.openingTracking){
+    panel.style.display="none";
+    return;
+  }
+  panel.style.display="block";
+  if(!state.openingMoves.length){
+    panel.textContent="Opening: Starting position";
+    return;
+  }
+  try {
+    const result=await lookupOpening(currentFen(),state.openingMoves);
+    if(requestId!==openingRequestId) return;
+    const opening=result.name
+      ? `${result.eco} · ${result.name}`
+      : "Unclassified opening";
+    panel.textContent=`Opening: ${opening}${result.line?` — ${result.line}`:""}`;
+  } catch(error) {
+    if(requestId===openingRequestId) panel.textContent=`Opening lookup failed: ${error.message}`;
+  }
+}
+
+// ===========================================================================
+// Engine bridge: the small program on the user's own computer that runs
+// Stockfish. The page only talks to it after the user has asked for it, so
+// visitors who just browse saved moves never see a local-network prompt.
+// ===========================================================================
+const bridgeState={connected:false,status:null,waiting:false,timer:null};
+const INSTALL_BUSY=["checking","downloading","unpacking","verifying"];
+async function bridge(path, options={}) {
+  let response;
+  try {
+    response=await fetch(BRIDGE_URL+path,{
+      method:options.method||(options.body!==undefined?"POST":"GET"),
+      headers:options.body!==undefined?{"Content-Type":"application/json"}:{},
+      body:options.body!==undefined?JSON.stringify(options.body):undefined
+    });
+  } catch(error) {
+    if(bridgeState.connected){ bridgeState.connected=false; bridgeState.status=null; renderBridge(); }
+    const failure=Error("The engine bridge is not running on this computer.");
+    failure.code="BRIDGE_OFFLINE";
+    throw failure;
+  }
+  let data=null;
+  try { data=await response.json(); } catch(error) { /* not JSON */ }
+  if(!response.ok) {
+    const failure=Error(data?.error||`The engine bridge answered with status ${response.status}`);
+    failure.status=response.status;
+    throw failure;
+  }
+  return data;
+}
+function versionAtLeast(version, minimum) {
+  const a=String(version).split(".").map(Number), b=minimum.split(".").map(Number);
+  for(let i=0;i<3;i++){ if((a[i]||0)!==(b[i]||0)) return (a[i]||0)>(b[i]||0); }
+  return true;
+}
+function installCommands() {
+  const origin=location.origin;
+  return {
+    windows:`$env:MYCHESSDB_SITE='${origin}'; iex (New-Object Net.WebClient).DownloadString('${origin}/install.ps1')`,
+    unix:`curl -fsSL ${origin}/install.sh | MYCHESSDB_SITE=${origin} sh`
+  };
+}
+function renderBridge() {
+  const text=document.querySelector("#bridge-status"), connect=document.querySelector("#bridge-connect");
+  const install=document.querySelector("#bridge-install"), engineInput=document.querySelector("#engine");
+  const info=bridgeState.status;
+  install.style.display="none";
+  if(!bridgeState.connected || !info) {
+    text.textContent="Engine bridge: not connected";
+    connect.style.display="";
+    connect.textContent=bridgeState.waiting?"Hide setup":"Connect";
+    engineInput.disabled=true;
+    return;
+  }
+  connect.style.display="none";
+  engineInput.disabled=false;
+  if(document.activeElement!==engineInput) engineInput.value=info.engine.path||"";
+  const state_=info.install.state;
+  let message;
+  if(info.engine.ready) message=`${info.engine.name} ready · ${info.threads} thread${info.threads===1?"":"s"}, ${info.hash} MB hash`;
+  else if(INSTALL_BUSY.includes(state_)) {
+    message=state_==="downloading"?`downloading Stockfish 19... ${info.install.progress}%`:"preparing Stockfish 19...";
+  } else {
+    message=`Stockfish is not installed${info.install.error?` (${info.install.error})`:""}`;
+    if(info.can_install) install.style.display="";
+  }
+  if(!versionAtLeast(info.version,BRIDGE_MIN_VERSION)) message+=" · bridge update available: run the install command again";
+  text.textContent=`Engine bridge connected · ${message}`;
+  if(bridgeState.waiting){ bridgeState.waiting=false; document.querySelector("#bridge-setup").style.display="none"; }
+}
+function scheduleBridgeCheck() {
+  clearTimeout(bridgeState.timer);
+  const installing=bridgeState.connected && INSTALL_BUSY.includes(bridgeState.status?.install.state);
+  if(installing || (!bridgeState.connected && bridgeState.waiting)) bridgeState.timer=setTimeout(checkBridge,2500);
+  // While connected, look again now and then so the status line notices when
+  // the bridge has been closed.
+  else if(bridgeState.connected) bridgeState.timer=setTimeout(checkBridge,10000);
+}
+async function checkBridge() {
+  const wasConnected=bridgeState.connected;
+  try {
+    bridgeState.status=await bridge("/api/status");
+    bridgeState.connected=true;
+    localStorage.setItem("chessdb_bridge_used","1");
+  } catch(error) {
+    bridgeState.connected=false; bridgeState.status=null;
+  }
+  renderBridge();
+  scheduleBridgeCheck();
+  if(bridgeState.connected && !wasConnected) void restoreActiveAnalyses().catch(error=>status(error.message));
+  return bridgeState.connected;
+}
+function showBridgeSetup(show=true) {
+  const panel=document.querySelector("#bridge-setup"), commands=installCommands();
+  bridgeState.waiting=show;
+  panel.style.display=show?"block":"none";
+  document.querySelector("#install-windows").textContent=commands.windows;
+  document.querySelector("#install-unix").textContent=commands.unix;
+  const windows=/win/i.test(navigator.userAgentData?.platform||navigator.platform||"");
+  document.querySelector("#install-windows-box").style.order=windows?"0":"1";
+  // Safari refuses to let a secure page talk to a program on the same
+  // computer, so analysing needs another browser there.
+  const safari=/Safari/.test(navigator.userAgent) && !/Chrome|Chromium|Edg|Firefox|FxiOS|CriOS/.test(navigator.userAgent);
+  document.querySelector("#safari-note").style.display=safari?"block":"none";
+  renderBridge();
+  scheduleBridgeCheck();
+}
+document.querySelector("#bridge-connect").onclick=async()=>{
+  if(bridgeState.waiting){ showBridgeSetup(false); return; }
+  document.querySelector("#bridge-status").textContent="Engine bridge: looking for it...";
+  if(!await checkBridge()) showBridgeSetup(true);
+};
+document.querySelector("#bridge-install").onclick=async()=>{
+  try { await bridge("/api/engine/install",{method:"POST"}); } catch(error) { status(error.message); }
+  await checkBridge();
+};
+for(const [button,source] of [["#copy-install-windows","#install-windows"],["#copy-install-unix","#install-unix"]]) {
+  document.querySelector(button).onclick=async()=>{
+    try {
+      await navigator.clipboard.writeText(document.querySelector(source).textContent);
+      status("Install command copied");
+    } catch(error) { status(`Could not copy: ${error.message}`); }
+  };
+}
+document.querySelector("#engine").addEventListener("change",async()=>{
+  const engineStatus=document.querySelector("#engine-status");
+  const path=document.querySelector("#engine").value.trim();
+  if(!path){ engineStatus.textContent=""; return; }
+  engineStatus.textContent="Checking executable...";
+  try {
+    const result=await bridge("/api/engine/path",{body:{engine_path:path}});
+    engineStatus.textContent=`✅ Verified: ${result.name}`;
+  } catch(error) { engineStatus.textContent=`❌ ${error.message}`; }
+  await checkBridge();
+});
+// Makes sure Stockfish can run here; explains what to do when it cannot.
+async function requireEngine() {
+  if(!await checkBridge()) {
+    showBridgeSetup(true);
+    throw Error("Stockfish runs on your own computer through the engine bridge, which is not running. See \"Engine bridge\" below.");
+  }
+  const info=bridgeState.status;
+  if(info.engine.ready) return;
+  if(INSTALL_BUSY.includes(info.install.state)) throw Error("The engine bridge is still downloading Stockfish 19. Try again when it is ready.");
+  throw Error("Stockfish 19 is not installed in the engine bridge yet. Use \"Install Stockfish 19\" below.");
+}
+
+
+const activeJobs = new Map();
+const openingLookups = new Map();
+function jobMatchesCurrent(job) { return positionKey(job.fen)===positionKey(currentFen()); }
+function setAnalyzeButtonLabel() {
+  const job=activeJobs.get(positionKey(currentFen()));
+  document.querySelector("#analyze").textContent=job&&!job.finished?"Stop analysis":"Find and save best move";
+}
+function loadJobPosition(job) {
+  parseFen(job.fen,job.openingMoves,job.positionHistory);
+  state.flipped=!!job.flipped;
+  if(state.history[state.historyIndex]) state.history[state.historyIndex].flipped=state.flipped;
+  rememberFlipForPosition(job.fen);
+  render();
+  status(job.openingName?`Loaded ${job.openingName}`:"Loaded analyzed position");
+}
+function dismissAnalysisJob(job) {
+  const key=positionKey(job.fen);
+  if(activeJobs.get(key)===job) activeJobs.delete(key);
+  renderActiveJobs();
+  setAnalyzeButtonLabel();
+  syncAnalysisProgressForCurrentPosition();
+}
+function completeAnalysisJob(job, outcome) {
+  job.completed=true;
+  job.finished=true;
+  job.progress=100;
+  job.statusText=outcome.saved
+    ? `Analysis complete. Best move saved${outcome.entry.verified?"":" (unverified)"}.`
+    : `Analysis complete. ${outcome.reason}`;
+  updateJobProgressUI(job);
+}
+function renderActiveJobs() {
+  const list=document.querySelector("#active-jobs"), label=document.querySelector("#active-jobs-label");
+  const currentKeys=new Set();
+  for(const job of activeJobs.values()){
+    const key=positionKey(job.fen);
+    currentKeys.add(key);
+    let elements=job.elements;
+    if(!elements) {
+      const li=document.createElement("li");
+      li.dataset.jobKey=key;
+      const openingButton=document.createElement("button");
+      openingButton.className="job-opening";
+      openingButton.onclick=()=>{
+        playMoveSound("ui");
+        loadJobPosition(job);
+      };
+      const statusSpan=document.createElement("span");
+      statusSpan.className="job-status";
+      li.append(openingButton,statusSpan);
+      list.appendChild(li);
+      elements=job.elements={li,openingButton,statusSpan,actionMode:null};
+    }
+    const openingText=job.openingName
+      ? `${job.openingEco} · ${job.openingName}${job.openingLine?` — ${job.openingLine}`:""}`
+      : job.openingLookupPending
+        ? "Looking up opening..."
+        : job.openingError
+          ? "Opening lookup failed"
+          : "Unclassified opening";
+    const openingTitle=`${job.openingError?`${job.openingError}\n`:""}${job.fen}`;
+    if(elements.openingButton.textContent!==openingText) elements.openingButton.textContent=openingText;
+    if(elements.openingButton.title!==openingTitle) elements.openingButton.title=openingTitle;
+    const openingLabel=`Load analyzed position: ${openingText}`;
+    if(elements.openingButton.getAttribute("aria-label")!==openingLabel)
+      elements.openingButton.setAttribute("aria-label",openingLabel);
+    const statusText=job.statusText||"Queued...";
+    if(elements.statusSpan.textContent!==statusText) elements.statusSpan.textContent=statusText;
+    const actionMode=job.awaitingCloudFallback?"fallback":job.finished?"finished":"running";
+    if(elements.actionMode!==actionMode) {
+      elements.li.querySelector(".job-actions, .job-dismiss, .job-running-actions")?.remove();
+      elements.actionMode=actionMode;
+    }
+    if(actionMode==="fallback" && !elements.li.querySelector(".job-actions")) {
+      const actions=document.createElement("span"); actions.className="job-actions";
+      const fallbackBtn=document.createElement("button");
+      fallbackBtn.textContent="Use Stockfish";
+      fallbackBtn.setAttribute("aria-label","Continue with Stockfish");
+      fallbackBtn.onclick=()=>continueWithStockfishFallback(job);
+      const dismissBtn=document.createElement("button");
+      dismissBtn.textContent="Dismiss";
+      dismissBtn.setAttribute("aria-label","Dismiss rate-limit fallback choice");
+      dismissBtn.onclick=()=>dismissCloudFallbackChoice(job);
+      actions.append(fallbackBtn,dismissBtn);
+      elements.li.appendChild(actions);
+    } else if(actionMode==="finished" && !elements.li.querySelector(".job-dismiss")) {
+      const dismissBtn=document.createElement("button");
+      dismissBtn.className="job-dismiss";
+      dismissBtn.textContent="Dismiss";
+      dismissBtn.setAttribute("aria-label","Dismiss completed analysis");
+      dismissBtn.onclick=()=>dismissAnalysisJob(job);
+      elements.li.appendChild(dismissBtn);
+    } else if(actionMode==="running") {
+      let actions=elements.li.querySelector(".job-running-actions");
+      if(!actions) {
+        actions=document.createElement("span");
+        actions.className="job-actions job-running-actions";
+        const pauseBtn=document.createElement("button");
+        pauseBtn.onclick=()=>job.paused?resumeAnalysisJob(job):pauseAnalysisJob(job);
+        const stopBtn=document.createElement("button");
+        stopBtn.textContent="Stop";
+        stopBtn.onclick=()=>stopAnalysisJob(job);
+        actions.append(pauseBtn,stopBtn);
+        elements.li.appendChild(actions);
+      }
+      const pauseBtn=actions.children[0];
+      const pauseLabel=job.paused?"Resume":"Pause";
+      if(pauseBtn.textContent!==pauseLabel) pauseBtn.textContent=pauseLabel;
+      pauseBtn.disabled=!job.stockfishJobId||job.cancelled;
+    }
+  }
+  for(const li of [...list.children])
+    if(!currentKeys.has(li.dataset.jobKey)) li.remove();
+  const hasJobs=activeJobs.size>0;
+  list.style.display=hasJobs?"block":"none";
+  label.style.display=hasJobs?"block":"none";
+}
+function syncAnalysisProgressForCurrentPosition() {
+  const job=activeJobs.get(positionKey(currentFen()));
+  const progress=document.querySelector("#analysis-progress");
+  if(job){
+    progress.style.display="block";
+    progress.value=job.progress||0;
+    status(job.statusText||"");
+  } else {
+    progress.style.display="none";
+  }
+}
+function updateJobProgressUI(job) {
+  renderActiveJobs();
+  if(jobMatchesCurrent(job)) syncAnalysisProgressForCurrentPosition();
+}
+function dismissCloudFallbackChoice(job) {
+  job.awaitingCloudFallback=false;
+  job.finished=true;
+  job.statusText=job.rateLimitMessage;
+  updateJobProgressUI(job);
+  setAnalyzeButtonLabel();
+}
+function askCloudFallback(job, message) {
+  job.awaitingCloudFallback=true;
+  job.rateLimitMessage=message;
+  job.statusText=`${message} Choose whether to continue with Stockfish.`;
+  updateJobProgressUI(job);
+}
+// Runs Stockfish through the bridge and sends the result to the server.
+async function runStockfishAndSave(job, target) {
+  const blocked=blockedByExisting(job.fen,!!state.role,target);
+  if(blocked) {
+    job.statusText=blocked;
+    job.finished=true;
+    updateJobProgressUI(job);
+    return;
+  }
+  await requireEngine();
+  const analysis=await analyzeWithStockfish(job,job.fen,target);
+  if(!analysis) return;
+  const outcome=await saveAnalysisFor(job.fen,analysis);
+  completeAnalysisJob(job,outcome);
+}
+async function continueWithStockfishFallback(job) {
+  if(job.cancelled || !job.awaitingCloudFallback) return;
+  job.awaitingCloudFallback=false;
+  job.statusText="Starting Stockfish...";
+  updateJobProgressUI(job);
+  try {
+    await runStockfishAndSave(job,job.target);
+  } catch(e) {
+    job.statusText=e.message;
+    job.finished=true;
+    updateJobProgressUI(job);
+  } finally {
+    if(!job.finished) {
+      job.finished=true;
+      if(job.cancelled) job.statusText="Analysis stopped.";
+    }
+    renderActiveJobs();
+    if(jobMatchesCurrent(job)) syncAnalysisProgressForCurrentPosition();
+    setAnalyzeButtonLabel();
+  }
+}
+async function lookupOpeningForJob(job) {
+  const key=`${positionKey(job.fen)}|${job.openingMoves?.join(" ")||""}`;
+  let lookup=openingLookups.get(key);
+  if(!lookup){
+    lookup=lookupOpening(job.fen,job.openingMoves)
+      .then(result=>({name:result.name,eco:result.eco,line:result.line}))
+      .catch(error=>({error:error.message}));
+    openingLookups.set(key,lookup);
+  }
+  job.openingLookupPending=true;
+  updateJobProgressUI(job);
+  const result=await lookup;
+  job.openingLookupPending=false;
+  if(result.error) {
+    if(openingLookups.get(key)===lookup) openingLookups.delete(key);
+    job.openingError=result.error;
+  }
+  else { job.openingName=result.name; job.openingEco=result.eco; job.openingLine=result.line; }
+  updateJobProgressUI(job);
+}
+async function stopAnalysisJob(job) {
+  if(!job || job.cancelled) return;
+  job.cancelled=true;
+  job.statusText="Stopping analysis...";
+  updateJobProgressUI(job);
+  if(job.stockfishJobId) {
+    try { await bridge(`/api/analyze/${job.stockfishJobId}/stop`,{method:"POST"}); } catch(e) {}
+  }
+}
+async function pauseAnalysisJob(job) {
+  if(!job || job.cancelled || !job.stockfishJobId || job.paused) return;
+  try {
+    await bridge(`/api/analyze/${job.stockfishJobId}/pause`,{method:"POST"});
+    job.paused=true;
+    job.statusText=`Paused at depth ${job.depth||0}/${job.target||"?"}`;
+  } catch(e) { job.statusText=e.message; }
+  updateJobProgressUI(job);
+}
+async function resumeAnalysisJob(job) {
+  if(!job || job.cancelled || !job.stockfishJobId || !job.paused) return;
+  try {
+    await bridge(`/api/analyze/${job.stockfishJobId}/resume`,{method:"POST"});
+    job.paused=false;
+    job.statusText=`Analyzing Stockfish... depth ${job.depth||0}/${job.target||"?"}`;
+  } catch(e) { job.statusText=e.message; }
+  updateJobProgressUI(job);
+}
+async function analyzeWithStockfish(job, fen, target) {
+  job.target=target;
+  job.statusText=`Analyzing Stockfish... depth 0/${target}`;
+  updateJobProgressUI(job);
+  const started=await bridge("/api/analyze",{body:{
+    fen,
+    depth:target,
+    // Kept by the bridge so a reloaded page can show the job as it was.
+    context:{openingMoves:job.openingMoves,positionHistory:job.positionHistory,flipped:job.flipped}
+  }});
+  job.stockfishJobId=started.job_id;
+  if(job.cancelled) {
+    try { await bridge(`/api/analyze/${started.job_id}/stop`,{method:"POST"}); } catch(e) {}
+    job.statusText="Analysis stopped"; updateJobProgressUI(job);
+    return null;
+  }
+  return pollStockfishJob(job,started.job_id);
+}
+async function pollStockfishJob(job, jobId) {
+  let d, failures=0;
+  for(let attempt=0;attempt<86400;attempt++){
+    if(job.cancelled) { job.statusText="Analysis stopped"; updateJobProgressUI(job); return null; }
+    await new Promise(r=>setTimeout(r,500));
+    try {
+      d=await bridge(`/api/analyze/${jobId}`);
+      failures=0;
+    } catch(error) {
+      // Ride out a short hiccup; give up if the bridge is really gone.
+      if(error.status || ++failures>=6) throw error.status?error:Error("Lost contact with the engine bridge. If it is still running, reconnect to pick the analysis up again.");
+      continue;
+    }
+    if(d.status==="running"){
+      job.paused=false;
+      job.depth=d.depth||0;
+      job.progress=d.progress||0;
+      job.statusText=`Analyzing Stockfish... depth ${job.depth}/${d.target_depth}`;
+      updateJobProgressUI(job);
+      continue;
+    }
+    if(d.status==="paused"){
+      job.paused=true;
+      job.depth=d.depth||0;
+      job.statusText=`Paused at depth ${job.depth}/${d.target_depth}`;
+      updateJobProgressUI(job);
+      continue;
+    }
+    break;
+  }
+  if(job.cancelled || d?.status==="stopped") {
+    job.finished=true;
+    job.statusText="Analysis stopped";
+    updateJobProgressUI(job);
+    return null;
+  }
+  if(!d||d.status==="running"||d.status==="paused") throw Error("Stockfish analysis did not finish within 12 hours");
+  if(d.status==="error") throw Error(d.error);
+  if(d.status!=="complete"||!d.result) throw Error("Stockfish returned an invalid analysis status.");
+  job.progress=100;
+  updateJobProgressUI(job);
+  return {source:"stockfish",depth:d.result.depth,pv:d.result.pv,evaluation:d.result.evaluation};
+}
+function clonePosition(position) {
+  return {
+    ...position,
+    board:Array.isArray(position.board)?position.board.map(row=>[...row]):[],
+    openingMoves:Array.isArray(position.openingMoves)?[...position.openingMoves]:[],
+    captured:position.captured
+      ? {w:[...(position.captured.w||[])],b:[...(position.captured.b||[])]}
+      : {w:[],b:[]}
+  };
+}
+// Picks up analyses the bridge is still running (or finished while this page
+// was closed) and carries them through to saving.
+async function restoreActiveAnalyses() {
+  const jobs=await bridge("/api/analyze");
+  for(const savedJob of jobs) {
+    if(!savedJob.job_id || !savedJob.fen) continue;
+    const key=positionKey(savedJob.fen);
+    const existing=activeJobs.get(key);
+    if(existing) {
+      if(!existing.finished || existing.completed) continue;
+      existing.elements?.li.remove();   // a job that lost contact earlier is replaced
+    }
+    const context=savedJob.context&&typeof savedJob.context==="object"?savedJob.context:{};
+    const target=savedJob.target_depth||state.minDepth;
+    const depth=savedJob.depth||0;
+    const job={
+      fen:savedJob.fen,
+      flipped:!!context.flipped,
+      cancelled:false,
+      finished:false,
+      completed:false,
+      stockfishJobId:savedJob.job_id,
+      depth,
+      progress:savedJob.progress||0,
+      target,
+      statusText:savedJob.status==="paused"
+        ? `Paused at depth ${depth}/${target}`
+        : savedJob.status==="complete"
+          ? "Collecting the finished analysis..."
+          : `Analyzing Stockfish... depth ${depth}/${target}`,
+      paused:savedJob.status==="paused",
+      openingMoves:Array.isArray(context.openingMoves)?[...context.openingMoves]:null,
+      positionHistory:Array.isArray(context.positionHistory)&&context.positionHistory.length
+        ? context.positionHistory.map(clonePosition)
+        : null
+    };
+    activeJobs.set(key,job);
+    void lookupOpeningForJob(job);
+    void (async()=>{
+      try {
+        const analysis=await pollStockfishJob(job,job.stockfishJobId);
+        if(!analysis) return;
+        const outcome=await saveAnalysisFor(job.fen,analysis);
+        completeAnalysisJob(job,outcome);
+      } catch(error) {
+        job.statusText=error.message;
+        job.finished=true;
+        updateJobProgressUI(job);
+      } finally {
+        renderActiveJobs();
+        setAnalyzeButtonLabel();
+        if(jobMatchesCurrent(job)) syncAnalysisProgressForCurrentPosition();
+      }
+    })();
+  }
+  renderActiveJobs();
+  setAnalyzeButtonLabel();
+  syncAnalysisProgressForCurrentPosition();
+}
+document.querySelector("#load").onclick=()=>{playMoveSound("ui");try{parseFen(fenEl.value);status("Position loaded")}catch(e){status(e.message)}};
+document.querySelector("#copy-fen").onclick=async()=>{
+  try {
+    await navigator.clipboard.writeText(currentFen());
+    status("Current position FEN copied");
+  } catch(error) {
+    status(`Could not copy FEN: ${error.message}`);
+  }
+};
+document.querySelector("#history-first").onclick=()=>{showHistoryPosition(0);status("Moved to the first position");};
+document.querySelector("#history-back").onclick=()=>undoMove();
+document.querySelector("#history-forward").onclick=()=>{if(state.historyIndex<state.history.length-1){showHistoryPosition(state.historyIndex+1);status("Moved forward one position");}};
+document.querySelector("#history-last").onclick=()=>{showHistoryPosition(state.history.length-1);status("Moved to the latest position");};
+document.querySelector("#board-wrap").addEventListener("wheel",e=>{
+  if(!state.history.length || !e.deltaY) return;
+  e.preventDefault();
+  const next=state.historyIndex+(e.deltaY>0?1:-1);
+  if(next!==state.historyIndex) {
+    showHistoryPosition(next);
+    status(e.deltaY>0?"Moved forward one position":"Moved back one position");
+  }
+},{passive:false});
+document.querySelector("#flip").onclick=()=>{
+  playMoveSound("ui");
+  state.flipped=!state.flipped;
+  const current=state.history[state.historyIndex];
+  if(current) current.flipped=state.flipped;
+  rememberFlipForPosition();
+  render();
+  status(state.flipped?"Board flipped":"Board restored");
+};
+// Asks Lichess for its cached evaluation straight from the browser (shown to
+// the user and used to decide whether Stockfish is needed). What gets saved
+// is fetched again by the server, so nothing here has to be trusted.
+async function cloudEval(fen) {
+  const nothing={depth:0,knodes:null,lines:[]};
+  let response;
+  try {
+    response=await fetch(`https://lichess.org/api/cloud-eval?${new URLSearchParams({fen,multiPv:"3"})}`,{headers:{Accept:"application/json"}});
+  } catch(error) {
+    return {...nothing,unreachable:true};
+  }
+  if(response.status===429) {
+    const retryAfter=Number(response.headers.get("Retry-After"));
+    const seconds=retryAfter>0?retryAfter:60;
+    state.lichessRetryUntil=Date.now()+seconds*1000;
+    const failure=Error(retryAfter>0
+      ? `Lichess Cloud rate limit. Try again in about ${seconds} seconds.`
+      : "Lichess Cloud rate limit. Lichess asks to wait about a minute before trying again.");
+    failure.code="LICHESS_RATE_LIMIT";
+    throw failure;
+  }
+  if(!response.ok) return response.status===404?nothing:{...nothing,unreachable:true};
+  let data;
+  try { data=await response.json(); } catch(error) { return {...nothing,unreachable:true}; }
+  const lines=[];
+  for(const pv of Array.isArray(data.pvs)?data.pvs:[]) {
+    const replay=chess.replayUci(fen,String(pv.moves||"").split(/\s+/).filter(Boolean));
+    if(!replay.uci.length) continue;
+    const cp=Number(pv.cp)||0;
+    lines.push({
+      move_uci:replay.uci[0],
+      pv_san:replay.san,
+      evaluation:Number.isInteger(pv.mate)?`mate ${pv.mate}`:`${cp>=0?"+":"-"}${(Math.abs(cp)/100).toFixed(2)}`
+    });
+  }
+  return {depth:Number(data.depth)||0,knodes:data.knodes,lines};
+}
+document.querySelector("#analyze").onclick=async()=>{
+  playMoveSound("ui");
+  const fen=currentFen();
+  const key=positionKey(fen);
+  const existing=activeJobs.get(key);
+  if(existing) {
+    if(!existing.finished) await stopAnalysisJob(existing);
+    else status("Dismiss the finished result before analyzing this position again.");
+    return;
+  }
+  try {
+    if(!chess.legalMoves(chess.parseFen(fen)).length){ status("The game is already over in this position."); return; }
+  } catch(error) {
+    status(`This position cannot be analysed: ${error.message}`);
+    return;
+  }
+  rememberFlipForPosition(fen);
+  const job={fen,flipped:state.flipped,cancelled:false,finished:false,completed:false,stockfishJobId:null,depth:0,progress:0,target:0,statusText:"Queued...",openingMoves:state.openingTracking?[...state.openingMoves]:null,positionHistory:state.history.slice(0,state.historyIndex+1).map(clonePosition)};
+  activeJobs.set(key,job);
+  setAnalyzeButtonLabel();
+  updateJobProgressUI(job);
+  void lookupOpeningForJob(job);
+  const target=state.role==="admin"
+    ? Math.min(245,Math.max(1,Math.floor(+document.querySelector("#depth").value)||state.minDepth))
+    : state.minDepth;
+  job.target=target;
+  try{
+    const remaining=Math.ceil((state.lichessRetryUntil-Date.now())/1000);
+    if(remaining>0) {
+      askCloudFallback(job,`Lichess Cloud rate limit. Try again in about ${remaining} seconds.`);
+      return;
+    }
+    job.statusText="Querying Lichess Cloud Evaluation...";
+    updateJobProgressUI(job);
+    let cloud;
+    try {
+      cloud=await cloudEval(fen);
+    } catch(e) {
+      if(e.code!=="LICHESS_RATE_LIMIT") throw e;
+      askCloudFallback(job,e.message);
+      return;
+    }
+    if(job.cancelled) return;
+    if(cloud.lines.length){
+      if(jobMatchesCurrent(job))
+        notationEl.textContent=cloud.lines.map(x=>`${x.pv_san.join(" ")} (${x.evaluation})`).join(" | ");
+      if(cloud.depth>=target){
+        const blocked=blockedByExisting(fen,true,cloud.depth);
+        if(blocked) {
+          job.statusText=blocked;
+          job.finished=true;
+          updateJobProgressUI(job);
+          return;
+        }
+        try {
+          // The server fetches the evaluation from Lichess itself.
+          const outcome=await saveAnalysisFor(fen,{source:"lichess"});
+          completeAnalysisJob(job,outcome);
+          return;
+        } catch(e) {
+          if(e.code==="LICHESS_RATE_LIMIT" || e.code==="LICHESS_UNAVAILABLE") {
+            askCloudFallback(job,"The server could not confirm the Lichess evaluation just now.");
+            return;
+          }
+          if(e.code!=="LICHESS_TOO_SHALLOW" && e.code!=="LICHESS_NOT_FOUND") throw e;
+          job.statusText="Lichess could not confirm that depth; starting Stockfish...";
+        }
+      } else {
+        job.statusText=`Lichess depth ${cloud.depth} is below target ${target}; starting Stockfish...`;
+      }
+    } else {
+      job.statusText=cloud.unreachable
+        ? "Lichess could not be reached; starting Stockfish..."
+        : "No suitable Lichess cache; starting Stockfish...";
+    }
+    updateJobProgressUI(job);
+    await runStockfishAndSave(job,target);
+    if(jobMatchesCurrent(job)) setTimeout(()=>{ if(!activeJobs.has(key)) syncAnalysisProgressForCurrentPosition(); },800);
+  }catch(e){
+    job.statusText=e.message;
+    job.finished=true;
+    updateJobProgressUI(job);
+  }
+  finally{
+    if(!job.finished && !job.awaitingCloudFallback) {
+      job.finished=true;
+      if(job.cancelled) job.statusText="Analysis stopped.";
+    }
+    renderActiveJobs();
+    setAnalyzeButtonLabel();
+    if(jobMatchesCurrent(job)) syncAnalysisProgressForCurrentPosition();
+  }
+};
+document.querySelector("#remove").onclick=async()=>{
+  try {
+    const result=await api("/api/remove",{body:{fen:currentFen()}});
+    await refreshSaved();
+    status(result.removed?"Saved move removed (it stays in the history and can be restored)":"There is no saved move for this position");
+  } catch(e) { status(e.message); }
+};
+
+// ===========================================================================
+// Admin tools: import, backup, contributor keys, history.
+// ===========================================================================
+function adminNote(text) { document.querySelector("#admin-note").textContent=text; }
+// Accepts the old app's saved_positions.json (SAN lines, text depth) as well
+// as a backup downloaded from this site, and turns either into what the
+// server stores.
+function toImportEntry(raw) {
+  if(!raw || typeof raw.fen!=="string") throw Error("no FEN");
+  let pv=[];
+  if(Array.isArray(raw.pv) && raw.pv.length) {
+    pv=/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(raw.pv[0])
+      ? chess.replayUci(raw.fen,raw.pv).uci
+      : chess.replaySan(raw.fen,raw.pv).uci;
+  }
+  if(!pv.length && typeof raw.move_uci==="string") pv=chess.replayUci(raw.fen,[raw.move_uci]).uci;
+  if(!pv.length) throw Error("the saved move is not legal in its position");
+  const depthText=String(raw.depth??"");
+  const depth=Number.isInteger(raw.depth)?raw.depth:Number((/(\d+)/.exec(depthText)||[])[1]);
+  if(!Number.isInteger(depth) || depth<1) throw Error("no depth");
+  const knodesMatch=/(\d+)k nodes/.exec(depthText);
+  const knodes=Number.isInteger(raw.knodes)?raw.knodes:knodesMatch?Number(knodesMatch[1]):null;
+  const source=/lichess/i.test(String(raw.source||""))?"lichess":"stockfish";
+  return {fen:raw.fen,pv,evaluation:String(raw.evaluation??""),depth,knodes,source,saved_at:raw.saved_at};
+}
+document.querySelector("#import-file").addEventListener("change",async e=>{
+  const file=e.target.files[0];
+  e.target.value="";
+  if(!file) return;
+  try {
+    const parsed=JSON.parse(await file.text());
+    const records=Array.isArray(parsed)?parsed:Array.isArray(parsed.saved)?parsed.saved:null;
+    if(!records) throw Error("This file is not a saved_positions.json or a My Chess DB backup.");
+    const entries=[], skipped=[];
+    records.forEach((raw,index)=>{
+      try { entries.push(toImportEntry(raw)); }
+      catch(error) { skipped.push(`#${index+1} ${String(raw?.fen||"").split(" ")[0]}: ${error.message}`); }
+    });
+    let stored=0, kept=0;
+    for(let start=0;start<entries.length;start+=100) {
+      adminNote(`Importing... ${start}/${entries.length}`);
+      const result=await api("/api/import",{body:{entries:entries.slice(start,start+100)}});
+      stored+=result.stored; kept+=result.kept_existing;
+      for(const item of result.invalid) skipped.push(`#${start+item.index+1} ${String(item.fen||"").split(" ")[0]}: ${item.error}`);
+    }
+    await refreshSaved();
+    adminNote(`Import finished: ${stored} stored, ${kept} already present with equal or deeper analysis, ${skipped.length} skipped.`
+      +(skipped.length?`\nSkipped:\n${skipped.join("\n")}`:""));
+  } catch(error) { adminNote(`Import failed: ${error.message}`); }
+});
+document.querySelector("#import-button").onclick=()=>document.querySelector("#import-file").click();
+document.querySelector("#export-button").onclick=async()=>{
+  try {
+    const backup=await api("/api/export");
+    const link=document.createElement("a");
+    link.href=URL.createObjectURL(new Blob([JSON.stringify(backup,null,1)],{type:"application/json"}));
+    link.download=`mychessdb-backup-${new Date().toISOString().slice(0,10)}.json`;
+    link.click();
+    setTimeout(()=>URL.revokeObjectURL(link.href),1000);
+    adminNote(`Backup downloaded: ${backup.saved.length} saved positions, ${backup.history.length} history entries.`);
+  } catch(error) { adminNote(error.message); }
+};
+async function renderKeys() {
+  const list=document.querySelector("#key-list");
+  const {keys}=await api("/api/keys");
+  list.innerHTML="";
+  if(!keys.length) { const li=document.createElement("li"); li.textContent="No contributor keys yet."; list.appendChild(li); }
+  for(const key of keys) {
+    const li=document.createElement("li");
+    const label=document.createElement("span");
+    label.className="admin-item-text";
+    label.textContent=`${key.label} · ${key.entries} saved · ${key.revoked_at?"revoked":"active"}`;
+    li.appendChild(label);
+    if(!key.revoked_at) {
+      for(const [text,demote] of [["Revoke",false],["Revoke + unverify entries",true]]) {
+        const button=document.createElement("button");
+        button.textContent=text;
+        button.onclick=async()=>{
+          try {
+            const result=await api("/api/keys/revoke",{body:{id:key.id,demote}});
+            adminNote(`Key "${key.label}" revoked${demote?`; ${result.demoted} of its entries are now unverified`:""}.`);
+            await renderKeys(); await refreshSaved();
+          } catch(error) { adminNote(error.message); }
+        };
+        li.appendChild(button);
+      }
+    }
+    list.appendChild(li);
+  }
+}
+document.querySelector("#keys-button").onclick=()=>renderKeys().catch(error=>adminNote(error.message));
+document.querySelector("#new-key-button").onclick=async()=>{
+  const input=document.querySelector("#new-key-label");
+  try {
+    const created=await api("/api/keys",{body:{label:input.value}});
+    input.value="";
+    adminNote(`Key for "${created.label}" (shown only once, copy it now):\n${created.key}`);
+    await renderKeys();
+  } catch(error) { adminNote(error.message); }
+};
+document.querySelector("#history-button").onclick=async()=>{
+  const list=document.querySelector("#history-list");
+  try {
+    const fen=currentFen();
+    const {history}=await api(`/api/history?fen=${encodeURIComponent(fen)}`);
+    list.innerHTML="";
+    if(!history.length) { const li=document.createElement("li"); li.textContent="No history for this position."; list.appendChild(li); }
+    for(const item of history) {
+      const li=document.createElement("li");
+      const label=document.createElement("span");
+      label.className="admin-item-text";
+      let san=item.move_uci;
+      try { san=chess.replayUci(item.fen,item.pv).san[0]||item.move_uci; } catch(error) { /* keep UCI */ }
+      label.textContent=`${san} · ${item.evaluation} · depth ${item.depth} · ${item.source}${item.verified?"":" · unverified"} · ${item.reason} ${item.archived_at.slice(0,16).replace("T"," ")}`;
+      const button=document.createElement("button");
+      button.textContent="Restore";
+      button.onclick=async()=>{
+        try {
+          await api("/api/restore",{body:{id:item.id}});
+          await refreshSaved();
+          adminNote(`Restored ${san} (depth ${item.depth}) for this position.`);
+          document.querySelector("#history-button").click();
+        } catch(error) { adminNote(error.message); }
+      };
+      li.append(label,button);
+      list.appendChild(li);
+    }
+  } catch(error) { adminNote(error.message); }
+};
+
+(async()=>{
+  parseFen(chess.START_FEN);
+  try {
+    await loadSession();
+    await refreshSaved();
+  } catch(e) { status(e.message); }
+  // Only look for the bridge by ourselves if this browser has used it before.
+  if(localStorage.getItem("chessdb_bridge_used")) await checkBridge();
+})();

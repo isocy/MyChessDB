@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>My Chess DB</title>
+  <link rel="icon" href="data:,">
+  <style>
+    :root { color-scheme: dark; --bg:#171717; --panel:#242424; --light:#f0d9b5; --dark:#b58863; }
+    * { box-sizing:border-box; }
+    body { margin:0; font:14px Segoe UI, sans-serif; background:var(--bg); color:#eee; }
+    main { display:flex; gap:18px; padding:18px; max-width:1160px; margin:auto; }
+    #board { display:grid; grid-template-columns:repeat(8,70px); grid-template-rows:repeat(8,70px); width:560px; height:560px; }
+    #board-wrap { position:relative; width:560px; height:560px; }
+    #annotation-layer { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+    .board-tools { width:560px; display:flex; justify-content:flex-end; margin-bottom:6px; }
+    .board-tools button { padding:5px 10px; }
+    #opening-status { display:none; width:560px; margin-top:8px; padding:8px 10px; background:var(--panel); border-radius:4px; color:#c8d8ff; overflow-wrap:anywhere; }
+    .history-controls { width:560px; display:flex; gap:6px; margin-top:8px; }
+    .history-controls button { flex:1; font-size:20px; line-height:1; padding:6px; }
+    .square { border:0; cursor:pointer; display:flex; align-items:center; justify-content:center; line-height:1; user-select:none; touch-action:none; }
+    .piece-image { width:100%; height:100%; object-fit:contain; transform:scale(1.14); pointer-events:none; }
+    .drag-preview { position:fixed; width:62px; height:62px; pointer-events:none; z-index:10; transform:translate(-50%,-50%) scale(1.14); }
+    .light { background:var(--light); } .dark { background:var(--dark); }
+    .last { background:#c9e6ff !important; }
+    .saved { background:#72d572 !important; }
+    .selected { background:#f6f669 !important; }
+    .saved.selected { background:#f6f669 !important; }
+    .coordinate { position:absolute; z-index:2; font:700 11px/1 Segoe UI,sans-serif; pointer-events:none; }
+    .coordinate.rank { top:3px; left:4px; }
+    .coordinate.file { right:4px; bottom:3px; }
+    .square.dark .coordinate { color:#f0d9b5; }
+    .square.light .coordinate { color:#b58863; }
+    .legal-move { box-shadow:inset 0 0 0 5px rgba(55,170,75,.78); }
+    .legal-capture { box-shadow:inset 0 0 0 5px rgba(55,170,75,.9); }
+    .legal-move::after { content:""; width:16px; height:16px; border-radius:50%; background:rgba(55,170,75,.78); }
+    .legal-capture::after { content:""; position:absolute; inset:5px; border:5px solid rgba(55,170,75,.82); border-radius:50%; }
+    .legal-castle { box-shadow:inset 0 0 0 5px rgba(55,170,75,.78); }
+    .legal-castle::after { content:""; width:16px; height:16px; border-radius:50%; background:rgba(55,170,75,.78); }
+    .square { position:relative; }
+    aside { width:460px; background:var(--panel); padding:16px; border-radius:6px; }
+    input, button { font:inherit; padding:8px; border-radius:4px; border:1px solid #555; }
+    input { width:100%; background:#151515; color:#eee; } button { cursor:pointer; background:#363636; color:#fff; }
+    button:hover { background:#4b4b4b; } .row { display:flex; gap:8px; margin:7px 0; } .row button { flex:1; }
+    label { display:block; margin-top:10px; color:#bbb; } .status { color:#9bd49b; min-height:20px; margin-top:10px; }
+    #active-jobs-label { display:none; margin-top:14px; }
+    #active-jobs { display:none; list-style:none; padding:0; margin:0; }
+    #active-jobs li { display:flex; align-items:center; gap:6px; background:#1c1c1c; padding:6px 8px; border-radius:4px; margin:4px 0; font-size:12px; }
+    #active-jobs li .job-opening { flex:0 1 190px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; text-align:left; }
+    #active-jobs li .job-status { flex:1; color:#9bd49b; }
+    #active-jobs li button { padding:3px 8px; flex:0 0 auto; }
+    #active-jobs li .job-actions { display:flex; gap:4px; flex:0 0 auto; }
+    #material-status { width:560px; margin-top:8px; padding:8px 10px; background:var(--panel); border-radius:4px; }
+    .captured-row { display:flex; align-items:center; gap:0; min-height:24px; }
+    .captured-label { width:112px; color:#bbb; flex:0 0 auto; }
+    .captured-pieces { display:flex; align-items:center; flex:1; min-width:0; }
+    .captured-piece-group { display:flex; align-items:center; flex:0 0 auto; }
+    .captured-piece-group + .captured-piece-group { margin-left:-8px; }
+    .captured-piece { width:23px; height:23px; object-fit:contain; flex:0 0 23px; margin-left:-17px; }
+    .captured-piece:first-child { margin-left:0; }
+    .material-advantage { margin-left:5px; color:#d9d9d9; font-variant-numeric:tabular-nums; }
+    .annotation-arrow { fill:none; stroke-width:9; stroke-linecap:butt; stroke-linejoin:round; opacity:.78; filter:drop-shadow(0 1px 1px rgba(0,0,0,.4)); }
+    .annotation-circle { stroke-width:3; opacity:.88; }
+    @media (max-width: 1080px) {
+      main { flex-direction:column; align-items:center; }
+      aside { width:min(100%,560px); }
+    }
+    .notation { min-height:40px; padding:8px; background:#151515; color:#eee; word-break:break-word; }
+    #analysis-progress { width:100%; height:18px; display:none; }
+    small { color:#aaa; }
+    .key-role { color:#9bd49b; align-self:center; white-space:nowrap; }
+    #bridge-bar { display:flex; align-items:center; gap:8px; margin-top:8px; font-size:12px; color:#bbb; }
+    #bridge-bar span { flex:1; min-width:0; overflow-wrap:anywhere; }
+    #bridge-bar button { padding:3px 8px; flex:0 0 auto; }
+    #bridge-setup { display:none; background:#1c1c1c; padding:4px 10px 10px; border-radius:4px; margin-top:6px; font-size:12px; }
+    #bridge-setup .install-boxes { display:flex; flex-direction:column; gap:10px; }
+    #bridge-setup code { display:block; background:#111; padding:6px; border-radius:4px; word-break:break-all; user-select:all; margin:4px 0; }
+    #bridge-setup button { padding:3px 8px; }
+    #admin-tools { margin-top:12px; border-top:1px solid #444; padding-top:2px; }
+    #admin-tools ul { list-style:none; padding:0; margin:4px 0; }
+    #admin-tools li { display:flex; align-items:center; gap:6px; background:#1c1c1c; padding:4px 8px; border-radius:4px; margin:3px 0; font-size:12px; }
+    #admin-tools li button { padding:3px 8px; flex:0 0 auto; }
+    .admin-item-text { flex:1; min-width:0; overflow-wrap:anywhere; }
+    #admin-note { white-space:pre-wrap; overflow-wrap:anywhere; color:#9bd49b; font-size:12px; min-height:16px; margin-top:6px; user-select:text; }
+  </style>
+</head>
+<body>
+<main>
+  <section>
+    <div class="board-tools"><button id="flip">↻ Flip board</button></div>
+    <div id="board-wrap">
+      <div id="board" aria-label="Chess board"></div>
+      <svg id="annotation-layer" aria-hidden="true"></svg>
+    </div>
+    <div id="material-status" aria-live="polite"></div>
+    <div class="history-controls" aria-label="Move navigation">
+      <button id="history-first" aria-label="Go to first position" title="Go to first position">|◀</button>
+      <button id="history-back" aria-label="Go back one move" title="Go back one move">◀</button>
+      <button id="history-forward" aria-label="Go forward one move" title="Go forward one move">▶</button>
+      <button id="history-last" aria-label="Go to latest position" title="Go to latest position">▶|</button>
+    </div>
+    <div id="opening-status" role="status" aria-live="polite">Opening: Starting position</div>
+    <small>Scroll over the board to move through the current history.</small><br>
+    <small>Right-click a square or drag to annotate; hold Ctrl for red annotations.</small><br>
+    <small>Green squares show the saved best move automatically.</small>
+  </section>
+  <aside>
+    <div class="row" id="key-bar" title="Optional. A key marks the analyses you save as verified; the admin token also unlocks the admin tools.">
+      <input id="key-input" type="password" placeholder="Admin token or contributor key (optional)" style="flex:1" autocomplete="off">
+      <span id="key-role" class="key-role"></span>
+      <button id="key-login">Login</button>
+    </div>
+    <details id="advanced-settings">
+      <summary>Position and engine settings</summary>
+      <label for="fen">FEN</label>
+      <input id="fen">
+      <div class="row"><button id="load">Load position</button><button id="copy-fen">Copy FEN</button></div>
+      <label for="engine">Stockfish 19 executable (optional: only to use a copy you already have)</label>
+      <input id="engine" placeholder="Leave empty: the engine bridge downloads Stockfish 19 for you" disabled>
+      <div id="engine-status" class="status"></div>
+      <label for="depth" id="depth-label">Analysis depth</label>
+      <input id="depth" type="number" min="8" max="60" value="46" disabled>
+      <div class="row"><button id="remove" style="display:none">Remove saved move</button></div>
+      <div id="admin-tools" style="display:none">
+        <label>Admin tools</label>
+        <div class="row"><button id="import-button">Import saved_positions.json or backup</button><button id="export-button">Download backup</button></div>
+        <input id="import-file" type="file" accept=".json,application/json" style="display:none">
+        <div class="row"><button id="history-button">History of this position</button><button id="keys-button">Contributor keys</button></div>
+        <ul id="history-list"></ul>
+        <div class="row"><input id="new-key-label" placeholder="Name for a new contributor key" style="flex:2"><button id="new-key-button">Create key</button></div>
+        <ul id="key-list"></ul>
+        <div id="admin-note"></div>
+      </div>
+    </details>
+    <div class="row"><button id="analyze">Find and save best move</button></div>
+    <progress id="analysis-progress" max="100" value="0"></progress>
+    <div id="bridge-bar"><span id="bridge-status">Engine bridge: not connected</span><button id="bridge-connect">Connect</button><button id="bridge-install" style="display:none">Install Stockfish 19</button></div>
+    <div id="bridge-setup">
+      <p>Stockfish runs on your own computer. A small helper program, the engine bridge, starts it for this site and downloads the official Stockfish 19 for you. Nothing is installed system-wide.</p>
+      <p><b>Already installed?</b> Start "My Chess DB Bridge" and this panel closes by itself. Your browser may ask once whether this site may connect to apps on your device: choose Allow.</p>
+      <p id="safari-note" style="display:none"><b>Safari cannot connect to the engine bridge.</b> Saved moves work here, but to analyse with Stockfish open this site in Chrome, Edge or Firefox.</p>
+      <div class="install-boxes">
+        <div id="install-windows-box"><b>Windows</b>: press Win+X, open Terminal or PowerShell, paste this and press Enter:
+          <code id="install-windows"></code><button id="copy-install-windows">Copy Windows command</button></div>
+        <div id="install-unix-box"><b>macOS / Linux</b>: open Terminal, paste this and press Enter:
+          <code id="install-unix"></code><button id="copy-install-unix">Copy macOS / Linux command</button></div>
+      </div>
+    </div>
+    <label id="active-jobs-label">Running analyses and results</label><ul id="active-jobs"></ul>
+    <label>Evaluation</label><input id="evaluation" readonly>
+    <label>Depth / nodes</label><input id="depth-result" readonly>
+    <label>Best line / database moves</label><div id="notation" class="notation"></div>
+    <div id="status" class="status"></div>
+  </aside>
+</main>
+<script type="module" src="/app.js"></script>
+</body>
+</html>

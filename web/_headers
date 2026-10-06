@@ -1,0 +1,16 @@
+# Response headers for the static site (Cloudflare reads this file).
+
+/*
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: no-referrer
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://raw.githubusercontent.com; connect-src 'self' https://lichess.org http://127.0.0.1:8765; frame-ancestors 'none'; base-uri 'none'; form-action 'none'
+
+/install.ps1
+  Content-Type: text/plain; charset=utf-8
+
+/install.sh
+  Content-Type: text/plain; charset=utf-8
+
+/bridge/SHA256SUMS
+  Content-Type: text/plain; charset=utf-8

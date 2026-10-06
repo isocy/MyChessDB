@@ -1,0 +1,468 @@
+package main
+
+// Analysis jobs: each one is its own Stockfish process searching one position
+// to a fixed depth. Jobs can be paused (process frozen, memory kept), resumed
+// and stopped individually.
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"regexp"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	maxTotalThreads     = 32
+	maxTotalHashMB      = 8192
+	fallbackTotalHashMB = 2048
+	maxSearchDepth      = 245
+)
+
+// resourceBudget is the total (threads, hash MB) Stockfish may use on this
+// machine: all cores but one, and a quarter of the RAM, both capped.
+func resourceBudget() (int, int) {
+	threads := runtime.NumCPU() - 1
+	if threads < 1 {
+		threads = 1
+	}
+	if threads > maxTotalThreads {
+		threads = maxTotalThreads
+	}
+	memory := totalMemoryMB()
+	if memory <= 0 {
+		memory = fallbackTotalHashMB * 4
+	}
+	hash := memory / 4
+	if hash < 256 {
+		hash = 256
+	}
+	if hash > maxTotalHashMB {
+		hash = maxTotalHashMB
+	}
+	return threads, hash
+}
+
+// perJobResources splits the budget across the jobs running at this moment.
+func perJobResources(activeJobs int) (int, int) {
+	totalThreads, totalHash := resourceBudget()
+	if activeJobs < 1 {
+		activeJobs = 1
+	}
+	threads := totalThreads / activeJobs
+	if threads < 1 {
+		threads = 1
+	}
+	hash := totalHash / activeJobs
+	if hash < 64 {
+		hash = 64
+	}
+	return threads, hash
+}
+
+type analysisResult struct {
+	MoveUCI    string   `json:"move_uci"`
+	PV         []string `json:"pv"`
+	Evaluation string   `json:"evaluation"`
+	Depth      int      `json:"depth"`
+	Nodes      int64    `json:"nodes"`
+	TimeMs     int64    `json:"time_ms"`
+}
+
+// jobView is what the site sees.
+type jobView struct {
+	JobID       string          `json:"job_id"`
+	Status      string          `json:"status"` // running | paused | complete | stopped | error
+	Depth       int             `json:"depth"`
+	TargetDepth int             `json:"target_depth"`
+	Progress    int             `json:"progress"`
+	Fen         string          `json:"fen"`
+	Threads     int             `json:"threads"`
+	Hash        int             `json:"hash"`
+	Error       string          `json:"error,omitempty"`
+	Result      *analysisResult `json:"result,omitempty"`
+	Context     json.RawMessage `json:"context,omitempty"`
+}
+
+type job struct {
+	view     jobView
+	proc     *uciProc
+	cancel   chan struct{}
+	finished time.Time
+	// collected: the site has fetched this job's result. Until then a
+	// completed job stays in the active list, so an analysis that finishes
+	// while the page is closed is still picked up and saved next time.
+	collected bool
+}
+
+type jobManager struct {
+	mu      sync.Mutex
+	jobs    map[string]*job
+	maxJobs int
+}
+
+func newJobManager(maxJobs int) *jobManager {
+	return &jobManager{jobs: map[string]*job{}, maxJobs: maxJobs}
+}
+
+var fenShape = regexp.MustCompile(`^[1-8pnbrqkPNBRQK/]{15,90} [wb] (-|[KQkq]{1,4}) (-|[a-h][36])( \d{1,4} \d{1,4})?$`)
+
+// validateFEN keeps anything that is not a plain chess position away from the
+// engine's stdin (in particular line breaks, which would let a caller inject
+// extra UCI commands).
+func validateFEN(fen string) error {
+	if !fenShape.MatchString(fen) {
+		return errors.New("that is not a valid FEN position")
+	}
+	fields := strings.Fields(fen)
+	ranks := strings.Split(fields[0], "/")
+	if len(ranks) != 8 {
+		return errors.New("a FEN board needs 8 ranks")
+	}
+	whiteKings, blackKings := 0, 0
+	for index, rank := range ranks {
+		squares := 0
+		for _, c := range rank {
+			switch {
+			case c >= '1' && c <= '8':
+				squares += int(c - '0')
+			default:
+				squares++
+				if c == 'K' {
+					whiteKings++
+				}
+				if c == 'k' {
+					blackKings++
+				}
+				if (c == 'P' || c == 'p') && (index == 0 || index == 7) {
+					return errors.New("a pawn cannot stand on the first or last rank")
+				}
+			}
+		}
+		if squares != 8 {
+			return errors.New("each FEN rank must describe 8 squares")
+		}
+	}
+	if whiteKings != 1 || blackKings != 1 {
+		return errors.New("a position needs exactly one king per side")
+	}
+	return nil
+}
+
+func newJobID() string {
+	raw := make([]byte, 8)
+	_, _ = rand.Read(raw)
+	return hex.EncodeToString(raw)
+}
+
+func (m *jobManager) snapshot(j *job) jobView {
+	view := j.view
+	if view.Result != nil {
+		result := *view.Result
+		view.Result = &result
+	}
+	return view
+}
+
+// active lists jobs that are running or paused, plus completed ones whose
+// result nobody has fetched yet.
+func (m *jobManager) active() []jobView {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []jobView{}
+	for _, j := range m.jobs {
+		if j.view.Status == "running" || j.view.Status == "paused" || (j.view.Status == "complete" && !j.collected) {
+			out = append(out, m.snapshot(j))
+		}
+	}
+	return out
+}
+
+func (m *jobManager) get(id string) (jobView, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, ok := m.jobs[id]
+	if !ok {
+		return jobView{}, false
+	}
+	if j.view.Status == "complete" {
+		j.collected = true
+	}
+	return m.snapshot(j), true
+}
+
+type httpError struct {
+	status  int
+	message string
+}
+
+func (e *httpError) Error() string { return e.message }
+
+func (m *jobManager) start(enginePath, fen string, depth int, context json.RawMessage) (jobView, error) {
+	if err := validateFEN(fen); err != nil {
+		return jobView{}, &httpError{400, err.Error()}
+	}
+	if depth < 1 || depth > maxSearchDepth {
+		return jobView{}, &httpError{400, fmt.Sprintf("depth must be between 1 and %d", maxSearchDepth)}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	running, live := 0, 0
+	for id, j := range m.jobs {
+		switch j.view.Status {
+		case "running":
+			running++
+			live++
+		case "paused":
+			live++
+		default:
+			uncollected := j.view.Status == "complete" && !j.collected
+			if time.Since(j.finished) > time.Hour && !uncollected {
+				delete(m.jobs, id) // forget long-finished jobs
+			}
+		}
+	}
+	if live >= m.maxJobs {
+		return jobView{}, &httpError{429, fmt.Sprintf(
+			"You already have %d analyses running. Stop one before starting another.", m.maxJobs)}
+	}
+	threads, hash := perJobResources(running + 1)
+	j := &job{
+		view: jobView{
+			JobID: newJobID(), Status: "running", TargetDepth: depth, Fen: fen,
+			Threads: threads, Hash: hash, Context: context,
+		},
+		cancel: make(chan struct{}),
+	}
+	m.jobs[j.view.JobID] = j
+	go m.run(j, enginePath)
+	return m.snapshot(j), nil
+}
+
+func (m *jobManager) update(j *job, change func(view *jobView)) {
+	m.mu.Lock()
+	change(&j.view)
+	m.mu.Unlock()
+}
+
+func (m *jobManager) finish(j *job, status, message string, result *analysisResult) {
+	m.mu.Lock()
+	j.view.Status = status
+	j.view.Error = message
+	j.view.Result = result
+	if status == "complete" {
+		j.view.Progress = 100
+	}
+	j.finished = time.Now()
+	j.proc = nil
+	m.mu.Unlock()
+}
+
+func (m *jobManager) cancelled(j *job) bool {
+	select {
+	case <-j.cancel:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *jobManager) run(j *job, enginePath string) {
+	fen, depth := j.view.Fen, j.view.TargetDepth
+	threads, hash := j.view.Threads, j.view.Hash
+	blackToMove := strings.Fields(fen)[1] == "b"
+
+	proc, err := startUCI(enginePath)
+	if err != nil {
+		m.finish(j, "error", "Could not start Stockfish: "+err.Error(), nil)
+		return
+	}
+	m.mu.Lock()
+	j.proc = proc
+	stopRequested := m.cancelled(j)
+	m.mu.Unlock()
+	defer proc.kill()
+	if stopRequested {
+		m.finish(j, "stopped", "", nil)
+		return
+	}
+
+	fail := func(err error) {
+		if m.cancelled(j) {
+			m.finish(j, "stopped", "", nil)
+			return
+		}
+		m.finish(j, "error", err.Error(), nil)
+	}
+
+	identity, err := proc.handshake(20 * time.Second)
+	if err != nil {
+		fail(err)
+		return
+	}
+	setOption := func(name string, value any) {
+		if identity.Options[name] {
+			_ = proc.send(fmt.Sprintf("setoption name %s value %v", name, value))
+		}
+	}
+	setOption("Threads", threads)
+	setOption("Hash", hash)
+	setOption("Syzygy50MoveRule", "false")
+	_ = proc.send("ucinewgame")
+	_ = proc.send("isready")
+	// Clearing a large hash table can take a while on a busy machine.
+	if err := proc.waitFor("readyok", 5*time.Minute, nil); err != nil {
+		fail(err)
+		return
+	}
+	_ = proc.send("position fen " + fen)
+	_ = proc.send(fmt.Sprintf("go depth %d", depth))
+
+	var best uciInfo
+	haveBest := false
+	for {
+		select {
+		case <-j.cancel:
+			m.finish(j, "stopped", "", nil)
+			return
+		case line, ok := <-proc.lines:
+			if !ok {
+				fail(errEngineExited)
+				return
+			}
+			if strings.HasPrefix(line, "bestmove") {
+				if m.cancelled(j) {
+					m.finish(j, "stopped", "", nil)
+					return
+				}
+				if !haveBest {
+					m.finish(j, "error", "Stockfish returned no analysis result.", nil)
+					proc.quit()
+					return
+				}
+				result := &analysisResult{
+					MoveUCI: best.PV[0], PV: best.PV, Evaluation: formatEvaluation(best, blackToMove),
+					Depth: best.Depth, Nodes: best.Nodes, TimeMs: best.TimeMs,
+				}
+				m.finish(j, "complete", "", result)
+				proc.quit()
+				return
+			}
+			info, isInfo := parseInfo(line)
+			if !isInfo {
+				continue
+			}
+			if info.HasDepth {
+				progress := info.Depth * 100 / depth
+				if progress > 99 {
+					progress = 99
+				}
+				m.update(j, func(view *jobView) {
+					view.Depth = info.Depth
+					view.Progress = progress
+				})
+			}
+			if info.HasScore && !info.Bound && info.MultiPV == 1 && len(info.PV) > 0 && info.HasDepth {
+				best, haveBest = info, true
+			}
+		}
+	}
+}
+
+func (m *jobManager) find(id string) (*job, error) {
+	j, ok := m.jobs[id]
+	if !ok {
+		return nil, &httpError{404, "Analysis job not found"}
+	}
+	return j, nil
+}
+
+func (m *jobManager) stop(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, err := m.find(id)
+	if err != nil {
+		return err
+	}
+	if j.view.Status != "running" && j.view.Status != "paused" {
+		return nil
+	}
+	if j.view.Status == "paused" && j.proc != nil {
+		// A frozen process cannot be shut down cleanly; thaw it first.
+		_ = resumeProcess(j.proc.pid())
+	}
+	select {
+	case <-j.cancel:
+	default:
+		close(j.cancel)
+	}
+	if j.proc != nil {
+		go j.proc.kill()
+	}
+	return nil
+}
+
+func (m *jobManager) pause(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, err := m.find(id)
+	if err != nil {
+		return err
+	}
+	if j.view.Status != "running" || j.proc == nil {
+		return &httpError{409, "Job is not currently running"}
+	}
+	if err := suspendProcess(j.proc.pid()); err != nil {
+		return &httpError{500, "Could not pause Stockfish: " + err.Error()}
+	}
+	j.view.Status = "paused"
+	return nil
+}
+
+func (m *jobManager) resume(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, err := m.find(id)
+	if err != nil {
+		return err
+	}
+	if j.view.Status != "paused" || j.proc == nil {
+		return &httpError{409, "Job is not currently paused"}
+	}
+	if err := resumeProcess(j.proc.pid()); err != nil {
+		return &httpError{500, "Could not resume Stockfish: " + err.Error()}
+	}
+	j.view.Status = "running"
+	return nil
+}
+
+// shutdown stops every engine; called when the bridge exits. Jobs end as
+// "stopped", not as an engine failure.
+func (m *jobManager) shutdown() {
+	m.mu.Lock()
+	procs := []*uciProc{}
+	for _, j := range m.jobs {
+		if j.view.Status == "running" || j.view.Status == "paused" {
+			select {
+			case <-j.cancel:
+			default:
+				close(j.cancel)
+			}
+		}
+		if j.proc != nil {
+			if j.view.Status == "paused" {
+				_ = resumeProcess(j.proc.pid())
+			}
+			procs = append(procs, j.proc)
+		}
+	}
+	m.mu.Unlock()
+	for _, proc := range procs {
+		proc.kill()
+	}
+}

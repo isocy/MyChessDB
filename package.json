@@ -1,0 +1,17 @@
+{
+  "name": "mychessdb",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --no-warnings scripts/dev_server.mjs",
+    "test": "node tests/chesslib.test.mjs && node --no-warnings tests/worker.test.mjs",
+    "test:bridge": "cd bridge && go test -tags testhooks ./...",
+    "test:e2e": "node --no-warnings tests/e2e.mjs",
+    "build:openings": "node scripts/build_openings.mjs",
+    "build:bridge": "sh scripts/build_bridge.sh",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

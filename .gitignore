@@ -7,3 +7,10 @@ admin_token.txt
 
 todo.txt
 stockfish/
+
+# cloud version (see DEPLOY.md)
+node_modules/
+.wrangler/
+.dev/
+.dev.vars
+tests/chess_fixture.json
