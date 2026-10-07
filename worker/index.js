@@ -163,11 +163,14 @@ async function countAnonymousWrite(request, env) {
 
 // ------------------------------------------------------------- Lichess -----
 
+// multiPv=1: Lichess answers with its deepest evaluation that has at least
+// the number of lines asked for, and the deepest ones are mostly single-line.
+// (The page asks the same way, so both see the same evaluation.)
 async function fetchLichessEval(env, fen) {
   const base = (env.LICHESS_API_BASE || "https://lichess.org").replace(/\/+$/, "");
   let response;
   try {
-    response = await fetch(`${base}/api/cloud-eval?fen=${encodeURIComponent(fen)}&multiPv=3`, {
+    response = await fetch(`${base}/api/cloud-eval?fen=${encodeURIComponent(fen)}&multiPv=1`, {
       headers: { Accept: "application/json", "User-Agent": "MyChessDB" },
     });
   } catch (error) {
@@ -390,7 +393,9 @@ function cleanImportEntry(raw) {
     position_key: fen.split(" ").slice(0, 4).join(" "),
     fen, move_uci: line[0], pv: line.join(" "), evaluation: raw.evaluation,
     depth: raw.depth, knodes: Number.isInteger(raw.knodes) ? raw.knodes : null,
-    source: raw.source, verified: 1, saved_by: "import", saved_at: savedAt,
+    // An entry marked unverified (as in a backup) stays unverified; anything
+    // else the admin imports counts as verified.
+    source: raw.source, verified: raw.verified === false ? 0 : 1, saved_by: "import", saved_at: savedAt,
   };
 }
 

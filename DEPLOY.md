@@ -24,7 +24,10 @@ cloud or in the browser.
 There are no accounts. Trust comes from where an entry came from:
 
 - **Lichess entries** are fetched from Lichess by the server itself, so the
-  browser cannot fake them. They count as verified.
+  browser cannot fake them. They count as verified. Both the page and the
+  server ask Lichess for one line (`multiPv=1`): Lichess answers with its
+  deepest evaluation that has at least the number of lines asked for, and
+  its deepest ones are mostly single-line.
 - **Stockfish entries saved with a key** (your admin token, or a contributor
   key you created for someone) count as verified.
 - **Stockfish entries without a key** are stored as *unverified* and shown with
@@ -97,6 +100,15 @@ Windows, Applications entry on macOS and Linux) for next time; the site also
 shows a short start command. The bridge's window has to stay open while
 analysing.
 
+Up to four analyses run at the same time (`-max-jobs` changes that). Further
+ones wait in a queue, up to 100, and start by themselves, oldest first, as
+soon as one of the four ends; a paused analysis keeps its place. Stockfish
+runs below normal priority. It may use all processor cores but one and a
+quarter of the memory (at most 8 GB) for its hash table, shared between the
+analyses running at that moment, and a new analysis never takes more than half
+of the memory that is free when it starts. The bridge window logs the threads
+and hash size each analysis started with.
+
 Nothing is installed system-wide and no administrator rights are needed.
 Because the files are fetched by a terminal command instead of being
 double-clicked from a download, Windows SmartScreen and macOS Gatekeeper do
@@ -126,7 +138,9 @@ Log in with the admin token, then open **Position and engine settings**:
   key; **Revoke + unverify entries** also marks everything saved with it as
   unverified, so it can be replaced.
 - **Download backup**: the whole database, including history, as one JSON
-  file. The same file can be imported again.
+  file. The same file can be imported again; entries that were unverified
+  stay unverified. Import only fills gaps: it never replaces an entry of equal
+  or greater depth, and it does not restore history or contributor keys.
 
 Settings you can change in `wrangler.jsonc` under `vars`: `MIN_DEPTH`
 (default 46) and `ANON_WRITES_PER_HOUR` (default 60 save attempts per hour for
@@ -186,27 +200,37 @@ more.
 
 ## What has and has not been run for real
 
-Tested here, on Linux, in a real browser:
+Automated tests (Linux, real browser):
 
 - chess rules against published perft counts and 28,694 positions from
   python-chess; opening table identical to the old `app.py` logic
 - every API rule against SQLite (the engine behind D1)
 - the released Linux bridge downloading the official Stockfish 19 from GitHub,
   analysing, pausing, resuming, stopping, and cleaning up
-- the macOS/Linux install script
-- importing your real `saved_positions.json` (492 entries, none skipped)
+- the analysis queue (waiting, order, dropping a waiting job, starting by
+  itself, shutdown) and the free-memory limit on the hash size
+- the macOS/Linux install script (on Linux)
+- importing the real `saved_positions.json` (492 entries, none skipped)
 
-Not yet run on the real thing:
+Checked by hand on the live site, Windows 11 with Firefox:
 
-- the Cloudflare deploy itself (wrangler, real D1, the `_headers` file)
-- the bridge and `install.ps1` on Windows, and the bridge on macOS. They
-  compile and share the tested code, but the Windows-only parts (pause through
-  `NtSuspendProcess`, the kill-on-close job, the Start menu shortcut) and the
-  macOS memory lookup have not executed anywhere yet.
-- the browser's "allow this site to reach apps on your device" prompt, which
-  only appears on a real `https://` address
-- Lichess from Cloudflare's network (the server-side check of Lichess entries
-  was tested against a stand-in)
+- deploy with wrangler and the real D1 database
+- `install.ps1`, the Start menu shortcut, and the browser's one-time
+  permission prompt
+- the Windows bridge: Stockfish download, analysis, pause, resume, stop,
+  closing the bridge window, reload during an analysis
+- an analysis saved from the PC and visible to a visitor who is not logged in
+
+Not yet run anywhere:
+
+- the Windows-only parts of bridge 1.0.3: reading free memory, and marking
+  Stockfish's memory as the first to give up when memory runs short
+- the depth field's reset in Firefox (tested in Chromium)
+- anything on macOS (bridge, installer, launcher)
+- the Linux launcher on a real desktop
+- the permission prompt in Chrome and Edge
+- whether Lichess answers the server-side check from Cloudflare's network
+  reliably (it was tested against a stand-in)
 
 ## Credits
 

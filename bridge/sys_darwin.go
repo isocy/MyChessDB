@@ -29,6 +29,10 @@ func totalMemoryMB() int {
 	return 0
 }
 
+// availableMemoryMB: macOS has no simple counter for this, so the bridge does
+// not try; 0 means "unknown" and the hash size is then not adjusted.
+func availableMemoryMB() int { return 0 }
+
 func configureChild(cmd *exec.Cmd) {}
 
 func openBrowser(url string) error {

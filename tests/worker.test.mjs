@@ -198,7 +198,7 @@ const list = async env => (await call(env, "GET", "/api/saved")).data.entries;
   eq(r.status, 200);
   eq(r.data.entry, { fen: ITALIAN, move_uci: "e1g1", pv: ["e1g1", "g8f6", "d2d3", "d7d6", "c2c3"], evaluation: "Lichess Cloud: +0.25",
     depth: 50, knodes: 123456, source: "lichess", verified: true, saved_at: r.data.entry.saved_at }, "castling normalised, server data used");
-  ok(lichessCalls[0].includes("multiPv=3") && lichessCalls[0].includes(encodeURIComponent(ITALIAN)), "asked Lichess for this position");
+  ok(lichessCalls[0].endsWith("&multiPv=1") && lichessCalls[0].includes(encodeURIComponent(ITALIAN)), "asked Lichess for this position");
 
   lichess = lichessJson({ depth: 40, knodes: 10, pvs: [{ moves: "e2e4", cp: -31 }] });
   r = await call(env, "POST", "/api/saved", { body: { fen: START, source: "lichess" } });
@@ -276,6 +276,15 @@ const list = async env => (await call(env, "GET", "/api/saved")).data.entries;
   r = await call(env, "POST", "/api/import", { body: { entries: [{ ...entries[0], depth: 60 }], overwrite: true }, key: ADMIN });
   eq(r.data.stored, 1);
   eq(history(env).map(x => [x.depth, x.reason]), [[75, "replaced"]]);
+  // A backup's unverified entries stay unverified, and cannot displace a verified one.
+  r = await call(env, "POST", "/api/import", { body: { entries: [
+    { fen: ITALIAN, pv: ["e1g1"], evaluation: "+0.30", depth: 46, source: "stockfish", verified: false },
+    { fen: START, pv: ["d2d4"], evaluation: "+0.20", depth: 99, source: "stockfish", verified: false },
+  ] }, key: ADMIN });
+  eq([r.data.stored, r.data.kept_existing], [1, 1]);
+  const after = await list(env);
+  eq(after.find(e => e.fen === ITALIAN).verified, false, "imported as unverified");
+  eq(after.find(e => e.fen === START).verified, true, "the verified entry was kept");
   eq((await call(env, "POST", "/api/import", { body: { entries: Array(101).fill(entries[0]) }, key: ADMIN })).status, 400);
   eq((await call(env, "POST", "/api/import", { body: { entries: [] }, key: ADMIN })).status, 400);
 }

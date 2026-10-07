@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,9 @@ const (
 	maxTotalHashMB      = 8192
 	fallbackTotalHashMB = 2048
 	maxSearchDepth      = 245
+	minJobHashMB        = 64
+	// How many analyses may wait for a free slot.
+	maxQueuedJobs = 100
 )
 
 // resourceBudget is the total (threads, hash MB) Stockfish may use on this
@@ -59,10 +63,28 @@ func perJobResources(activeJobs int) (int, int) {
 		threads = 1
 	}
 	hash := totalHash / activeJobs
-	if hash < 64 {
-		hash = 64
+	if hash < minJobHashMB {
+		hash = minJobHashMB
 	}
 	return threads, hash
+}
+
+// fitHashToFreeMemory keeps a new job's hash table within half of the memory
+// that is free right now. A table larger than what is free makes the system
+// push other programs (the browser first of all) out to disk, which freezes
+// them for a while. freeMB <= 0 means "unknown": the hash is left as it is.
+func fitHashToFreeMemory(hash, freeMB int) int {
+	if freeMB <= 0 {
+		return hash
+	}
+	limit := freeMB / 2
+	if limit < minJobHashMB {
+		limit = minJobHashMB
+	}
+	if hash > limit {
+		return limit
+	}
+	return hash
 }
 
 type analysisResult struct {
@@ -76,17 +98,19 @@ type analysisResult struct {
 
 // jobView is what the site sees.
 type jobView struct {
-	JobID       string          `json:"job_id"`
-	Status      string          `json:"status"` // running | paused | complete | stopped | error
-	Depth       int             `json:"depth"`
-	TargetDepth int             `json:"target_depth"`
-	Progress    int             `json:"progress"`
-	Fen         string          `json:"fen"`
-	Threads     int             `json:"threads"`
-	Hash        int             `json:"hash"`
-	Error       string          `json:"error,omitempty"`
-	Result      *analysisResult `json:"result,omitempty"`
-	Context     json.RawMessage `json:"context,omitempty"`
+	JobID       string `json:"job_id"`
+	Status      string `json:"status"` // queued | running | paused | complete | stopped | error
+	Depth       int    `json:"depth"`
+	TargetDepth int    `json:"target_depth"`
+	Progress    int    `json:"progress"`
+	Fen         string `json:"fen"`
+	Threads     int    `json:"threads"`
+	Hash        int    `json:"hash"`
+	// QueuePosition: 1 for the job that starts next; only set while queued.
+	QueuePosition int             `json:"queue_position,omitempty"`
+	Error         string          `json:"error,omitempty"`
+	Result        *analysisResult `json:"result,omitempty"`
+	Context       json.RawMessage `json:"context,omitempty"`
 }
 
 type job struct {
@@ -98,16 +122,24 @@ type job struct {
 	// completed job stays in the active list, so an analysis that finishes
 	// while the page is closed is still picked up and saved next time.
 	collected bool
+	// seq: order of arrival. Queued jobs start in this order.
+	seq uint64
 }
 
 type jobManager struct {
 	mu      sync.Mutex
 	jobs    map[string]*job
 	maxJobs int
+	nextSeq uint64
+	closing bool
+	// engine names the executable to run. It is asked (and the file checked
+	// again) at the moment a job really starts, which for a queued job can be
+	// long after it was requested.
+	engine func() (string, error)
 }
 
-func newJobManager(maxJobs int) *jobManager {
-	return &jobManager{jobs: map[string]*job{}, maxJobs: maxJobs}
+func newJobManager(maxJobs int, engine func() (string, error)) *jobManager {
+	return &jobManager{jobs: map[string]*job{}, maxJobs: maxJobs, engine: engine}
 }
 
 var fenShape = regexp.MustCompile(`^[1-8pnbrqkPNBRQK/]{15,90} [wb] (-|[KQkq]{1,4}) (-|[a-h][36])( \d{1,4} \d{1,4})?$`)
@@ -160,8 +192,17 @@ func newJobID() string {
 	return hex.EncodeToString(raw)
 }
 
+// snapshot copies a job's view. The caller holds m.mu.
 func (m *jobManager) snapshot(j *job) jobView {
 	view := j.view
+	if view.Status == "queued" {
+		view.QueuePosition = 1
+		for _, other := range m.jobs {
+			if other.view.Status == "queued" && other.seq < j.seq {
+				view.QueuePosition++
+			}
+		}
+	}
 	if view.Result != nil {
 		result := *view.Result
 		view.Result = &result
@@ -169,16 +210,26 @@ func (m *jobManager) snapshot(j *job) jobView {
 	return view
 }
 
-// active lists jobs that are running or paused, plus completed ones whose
-// result nobody has fetched yet.
+// active lists jobs that are waiting, running or paused, plus completed ones
+// whose result nobody has fetched yet, in the order they were requested.
 func (m *jobManager) active() []jobView {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := []jobView{}
+	listed := []*job{}
 	for _, j := range m.jobs {
-		if j.view.Status == "running" || j.view.Status == "paused" || (j.view.Status == "complete" && !j.collected) {
-			out = append(out, m.snapshot(j))
+		switch j.view.Status {
+		case "queued", "running", "paused":
+			listed = append(listed, j)
+		case "complete":
+			if !j.collected {
+				listed = append(listed, j)
+			}
 		}
+	}
+	sort.Slice(listed, func(a, b int) bool { return listed[a].seq < listed[b].seq })
+	out := make([]jobView, 0, len(listed))
+	for _, j := range listed {
+		out = append(out, m.snapshot(j))
 	}
 	return out
 }
@@ -203,7 +254,10 @@ type httpError struct {
 
 func (e *httpError) Error() string { return e.message }
 
-func (m *jobManager) start(enginePath, fen string, depth int, context json.RawMessage) (jobView, error) {
+// start accepts an analysis. It begins at once if fewer than maxJobs are
+// running or paused; otherwise it waits in the queue and begins by itself
+// when one of them ends.
+func (m *jobManager) start(fen string, depth int, context json.RawMessage) (jobView, error) {
 	if err := validateFEN(fen); err != nil {
 		return jobView{}, &httpError{400, err.Error()}
 	}
@@ -212,14 +266,15 @@ func (m *jobManager) start(enginePath, fen string, depth int, context json.RawMe
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	running, live := 0, 0
+	if m.closing {
+		return jobView{}, &httpError{503, "The engine bridge is shutting down."}
+	}
+	queued := 0
 	for id, j := range m.jobs {
 		switch j.view.Status {
-		case "running":
-			running++
-			live++
-		case "paused":
-			live++
+		case "running", "paused":
+		case "queued":
+			queued++
 		default:
 			uncollected := j.view.Status == "complete" && !j.collected
 			if time.Since(j.finished) > time.Hour && !uncollected {
@@ -227,21 +282,63 @@ func (m *jobManager) start(enginePath, fen string, depth int, context json.RawMe
 			}
 		}
 	}
-	if live >= m.maxJobs {
+	if queued >= maxQueuedJobs {
 		return jobView{}, &httpError{429, fmt.Sprintf(
-			"You already have %d analyses running. Stop one before starting another.", m.maxJobs)}
+			"%d analyses are already waiting. Let some finish, or stop some, before adding more.", queued)}
 	}
-	threads, hash := perJobResources(running + 1)
 	j := &job{
-		view: jobView{
-			JobID: newJobID(), Status: "running", TargetDepth: depth, Fen: fen,
-			Threads: threads, Hash: hash, Context: context,
-		},
+		view:   jobView{JobID: newJobID(), Status: "queued", TargetDepth: depth, Fen: fen, Context: context},
 		cancel: make(chan struct{}),
+		seq:    m.nextSeq,
 	}
+	m.nextSeq++
 	m.jobs[j.view.JobID] = j
-	go m.run(j, enginePath)
+	m.promoteLocked()
+	if j.view.Status == "queued" {
+		logf("Analysis %s is waiting for a free slot (%d waiting).", shortID(j), queued+1)
+	}
 	return m.snapshot(j), nil
+}
+
+func shortID(j *job) string { return j.view.JobID[:6] }
+
+// promoteLocked starts waiting jobs, oldest first, while there is a free
+// slot. The caller holds m.mu.
+func (m *jobManager) promoteLocked() {
+	if m.closing {
+		return
+	}
+	for {
+		live, running := 0, 0
+		var next *job
+		for _, j := range m.jobs {
+			switch j.view.Status {
+			case "running":
+				live++
+				running++
+			case "paused":
+				live++
+			case "queued":
+				if next == nil || j.seq < next.seq {
+					next = j
+				}
+			}
+		}
+		if next == nil || live >= m.maxJobs {
+			return
+		}
+		threads, hash := perJobResources(running + 1)
+		free := availableMemoryMB()
+		hash = fitHashToFreeMemory(hash, free)
+		next.view.Status, next.view.Threads, next.view.Hash = "running", threads, hash
+		if free > 0 {
+			logf("Analysis %s starts: depth %d, %d threads, %d MB hash (%d MB of memory was free).",
+				shortID(next), next.view.TargetDepth, threads, hash, free)
+		} else {
+			logf("Analysis %s starts: depth %d, %d threads, %d MB hash.", shortID(next), next.view.TargetDepth, threads, hash)
+		}
+		go m.run(next)
+	}
 }
 
 func (m *jobManager) update(j *job, change func(view *jobView)) {
@@ -260,6 +357,16 @@ func (m *jobManager) finish(j *job, status, message string, result *analysisResu
 	}
 	j.finished = time.Now()
 	j.proc = nil
+	switch status {
+	case "complete":
+		logf("Analysis %s finished at depth %d.", shortID(j), result.Depth)
+	case "error":
+		logf("Analysis %s failed: %s", shortID(j), message)
+	default:
+		logf("Analysis %s stopped.", shortID(j))
+	}
+	// A slot is free now: let the next waiting analysis begin.
+	m.promoteLocked()
 	m.mu.Unlock()
 }
 
@@ -272,11 +379,22 @@ func (m *jobManager) cancelled(j *job) bool {
 	}
 }
 
-func (m *jobManager) run(j *job, enginePath string) {
+func (m *jobManager) run(j *job) {
+	m.mu.Lock()
 	fen, depth := j.view.Fen, j.view.TargetDepth
 	threads, hash := j.view.Threads, j.view.Hash
+	m.mu.Unlock()
 	blackToMove := strings.Fields(fen)[1] == "b"
 
+	enginePath, err := m.engine()
+	if err != nil {
+		m.finish(j, "error", "Stockfish is not ready: "+err.Error(), nil)
+		return
+	}
+	if m.cancelled(j) {
+		m.finish(j, "stopped", "", nil)
+		return
+	}
 	proc, err := startUCI(enginePath)
 	if err != nil {
 		m.finish(j, "error", "Could not start Stockfish: "+err.Error(), nil)
@@ -389,6 +507,14 @@ func (m *jobManager) stop(id string) error {
 	if err != nil {
 		return err
 	}
+	if j.view.Status == "queued" {
+		// Never started: just take it out of the queue.
+		j.view.Status = "stopped"
+		j.finished = time.Now()
+		close(j.cancel)
+		logf("Analysis %s left the queue.", shortID(j))
+		return nil
+	}
 	if j.view.Status != "running" && j.view.Status != "paused" {
 		return nil
 	}
@@ -445,8 +571,14 @@ func (m *jobManager) resume(id string) error {
 // "stopped", not as an engine failure.
 func (m *jobManager) shutdown() {
 	m.mu.Lock()
+	m.closing = true // nothing waiting may start any more
 	procs := []*uciProc{}
 	for _, j := range m.jobs {
+		if j.view.Status == "queued" {
+			j.view.Status = "stopped"
+			j.finished = time.Now()
+			close(j.cancel)
+		}
 		if j.view.Status == "running" || j.view.Status == "paused" {
 			select {
 			case <-j.cancel:

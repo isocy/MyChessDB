@@ -112,13 +112,13 @@
     <details id="advanced-settings">
       <summary>Position and engine settings</summary>
       <label for="fen">FEN</label>
-      <input id="fen">
+      <input id="fen" autocomplete="off">
       <div class="row"><button id="load">Load position</button><button id="copy-fen">Copy FEN</button></div>
       <label for="engine">Stockfish 19 executable (optional: only to use a copy you already have)</label>
-      <input id="engine" placeholder="Leave empty: the engine bridge downloads Stockfish 19 for you" disabled>
+      <input id="engine" placeholder="Leave empty: the engine bridge downloads Stockfish 19 for you" autocomplete="off" disabled>
       <div id="engine-status" class="status"></div>
       <label for="depth" id="depth-label">Analysis depth</label>
-      <input id="depth" type="number" min="8" max="60" value="46" disabled>
+      <input id="depth" type="number" min="8" max="60" value="46" autocomplete="off" disabled>
       <div class="row"><button id="remove" style="display:none">Remove saved move</button></div>
       <div id="admin-tools" style="display:none">
         <label>Admin tools</label>
@@ -126,7 +126,7 @@
         <input id="import-file" type="file" accept=".json,application/json" style="display:none">
         <div class="row"><button id="history-button">History of this position</button><button id="keys-button">Contributor keys</button></div>
         <ul id="history-list"></ul>
-        <div class="row"><input id="new-key-label" placeholder="Name for a new contributor key" style="flex:2"><button id="new-key-button">Create key</button></div>
+        <div class="row"><input id="new-key-label" placeholder="Name for a new contributor key" style="flex:2" autocomplete="off"><button id="new-key-button">Create key</button></div>
         <ul id="key-list"></ul>
         <div id="admin-note"></div>
       </div>
@@ -149,8 +149,8 @@
       </div>
     </div>
     <label id="active-jobs-label">Running analyses and results</label><ul id="active-jobs"></ul>
-    <label>Evaluation</label><input id="evaluation" readonly>
-    <label>Depth / nodes</label><input id="depth-result" readonly>
+    <label>Evaluation</label><input id="evaluation" autocomplete="off" readonly>
+    <label>Depth / nodes</label><input id="depth-result" autocomplete="off" readonly>
     <label>Best line / database moves</label><div id="notation" class="notation"></div>
     <div id="status" class="status"></div>
   </aside>

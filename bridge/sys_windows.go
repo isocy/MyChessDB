@@ -15,6 +15,7 @@ var (
 	ntdll    = syscall.NewLazyDLL("ntdll.dll")
 
 	procGlobalMemoryStatusEx     = kernel32.NewProc("GlobalMemoryStatusEx")
+	procSetProcessInformation    = kernel32.NewProc("SetProcessInformation")
 	procCreateJobObjectW         = kernel32.NewProc("CreateJobObjectW")
 	procSetInformationJobObject  = kernel32.NewProc("SetInformationJobObject")
 	procAssignProcessToJobObject = kernel32.NewProc("AssignProcessToJobObject")
@@ -36,21 +37,42 @@ type memoryStatusEx struct {
 	AvailExtendedVirtual uint64
 }
 
-func totalMemoryMB() int {
+func memoryStatus() (memoryStatusEx, bool) {
 	var status memoryStatusEx
 	status.Length = uint32(unsafe.Sizeof(status))
-	if ok, _, _ := procGlobalMemoryStatusEx.Call(uintptr(unsafe.Pointer(&status))); ok == 0 {
+	ok, _, _ := procGlobalMemoryStatusEx.Call(uintptr(unsafe.Pointer(&status)))
+	return status, ok != 0
+}
+
+func totalMemoryMB() int {
+	status, ok := memoryStatus()
+	if !ok {
 		return 0
 	}
 	return int(status.TotalPhys / (1024 * 1024))
 }
 
+// availableMemoryMB is the physical memory programs can still take without
+// anything being pushed out to the page file. 0 = unknown.
+func availableMemoryMB() int {
+	status, ok := memoryStatus()
+	if !ok {
+		return 0
+	}
+	return int(status.AvailPhys / (1024 * 1024))
+}
+
 const (
-	processSuspendResume = 0x0800
-	processSetQuota      = 0x0100
-	processTerminate     = 0x0001
-	createNoWindow       = 0x08000000
-	belowNormalPriority  = 0x00004000
+	processSuspendResume  = 0x0800
+	processSetQuota       = 0x0100
+	processSetInformation = 0x0200
+	processTerminate      = 0x0001
+	createNoWindow        = 0x08000000
+	belowNormalPriority   = 0x00004000
+
+	// SetProcessInformation(ProcessMemoryPriority, MEMORY_PRIORITY_LOW)
+	processMemoryPriorityClass = 0
+	memoryPriorityLow          = 2
 )
 
 func withProcess(pid int, access uint32, action func(handle syscall.Handle) error) error {
@@ -154,12 +176,28 @@ func engineJobHandle() uintptr {
 // adoptChild puts a freshly started engine into the kill-on-close job. It is
 // best effort: without it the engine still exits when its stdin closes.
 func adoptChild(cmd *exec.Cmd) {
+	lowerMemoryPriority(cmd)
 	job := engineJobHandle()
 	if job == 0 || cmd.Process == nil {
 		return
 	}
 	_ = withProcess(cmd.Process.Pid, processSetQuota|processTerminate, func(handle syscall.Handle) error {
 		procAssignProcessToJobObject.Call(job, uintptr(handle))
+		return nil
+	})
+}
+
+// lowerMemoryPriority tells Windows that, when memory runs short, the
+// engine's pages are the ones to push out first, not the browser's. It has no
+// effect while there is memory to spare. Best effort (needs Windows 8+).
+func lowerMemoryPriority(cmd *exec.Cmd) {
+	if cmd.Process == nil || procSetProcessInformation.Find() != nil {
+		return
+	}
+	_ = withProcess(cmd.Process.Pid, processSetInformation, func(handle syscall.Handle) error {
+		priority := uint32(memoryPriorityLow) // MEMORY_PRIORITY_INFORMATION { ULONG MemoryPriority; }
+		procSetProcessInformation.Call(uintptr(handle), processMemoryPriorityClass,
+			uintptr(unsafe.Pointer(&priority)), unsafe.Sizeof(priority))
 		return nil
 	})
 }

@@ -75,8 +75,8 @@ func newHarness(t *testing.T, maxJobs int) *harness {
 	srv := &server{
 		store: store, verifier: verifier,
 		installer: &installer{dir: dir, store: store, verifier: verifier, status: installStatus{State: "idle"}},
-		jobs:      newJobManager(maxJobs),
 	}
+	srv.jobs = newJobManager(maxJobs, srv.currentEngine)
 	ts := httptest.NewServer(srv)
 	fmt.Sscanf(ts.URL[strings.LastIndex(ts.URL, ":")+1:], "%d", &srv.port)
 	h := &harness{t: t, srv: srv, http: ts, dir: dir, origin: site}
@@ -281,6 +281,20 @@ func TestResourceSplit(t *testing.T) {
 	if one != totalThreads || many != 1 || hash != 64 {
 		t.Fatalf("split wrong: %d %d %d", one, many, hash)
 	}
+	// A new job's hash never takes more than half of the memory that is free.
+	for _, c := range []struct{ hash, free, want int }{
+		{8192, 20000, 8192}, {8192, 6000, 3000}, {2048, 4096, 2048}, {2048, 1000, 500},
+		{2048, 100, 64}, {64, 10, 64}, {4096, 0, 4096}, {4096, -1, 4096},
+	} {
+		if got := fitHashToFreeMemory(c.hash, c.free); got != c.want {
+			t.Errorf("fitHashToFreeMemory(%d, %d) = %d, want %d", c.hash, c.free, got, c.want)
+		}
+	}
+	if runtime.GOOS == "linux" {
+		if free := availableMemoryMB(); free < 1 || free > totalMemoryMB() {
+			t.Fatalf("free memory reads as %d MB of %d MB", free, totalMemoryMB())
+		}
+	}
 }
 
 // -------------------------------------------------- who may talk to it ---
@@ -407,7 +421,11 @@ func TestAnalysisLifecycle(t *testing.T) {
 	}
 	raw, _ := os.ReadFile(logPath)
 	sent := string(raw)
-	threads, hash := perJobResources(1)
+	threads, fullHash := perJobResources(1)
+	hash := int(job["hash"].(float64)) // the share, or less when little memory is free
+	if hash < 64 || hash > fullHash || int(job["threads"].(float64)) != threads {
+		t.Fatalf("resources: %v threads, %v MB hash (budget %d, %d)", job["threads"], job["hash"], threads, fullHash)
+	}
 	for _, want := range []string{
 		fmt.Sprintf("setoption name Threads value %d", threads), fmt.Sprintf("setoption name Hash value %d", hash),
 		"setoption name Syzygy50MoveRule value false", "position fen " + startFEN, "go depth 12", "quit",
@@ -515,32 +533,91 @@ func TestPauseResumeStop(t *testing.T) {
 	}
 }
 
-func TestJobLimitAndShutdown(t *testing.T) {
+func (h *harness) queue(fen string, depth int) map[string]any {
+	h.t.Helper()
+	r := h.do("POST", "/api/analyze", map[string]any{"fen": fen, "depth": depth}, nil)
+	if r.status != 202 {
+		h.t.Fatalf("start: status %d %v", r.status, r.body)
+	}
+	return r.body
+}
+
+func (h *harness) job(id string) map[string]any {
+	return h.do("GET", "/api/analyze/"+id, nil, nil).body
+}
+
+// More analyses than slots: the extra ones wait and start by themselves, in
+// the order they were asked for.
+func TestQueue(t *testing.T) {
 	t.Setenv("MOCK_DELAY_MS", "50")
 	h := newHarness(t, 2)
 	first := h.start(startFEN, 200)
 	second := h.start(blackFEN, 200)
-	r := h.do("POST", "/api/analyze", map[string]any{"fen": startFEN, "depth": 5}, nil)
-	if r.status != 429 || !strings.Contains(r.body["error"].(string), "already have 2") {
-		t.Fatalf("third job: %d %v", r.status, r.body)
+	third := h.queue(startFEN, 200)
+	fourth := h.queue(blackFEN, 200)
+	if third["status"] != "queued" || third["queue_position"].(float64) != 1 ||
+		fourth["status"] != "queued" || fourth["queue_position"].(float64) != 2 {
+		t.Fatalf("the third and fourth job should wait: %v / %v", third, fourth)
 	}
+	thirdID, fourthID := third["job_id"].(string), fourth["job_id"].(string)
 	// The second job started while one was running, so it got half the threads.
 	total, _ := resourceBudget()
-	a, b := h.do("GET", "/api/analyze/"+first, nil, nil).body, h.do("GET", "/api/analyze/"+second, nil, nil).body
 	half := total / 2
 	if half < 1 {
 		half = 1
 	}
-	if int(a["threads"].(float64)) != total || int(b["threads"].(float64)) != half {
+	if a, b := h.job(first), h.job(second); int(a["threads"].(float64)) != total || int(b["threads"].(float64)) != half {
 		t.Fatalf("thread split: %v / %v of %d", a["threads"], b["threads"], total)
 	}
-	// Wait until both engines are really up before taking their process ids.
+	// All four are listed, oldest first.
+	list := h.do("GET", "/api/analyze", nil, nil).list
+	order := []string{}
+	for _, item := range list {
+		order = append(order, item.(map[string]any)["job_id"].(string))
+	}
+	if !reflect.DeepEqual(order, []string{first, second, thirdID, fourthID}) {
+		t.Fatalf("listing order: %v", list)
+	}
+	// A waiting job has no engine: it cannot be paused, but it can be dropped.
+	if r := h.do("POST", "/api/analyze/"+fourthID+"/pause", nil, nil); r.status != 409 {
+		t.Fatalf("pausing a waiting job: %d %v", r.status, r.body)
+	}
+	if r := h.do("POST", "/api/analyze/"+fourthID+"/stop", nil, nil); r.status != 200 {
+		t.Fatalf("dropping a waiting job: %d %v", r.status, r.body)
+	}
+	if job := h.job(fourthID); job["status"] != "stopped" || job["depth"].(float64) != 0 {
+		t.Fatalf("a dropped job should read as stopped and never have run: %v", job)
+	}
+	fifth := h.queue(blackFEN, 200)
+	if fifth["queue_position"].(float64) != 2 {
+		t.Fatalf("the fifth job should be second in line now: %v", fifth)
+	}
+	fifthID := fifth["job_id"].(string)
+	// A paused job keeps its slot: nothing is promoted.
 	for h.depth(first) < 1 || h.depth(second) < 1 {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if r := h.do("POST", "/api/analyze/"+second+"/pause", nil, nil); r.status != 200 {
-		t.Fatalf("pause: %d %v", r.status, r.body)
+	h.do("POST", "/api/analyze/"+second+"/pause", nil, nil)
+	time.Sleep(150 * time.Millisecond)
+	if job := h.job(thirdID); job["status"] != "queued" {
+		t.Fatalf("pausing must not free a slot: %v", job)
 	}
+	h.do("POST", "/api/analyze/"+second+"/resume", nil, nil)
+	// Ending one lets exactly the oldest waiting job start.
+	h.do("POST", "/api/analyze/"+first+"/stop", nil, nil)
+	h.waitStatus(first, "stopped")
+	promoted := h.waitStatus(thirdID, "running")
+	if promoted["queue_position"] != nil || int(promoted["threads"].(float64)) != half || promoted["hash"].(float64) < 64 {
+		t.Fatalf("promoted job: %v", promoted)
+	}
+	if job := h.job(fifthID); job["status"] != "queued" || job["queue_position"].(float64) != 1 {
+		t.Fatalf("the fifth job should be next in line: %v", job)
+	}
+	for h.depth(thirdID) < 1 {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Shutdown: engines end, and what was still waiting never starts.
 	pids := []int{}
 	h.srv.jobs.mu.Lock()
 	for _, j := range h.srv.jobs.jobs {
@@ -552,6 +629,7 @@ func TestJobLimitAndShutdown(t *testing.T) {
 	if len(pids) != 2 {
 		t.Fatalf("expected two engine processes, found %d", len(pids))
 	}
+	h.do("POST", "/api/analyze/"+second+"/pause", nil, nil)
 	h.srv.jobs.shutdown()
 	time.Sleep(200 * time.Millisecond)
 	for _, pid := range pids {
@@ -559,8 +637,88 @@ func TestJobLimitAndShutdown(t *testing.T) {
 			t.Errorf("engine process %d survived shutdown", pid)
 		}
 	}
-	if job := h.waitStatus(first, "stopped", "error"); job["status"] != "stopped" {
-		t.Fatalf("a job ended by shutdown should read as stopped: %v", job)
+	for _, id := range []string{second, thirdID, fifthID} {
+		if job := h.waitStatus(id, "stopped", "error", "complete", "running"); job["status"] != "stopped" {
+			t.Fatalf("a job ended by shutdown should read as stopped: %v", job)
+		}
+	}
+	if job := h.job(fifthID); job["depth"].(float64) != 0 || job["threads"].(float64) != 0 {
+		t.Fatalf("a waiting job must not start during shutdown: %v", job)
+	}
+	if r := h.do("POST", "/api/analyze", map[string]any{"fen": startFEN, "depth": 5}, nil); r.status != 503 {
+		t.Fatalf("starting during shutdown: %d %v", r.status, r.body)
+	}
+}
+
+func TestQueueRunsToTheEnd(t *testing.T) {
+	t.Setenv("MOCK_DELAY_MS", "10")
+	h := newHarness(t, 1)
+	ids := []string{h.start(startFEN, 4)}
+	for i := 0; i < 3; i++ {
+		ids = append(ids, h.queue(blackFEN, 4)["job_id"].(string))
+	}
+	// Never more than one engine at a time, and every job gets its turn.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		list := h.srv.jobs.active()
+		running, unfinished := 0, 0
+		for _, view := range list {
+			if view.Status == "running" {
+				running++
+			}
+			if view.Status != "complete" {
+				unfinished++
+			}
+		}
+		if running > 1 {
+			t.Fatalf("%d analyses ran at once with one slot", running)
+		}
+		if unfinished == 0 && len(list) == len(ids) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the queue did not drain: %+v", list)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	for _, id := range ids {
+		if job := h.job(id); job["status"] != "complete" || job["result"] == nil {
+			t.Fatalf("job %s: %v", id, job)
+		}
+	}
+}
+
+func TestQueueLimitAndEngineRecheck(t *testing.T) {
+	t.Setenv("MOCK_DELAY_MS", "50")
+	h := newHarness(t, 1)
+	running := h.start(startFEN, 200)
+	waiting := ""
+	for i := 0; i < maxQueuedJobs; i++ {
+		waiting = h.queue(blackFEN, 5)["job_id"].(string)
+	}
+	r := h.do("POST", "/api/analyze", map[string]any{"fen": startFEN, "depth": 5}, nil)
+	if r.status != 429 || !strings.Contains(r.body["error"].(string), "already waiting") {
+		t.Fatalf("a full queue should refuse: %d %v", r.status, r.body)
+	}
+	if list := h.do("GET", "/api/analyze", nil, nil).list; len(list) != maxQueuedJobs+1 {
+		t.Fatalf("listed %d jobs", len(list))
+	}
+	// Drop all waiting jobs but the last one.
+	for _, view := range h.srv.jobs.active() {
+		if view.Status == "queued" && view.JobID != waiting {
+			h.do("POST", "/api/analyze/"+view.JobID+"/stop", nil, nil)
+		}
+	}
+	if job := h.job(waiting); job["queue_position"].(float64) != 1 {
+		t.Fatalf("the remaining job should be first in line: %v", job)
+	}
+	// The engine file is checked again when a waiting job finally starts: if
+	// it is no longer a trusted build by then, nothing is run.
+	t.Setenv("MYCHESSDB_TEST_TRUST", "")
+	h.do("POST", "/api/analyze/"+running+"/stop", nil, nil)
+	job := h.waitStatus(waiting, "error", "complete", "stopped")
+	if job["status"] != "error" || !strings.Contains(job["error"].(string), "not an official") || job["depth"].(float64) != 0 {
+		t.Fatalf("a job must not start with an untrusted engine: %v", job)
 	}
 }
 

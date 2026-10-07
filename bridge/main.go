@@ -27,7 +27,7 @@ import (
 
 const (
 	appName     = "mychessdb-bridge"
-	version     = "1.0.2"
+	version     = "1.0.3"
 	defaultPort = 8765
 	maxBody     = 4 << 20
 )
@@ -166,6 +166,16 @@ func (s *server) statusBody() map[string]any {
 	}
 }
 
+// currentEngine returns the configured engine, after checking once more that
+// it is a verified official build.
+func (s *server) currentEngine() (string, error) {
+	path := s.store.get().EnginePath
+	if _, err := s.verifier.verify(path); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
 func (s *server) route(w http.ResponseWriter, r *http.Request) {
 	path, get, post := r.URL.Path, r.Method == http.MethodGet, r.Method == http.MethodPost
 	switch {
@@ -218,12 +228,11 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 			writeError(w, err)
 			return
 		}
-		enginePath := s.store.get().EnginePath
-		if _, err := s.verifier.verify(enginePath); err != nil {
+		if _, err := s.currentEngine(); err != nil {
 			writeJSON(w, 400, map[string]string{"error": "Stockfish is not ready: " + err.Error()})
 			return
 		}
-		view, err := s.jobs.start(enginePath, strings.TrimSpace(body.Fen), body.Depth, body.Context)
+		view, err := s.jobs.start(strings.TrimSpace(body.Fen), body.Depth, body.Context)
 		if err != nil {
 			writeError(w, err)
 			return
@@ -306,7 +315,7 @@ func main() {
 	flag.Var(&sites, "site", "address of the My Chess DB site allowed to use this bridge (https://...); remembered for next time")
 	port := flag.Int("port", defaultPort, "port to listen on (the site expects 8765)")
 	noOpen := flag.Bool("no-open", false, "do not open the site in the browser")
-	maxJobs := flag.Int("max-jobs", 4, "how many analyses may run at the same time")
+	maxJobs := flag.Int("max-jobs", 4, "how many analyses may run at the same time; more wait in a queue")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 	if *showVersion {
@@ -358,8 +367,8 @@ func main() {
 	srv := &server{
 		port: *port, store: store, verifier: verifier,
 		installer: &installer{dir: dir, store: store, verifier: verifier, status: installStatus{State: "idle"}},
-		jobs:      newJobManager(*maxJobs),
 	}
+	srv.jobs = newJobManager(*maxJobs, srv.currentEngine)
 
 	logf("My Chess DB engine bridge %s", version)
 	logf("Listening on http://127.0.0.1:%d for %s", *port, strings.Join(cfg.Sites, ", "))

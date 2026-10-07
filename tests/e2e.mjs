@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import assert from "node:assert/strict";
-import { positionKey } from "../web/chesslib.js";
+import { positionKey, replayUci } from "../web/chesslib.js";
 
 const require = createRequire(import.meta.url);
 let chromium;
@@ -208,7 +208,7 @@ try {
       return /Stockfish 19 ready/.test(status);
     }, "engine ready", 30000);
     assert.ok([...seen].some(s => /downloading Stockfish 19\.\.\. N%/.test(s)), `download progress was shown: ${[...seen].join(" | ")}`);
-    assert.match(await text(page, "#bridge-status"), /^Engine bridge \d+\.\d+\.\d+ connected · Stockfish 19 ready · \d+ threads?, \d+ MB hash$/);
+    assert.match(await text(page, "#bridge-status"), /^Engine bridge \d+\.\d+\.\d+ connected · Stockfish 19 ready · up to \d+ threads?, \d+ MB hash$/);
     assert.equal(await page.locator("#bridge-setup").isVisible(), false, "setup panel closes once connected");
     assert.match(bridge.output, /is installed/);
   });
@@ -420,6 +420,30 @@ try {
     assert.equal(backup.saved.length, (await apiSaved()).length);
     assert.ok(backup.history.length >= 1 && backup.contributor_keys.length === 1);
     assert.ok(!JSON.stringify(backup).includes(ADMIN));
+    // Importing the backup into itself changes nothing, and what was
+    // unverified is still unverified afterwards.
+    const before = await apiSaved();
+    assert.ok(before.some(e => !e.verified), "the test database has unverified entries");
+    await page.setInputFiles("#import-file", await download.path());
+    await until(async () => /Import finished: 0 stored/.test(await text(page, "#admin-note")), "backup re-import", 60000);
+    assert.deepEqual(await apiSaved(), before);
+    // Remove one unverified and one verified entry, then restore from the backup.
+    const byFen = list => new Map(list.map(e => [e.fen, e]));
+    const lost = [before.find(e => !e.verified), before.find(e => e.verified)];
+    for (const entry of lost) {
+      const r = await fetch(SITE + "/api/remove", { method: "POST", headers: { "Content-Type": "application/json", "X-Key": ADMIN, Origin: SITE }, body: JSON.stringify({ fen: entry.fen }) });
+      assert.deepEqual(await r.json(), { removed: true });
+    }
+    await page.setInputFiles("#import-file", await download.path());
+    await until(async () => /Import finished: 2 stored/.test(await text(page, "#admin-note")), "restore from backup", 60000);
+    const restored = byFen(await apiSaved());
+    // (The stand-in engine's lines are not real chess; import keeps the legal
+    // part of a line, which for a real engine is all of it.)
+    for (const entry of lost) {
+      assert.deepEqual(restored.get(entry.fen), { ...entry, pv: replayUci(entry.fen, entry.pv).uci }, "restored, verified flag included");
+    }
+    assert.equal(restored.get(lost[0].fen).verified, false);
+    assert.equal(restored.get(lost[1].fen).verified, true);
   });
 
   await step("admin can analyse at a custom depth and the result is verified", async () => {
@@ -435,6 +459,98 @@ try {
     await until(async () => (await text(page, "#key-role")) === "", "logged out");
     assert.equal(await value(page, "#depth"), "46");
     assert.equal(await page.locator("#admin-tools").isVisible(), false);
+  });
+
+  await step("the depth field starts at 46 on every visit, also for the admin", async () => {
+    assert.equal(await page.getAttribute("#depth", "autocomplete"), "off", "the browser must not restore an old value");
+    await page.fill("#key-input", ADMIN);
+    await page.press("#key-input", "Enter");
+    await until(async () => (await text(page, "#key-role")) === "Admin", "admin role");
+    await page.fill("#depth", "30");
+    await page.reload();
+    await page.waitForSelector("#board .square");
+    await until(async () => (await text(page, "#key-role")) === "Admin", "still admin after reload");
+    assert.equal(await value(page, "#depth"), "46");
+    assert.equal(await page.locator("#depth").isDisabled(), false);
+    await page.click("#key-login");   // logout
+    await until(async () => (await text(page, "#key-role")) === "", "logged out");
+  });
+
+  const center = async (page, name) => {
+    const box = await page.locator(`#board .square[data-index="${square(name)}"]`).boundingBox();
+    return [box.x + box.width / 2, box.y + box.height / 2];
+  };
+  async function drawArrow(page, from, to) {
+    await page.mouse.move(...await center(page, from));
+    await page.mouse.down({ button: "right" });
+    await page.mouse.move(...await center(page, to));
+    await page.mouse.up({ button: "right" });
+  }
+  const annotations = page => page.locator("#annotation-layer > *").count();
+  const jobItem = (page, index) => page.locator("#active-jobs li").nth(index);
+
+  await step("a fifth analysis waits in the queue and starts by itself; annotations stay with their position", async () => {
+    lichessBrowser = () => ({ status: 404, body: "" });
+    lichessAnswer = () => ({ status: 404, body: "" });
+    const before = (await apiSaved()).length;
+    // Four analyses, each paused as soon as it runs: all four slots are taken.
+    const openings = [["h2", "h4", "h7", "h5"], ["a2", "a4", "a7", "a5"], ["b1", "a3", "b8", "a6"], ["g1", "h3", "g8", "h6"]];
+    for (const [index, [a, b, c, d]] of openings.entries()) {
+      await toStart(page);
+      await move(page, a, b); await move(page, c, d);
+      await page.click("#analyze");
+      await until(async () => /Analyzing Stockfish\.\.\. depth \d+\/46/.test(await jobItem(page, index).innerText()), `job ${index + 1} running`);
+      await jobItem(page, index).locator("button:has-text('Pause')").click();
+      await until(async () => /Paused at depth/.test(await jobItem(page, index).innerText()), `job ${index + 1} paused`);
+    }
+    // The fifth and sixth are accepted and wait.
+    await toStart(page);
+    await move(page, "h2", "h3"); await move(page, "h7", "h6");
+    await page.click("#analyze");
+    await until(async () => /Waiting for a free engine slot \(number 1 in the queue\)/.test(await jobItem(page, 4).innerText()), "fifth job queued");
+    assert.equal(await text(page, "#analyze"), "Stop analysis");
+    assert.equal(await jobItem(page, 4).locator("button:has-text('Pause')").isDisabled(), true, "a waiting job cannot be paused");
+    await toStart(page);
+    await move(page, "a2", "a3"); await move(page, "a7", "a6");
+    await page.click("#analyze");
+    await until(async () => /number 2 in the queue/.test(await jobItem(page, 5).innerText()), "sixth job queued");
+
+    // An arrow drawn here must not show up on another analysis's position.
+    await drawArrow(page, "e2", "e4");
+    await drawArrow(page, "d2", "d2");
+    assert.equal(await annotations(page), 3, "an arrow (line and head) and a circle are drawn");
+    await jobItem(page, 0).locator(".job-opening").click();
+    await until(async () => /Paused at depth/.test(await text(page, "#status")), "first job's position loaded");
+    assert.equal(await annotations(page), 0, "annotations are cleared when another analysis's position is loaded");
+    await drawArrow(page, "g1", "f3");
+    assert.equal(await annotations(page), 2);
+    await page.click("#advanced-settings summary");
+    await page.click("#load");
+    assert.equal(await annotations(page), 0, "annotations are cleared when a position is loaded from FEN");
+    await page.click("#advanced-settings summary");
+
+    // A page opened now shows the same six jobs in the same order.
+    const second = await newPage();
+    await until(async () => (await jobTexts(second)).length === 6, "jobs restored in a new page");
+    const restored = await jobTexts(second);
+    assert.ok(restored.slice(0, 4).every(t => /Paused at depth/.test(t)) && /number 1 in the queue/.test(restored[4]) && /number 2 in the queue/.test(restored[5]), restored.join(" | "));
+    await second.close();
+
+    // A waiting job can be dropped; the one before it keeps its place.
+    await jobItem(page, 5).locator("button:has-text('Stop')").click();
+    await until(async () => /Analysis stopped/.test(await jobItem(page, 5).innerText()), "sixth job dropped");
+    assert.match(await jobItem(page, 4).innerText(), /number 1 in the queue/);
+    // Ending one of the four lets the waiting one start, with nobody clicking.
+    await jobItem(page, 0).locator("button:has-text('Stop')").click();
+    await until(async () => /Analysis stopped/.test(await jobItem(page, 0).innerText()), "first job stopped");
+    await until(async () => /Analyzing Stockfish\.\.\. depth \d+\/46|Best move saved/.test(await jobItem(page, 4).innerText()), "fifth job started by itself");
+    await until(async () => /Best move saved \(unverified\)/.test(await jobItem(page, 4).innerText()), "fifth job saved", 20000);
+    for (const index of [1, 2, 3]) await jobItem(page, index).locator("button:has-text('Resume')").click();
+    await until(async () => (await jobTexts(page)).filter(t => /Best move saved/.test(t)).length === 4, "the paused ones finish too", 30000);
+    assert.equal((await apiSaved()).length, before + 4);
+    while (await page.locator("#active-jobs li button:has-text('Dismiss')").count()) await page.click("#active-jobs li button:has-text('Dismiss')");
+    assert.match(bridge.output, /is waiting for a free slot/);
+    assert.match(bridge.output, /starts: depth 46, \d+ threads, \d+ MB hash \(\d+ MB of memory was free\)/);
   });
 
   await step("another site cannot use the bridge from the browser", async () => {

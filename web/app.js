@@ -6,7 +6,7 @@
 import * as chess from "./chesslib.js";
 
 const BRIDGE_URL = "http://127.0.0.1:8765";
-const BRIDGE_MIN_VERSION = "1.0.2";
+const BRIDGE_MIN_VERSION = "1.0.3";
 
 const symbols = {K:"♔",Q:"♕",R:"♖",B:"♗",N:"♘",P:"♙",k:"♚",q:"♛",r:"♜",b:"♝",n:"♞",p:"♟"};
 const boardEl = document.querySelector("#board"), annotationLayer = document.querySelector("#annotation-layer"), fenEl = document.querySelector("#fen");
@@ -161,6 +161,8 @@ function parseFen(fen, openingMoves=null, positionHistory=null) {
     board.push(out);
   }
   state.board=board; state.turn=parts[1]; state.castling=parts[2]; state.ep=parts[3]; state.selected=null; state.last=null; state.lastSound="move"; state.captured={w:[],b:[]}; state.analysis=null; state.savedMove=null; state.history=[];
+  // Arrows and circles belong to the position they were drawn on.
+  state.annotations=[]; state.annotationStart=null;
   const preferences=flipPreferences(), savedFlip=preferences[positionKey(fen)];
   if(typeof savedFlip==="boolean") state.flipped=savedFlip;
   state.openingTracking=Array.isArray(openingMoves)||positionKey(fen)===positionKey("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
@@ -768,6 +770,8 @@ async function loadSession() {
     status("Your saved key is no longer valid; you are logged out.");
   }
   state.role=session.role; state.roleLabel=session.label;
+  // Every visit starts at the site's depth, whatever was typed last time.
+  document.querySelector("#depth").value=state.minDepth;
   setRoleUI();
   return session;
 }
@@ -914,6 +918,9 @@ function versionAtLeast(version, minimum) {
   for(let i=0;i<3;i++){ if((a[i]||0)!==(b[i]||0)) return (a[i]||0)>(b[i]||0); }
   return true;
 }
+function bridgeOutdated() {
+  return bridgeState.connected && !!bridgeState.status && !versionAtLeast(bridgeState.status.version,BRIDGE_MIN_VERSION);
+}
 function installCommands() {
   const origin=location.origin;
   return {
@@ -937,21 +944,25 @@ function renderBridge() {
     engineInput.disabled=true;
     return;
   }
-  connect.style.display="none";
+  // An out-of-date bridge keeps working, but the button stays so the install
+  // command is one click away.
+  const outdated=bridgeOutdated();
+  connect.style.display=outdated?"":"none";
+  connect.textContent=bridgeState.waiting?"Hide setup":"Update";
   engineInput.disabled=false;
   if(document.activeElement!==engineInput) engineInput.value=info.engine.path||"";
   const state_=info.install.state;
   let message;
-  if(info.engine.ready) message=`${info.engine.name} ready · ${info.threads} thread${info.threads===1?"":"s"}, ${info.hash} MB hash`;
+  if(info.engine.ready) message=`${info.engine.name} ready · up to ${info.threads} thread${info.threads===1?"":"s"}, ${info.hash} MB hash`;
   else if(INSTALL_BUSY.includes(state_)) {
     message=state_==="downloading"?`downloading Stockfish 19... ${info.install.progress}%`:"preparing Stockfish 19...";
   } else {
     message=`Stockfish is not installed${info.install.error?` (${info.install.error})`:""}`;
     if(info.can_install) install.style.display="";
   }
-  if(!versionAtLeast(info.version,BRIDGE_MIN_VERSION)) message+=" · this bridge is out of date: run the install command again";
+  if(outdated) message+=" · this bridge is out of date: run the install command again (Update)";
   text.textContent=`Engine bridge ${info.version} connected · ${message}`;
-  if(bridgeState.waiting){ bridgeState.waiting=false; document.querySelector("#bridge-setup").style.display="none"; }
+  if(bridgeState.waiting && !outdated){ bridgeState.waiting=false; document.querySelector("#bridge-setup").style.display="none"; }
 }
 function scheduleBridgeCheck() {
   clearTimeout(bridgeState.timer);
@@ -995,7 +1006,7 @@ function showBridgeSetup(show=true) {
 document.querySelector("#bridge-connect").onclick=async()=>{
   if(bridgeState.waiting){ showBridgeSetup(false); return; }
   document.querySelector("#bridge-status").textContent="Engine bridge: looking for it...";
-  if(!await checkBridge()) showBridgeSetup(true);
+  if(!await checkBridge() || bridgeOutdated()) showBridgeSetup(true);
 };
 document.querySelector("#bridge-install").onclick=async()=>{
   try { await bridge("/api/engine/install",{method:"POST"}); } catch(error) { status(error.message); }
@@ -1141,7 +1152,7 @@ function renderActiveJobs() {
       const pauseBtn=actions.children[0];
       const pauseLabel=job.paused?"Resume":"Pause";
       if(pauseBtn.textContent!==pauseLabel) pauseBtn.textContent=pauseLabel;
-      pauseBtn.disabled=!job.stockfishJobId||job.cancelled;
+      pauseBtn.disabled=!job.stockfishJobId||job.cancelled||!!job.queued;
     }
   }
   for(const li of [...list.children])
@@ -1244,7 +1255,7 @@ async function stopAnalysisJob(job) {
   }
 }
 async function pauseAnalysisJob(job) {
-  if(!job || job.cancelled || !job.stockfishJobId || job.paused) return;
+  if(!job || job.cancelled || !job.stockfishJobId || job.paused || job.queued) return;
   try {
     await bridge(`/api/analyze/${job.stockfishJobId}/pause`,{method:"POST"});
     job.paused=true;
@@ -1272,6 +1283,7 @@ async function analyzeWithStockfish(job, fen, target) {
     context:{openingMoves:job.openingMoves,positionHistory:job.positionHistory,flipped:job.flipped}
   }});
   job.stockfishJobId=started.job_id;
+  if(started.status==="queued") showQueued(job,started);
   if(job.cancelled) {
     try { await bridge(`/api/analyze/${started.job_id}/stop`,{method:"POST"}); } catch(e) {}
     job.statusText="Analysis stopped"; updateJobProgressUI(job);
@@ -1279,11 +1291,24 @@ async function analyzeWithStockfish(job, fen, target) {
   }
   return pollStockfishJob(job,started.job_id);
 }
+function queuedText(view) {
+  return `Waiting for a free engine slot${view.queue_position?` (number ${view.queue_position} in the queue)`:""}; it starts by itself.`;
+}
+function showQueued(job, view) {
+  job.queued=true;
+  job.paused=false;
+  job.depth=0;
+  job.progress=0;
+  job.statusText=queuedText(view);
+  updateJobProgressUI(job);
+}
 async function pollStockfishJob(job, jobId) {
-  let d, failures=0;
-  for(let attempt=0;attempt<86400;attempt++){
+  const LIMIT_MS=12*60*60*1000;
+  let d, failures=0, worked=0, last=Date.now();
+  for(;;){
     if(job.cancelled) { job.statusText="Analysis stopped"; updateJobProgressUI(job); return null; }
-    await new Promise(r=>setTimeout(r,500));
+    // A waiting job changes rarely; look at it less often.
+    await new Promise(r=>setTimeout(r,job.queued?1500:500));
     try {
       d=await bridge(`/api/analyze/${jobId}`);
       failures=0;
@@ -1292,6 +1317,16 @@ async function pollStockfishJob(job, jobId) {
       if(error.status || ++failures>=6) throw error.status?error:Error("Lost contact with the engine bridge. If it is still running, reconnect to pick the analysis up again.");
       continue;
     }
+    const now=Date.now();
+    // Time spent waiting in the queue does not count towards the limit.
+    if(d.status!=="queued") worked+=now-last;
+    last=now;
+    if(d.status==="queued"){
+      showQueued(job,d);
+      continue;
+    }
+    job.queued=false;
+    if(worked>LIMIT_MS) break;
     if(d.status==="running"){
       job.paused=false;
       job.depth=d.depth||0;
@@ -1309,6 +1344,7 @@ async function pollStockfishJob(job, jobId) {
     }
     break;
   }
+  job.queued=false;
   if(job.cancelled || d?.status==="stopped") {
     job.finished=true;
     job.statusText="Analysis stopped";
@@ -1361,8 +1397,11 @@ async function restoreActiveAnalyses() {
         ? `Paused at depth ${depth}/${target}`
         : savedJob.status==="complete"
           ? "Collecting the finished analysis..."
-          : `Analyzing Stockfish... depth ${depth}/${target}`,
+          : savedJob.status==="queued"
+            ? queuedText(savedJob)
+            : `Analyzing Stockfish... depth ${depth}/${target}`,
       paused:savedJob.status==="paused",
+      queued:savedJob.status==="queued",
       openingMoves:Array.isArray(context.openingMoves)?[...context.openingMoves]:null,
       positionHistory:Array.isArray(context.positionHistory)&&context.positionHistory.length
         ? context.positionHistory.map(clonePosition)
@@ -1425,11 +1464,17 @@ document.querySelector("#flip").onclick=()=>{
 // Asks Lichess for its cached evaluation straight from the browser (shown to
 // the user and used to decide whether Stockfish is needed). What gets saved
 // is fetched again by the server, so nothing here has to be trusted.
+//
+// multiPv=1 on purpose. Lichess keeps several evaluations per position and
+// answers with the deepest one that has at least the number of lines asked
+// for. Its deepest evaluations are mostly single-line ones (that is what the
+// Lichess analysis board shows), so asking for more lines gets a shallower
+// answer.
 async function cloudEval(fen) {
   const nothing={depth:0,knodes:null,lines:[]};
   let response;
   try {
-    response=await fetch(`https://lichess.org/api/cloud-eval?${new URLSearchParams({fen,multiPv:"3"})}`,{headers:{Accept:"application/json"}});
+    response=await fetch(`https://lichess.org/api/cloud-eval?${new URLSearchParams({fen,multiPv:"1"})}`,{headers:{Accept:"application/json"}});
   } catch(error) {
     return {...nothing,unreachable:true};
   }
@@ -1583,7 +1628,10 @@ function toImportEntry(raw) {
   const knodesMatch=/(\d+)k nodes/.exec(depthText);
   const knodes=Number.isInteger(raw.knodes)?raw.knodes:knodesMatch?Number(knodesMatch[1]):null;
   const source=/lichess/i.test(String(raw.source||""))?"lichess":"stockfish";
-  return {fen:raw.fen,pv,evaluation:String(raw.evaluation??""),depth,knodes,source,saved_at:raw.saved_at};
+  // A backup marks unverified entries (false or 0); they stay unverified.
+  // The old saved_positions.json has no such mark and imports as verified.
+  const verified=!(raw.verified===false || raw.verified===0);
+  return {fen:raw.fen,pv,evaluation:String(raw.evaluation??""),depth,knodes,source,verified,saved_at:raw.saved_at};
 }
 document.querySelector("#import-file").addEventListener("change",async e=>{
   const file=e.target.files[0];
