@@ -32,7 +32,8 @@
   // "vars": {
   //   "MIN_DEPTH": "21",             // nothing shallower is saved or can be chosen
   //   "FULL_DEPTH": "46",            // depth shown in full colour; shallower saved moves are paler
-  //   "ANON_WRITES_PER_HOUR": "60"   // saves per hour for a visitor without a key
+  //   "ANON_WRITES_PER_HOUR": "600",      // saves per hour for a visitor without a key
+  //   "ANON_LIVE_WRITES_PER_HOUR": "500"  // how many of those live analysis may use
   // },
 
   "observability": { "enabled": true }

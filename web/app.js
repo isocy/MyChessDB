@@ -8,7 +8,7 @@
 import * as chess from "./chesslib.js";
 
 const BRIDGE_URL = "http://127.0.0.1:8765";
-const BRIDGE_MIN_VERSION = "1.0.5";
+const BRIDGE_MIN_VERSION = "1.0.6";
 
 const symbols = {K:"♔",Q:"♕",R:"♖",B:"♗",N:"♘",P:"♙",k:"♚",q:"♛",r:"♜",b:"♝",n:"♞",p:"♟"};
 const boardEl = document.querySelector("#board"), annotationLayer = document.querySelector("#annotation-layer"), fenEl = document.querySelector("#fen");
@@ -101,6 +101,32 @@ function expandPosition(fen) {
   for(const at of covered) if(!state.positions.has(at) && !positionRequests.has(at)) positionRequests.set(at,request);
   return request;
 }
+// Fetches what is saved for positions that are not known yet, such as the
+// moves before a position loaded with its history, so that going back through
+// them shows their results at once. One request per 100 positions.
+function prefetchPositions(fens) {
+  const wanted=new Map();
+  for(const fen of fens) {
+    const key=positionKey(fen);
+    if(!state.positions.has(key) && !positionRequests.has(key)) wanted.set(key,fen);
+  }
+  const all=[...wanted];
+  for(let at=0;at<all.length;at+=100) {
+    const chunk=all.slice(at,at+100), sentAt=positionWrites, epoch=positionsEpoch;
+    const query=chunk.slice(1).map(([,fen])=>`&also=${encodeURIComponent(fen)}`).join("");
+    const request=api(`/api/position?fen=${encodeURIComponent(chunk[0][1])}${query}`)
+      .then(data=>{
+        if(epoch!==positionsEpoch) return;
+        const answers=[[chunk[0][0],data.entries],...Object.entries(data.also||{})];
+        for(const [key,entries] of answers)
+          if(entries && !state.positions.has(key) && !((positionWrittenAt.get(key)||0)>sentAt)) state.positions.set(key,entries);
+        if(chunk.some(([key])=>key===positionKey(currentFen()))) refreshShownAnalysis();
+      })
+      .catch(()=>{})   // they are fetched one by one when shown instead
+      .finally(()=>{ for(const [key] of chunk) if(positionRequests.get(key)===request) positionRequests.delete(key); });
+    for(const [key] of chunk) positionRequests.set(key,request);
+  }
+}
 // Resolves once the position's entries are known. Also fetches the positions
 // one move away if that has not been done for this position yet.
 function loadPosition(fen) {
@@ -147,21 +173,32 @@ function pvSan(entry) {
 }
 function depthLabel(entry) {
   const depth=`${ENGINES[entry.source]} · Depth ${entry.depth}${entry.knodes?` | ${entry.knodes}k nodes`:""}`;
+  if(entry.liveAnalysis) {
+    const stored=entryFor(entry.fen,"stockfish");
+    if(stored && stored.depth===entry.depth && stored.move_uci===entry.move_uci) return `${depth} · live analysis, saved`;
+    const blocked=state.positions.has(positionKey(entry.fen))&&liveSaveBlocked(entry);
+    return `${depth} · live analysis${blocked&&entry.depth<state.minDepth?`, saved from depth ${state.minDepth}`:blocked?", not saved":""}`;
+  }
   if(entry.live) return `${depth} · ${entry.source==="lichess"?"not saved":"still analysing"}`;
   return `${depth}${entry.imported?" · Lichess database":""}${entry.verified?"":" · unverified"}`;
 }
 // What the page shows for a position: its saved analysis in the chosen view,
-// or what a job of that view's engine has found so far (job.live) once that
-// is deeper than the saved one.
+// or what a job of that view's engine (job.live) or the live analysis has
+// found so far, once that is deeper than the saved one. While the live
+// analysis is still searching the position it also stays on screen when it
+// is only as deep as the saved one, which is what happens each time it has
+// been saved: it turns to the saved (green) one when the search stops.
 function shownAnalysis(fen) {
   const saved=savedMatch(fen);
-  let live=null;
+  let live=liveAnalysisFor(fen);
   for(const source of state.view==="combined"?Object.keys(ENGINES):[state.view]) {
     const job=activeJobs.get(jobKey(source,fen));
     const found=job&&(!job.finished||job.unsaved)?job.live:null;
     if(found&&(!live||found.depth>live.depth)) live=found;
   }
-  return live&&(!saved||live.depth>saved.depth)?live:saved;
+  if(!live || !saved) return live||saved;
+  if(live.depth>saved.depth) return live;
+  return live.depth===saved.depth && live.liveAnalysis && liveSearching(fen) ? live : saved;
 }
 function applyShownAnalysis(fen) {
   const key=positionKey(fen);
@@ -179,6 +216,7 @@ function applyShownAnalysis(fen) {
   notationEl.textContent=shown?pvSan(shown).join(" "):"";
   document.querySelector("#evaluation").value=shown?.evaluation||"";
   document.querySelector("#depth-result").value=shown?depthLabel(shown):"";
+  syncLiveAnalysis();
 }
 // The same without rebuilding the board, so it is safe while a piece is
 // being dragged. Used when a running analysis reports a new depth.
@@ -355,6 +393,8 @@ function parseFen(fen, openingMoves=null, positionHistory=null) {
   }
   state.historyIndex=state.history.length-1;
   fenEl.value=fen; applyShownAnalysis(fen); render(); updateHistoryControls(); void updateOpeningDisplay();
+  // A position loaded with the moves before it: have their results ready too.
+  if(state.history.length>1) prefetchPositions(state.history.slice(0,-1).map(snapshotFen));
 }
 function moveSquares(uci) { return uci ? [("abcdefgh".indexOf(uci[0]) + (8-+uci[1])*8), ("abcdefgh".indexOf(uci[2]) + (8-+uci[3])*8)] : []; }
 function bestMoveSquares(uci) {
@@ -489,7 +529,7 @@ function render() {
     b.dataset.index=String(i);
     b.className="square "+(((displayRow+displayCol)%2)?"dark":"light");
     b.setAttribute("aria-label",`${squareName(i)}${piece?` ${piece}`:""}`);
-    if(best.includes(i))b.classList.add("best");
+    if(best.includes(i))b.classList.add(state.shown?.liveAnalysis?"live-best":"best");
     if(last.includes(i)&&!castle)b.classList.add("last");
     if(state.selected===i)b.classList.add("selected");
     if(castle)b.classList.add("legal-castle");
@@ -595,12 +635,13 @@ function hasAnyLegalMove(color) {
 function updateSelectionVisual() {
   const legalMoves=state.selected===null ? [] : getLegalDestinations(state.selected);
   const castleMoves=state.selected===null ? [] : getCastleHighlights(state.selected);
-  const best=bestMoveSquares(state.shownMove);
+  const best=bestMoveSquares(state.shownMove), liveBest=!!state.shown?.liveAnalysis;
   applyBestMoveColour();
   document.querySelectorAll("#board .square").forEach(square=>{
     const index=Number(square.dataset.index), piece=state.board[Math.floor(index/8)][index%8];
     const castle=castleMoves.includes(index);
-    square.classList.toggle("best",best.includes(index));
+    square.classList.toggle("best",best.includes(index)&&!liveBest);
+    square.classList.toggle("live-best",best.includes(index)&&liveBest);
     square.classList.toggle("last",state.last && moveSquares(state.last).includes(index) && !castle);
     square.classList.toggle("selected",state.selected===index);
     square.classList.toggle("legal-castle",castle);
@@ -1165,7 +1206,12 @@ async function checkBridge() {
   }
   renderBridge();
   scheduleBridgeCheck();
-  if(bridgeState.connected && !wasConnected) void restoreActiveAnalyses().catch(error=>status(error.message));
+  if(bridgeState.connected && !wasConnected) {
+    void restoreActiveAnalyses().catch(error=>status(error.message));
+    liveLost();   // whatever the bridge was told before, tell it again
+  }
+  if(!bridgeState.connected) liveLost();
+  syncLiveAnalysis();
   return bridgeState.connected;
 }
 function showBridgeSetup(show=true) {
@@ -1225,6 +1271,214 @@ async function requireEngine() {
   throw Error("Stockfish 19 is not installed in the engine bridge yet. Use \"Install Stockfish 19\" below.");
 }
 
+
+// ===========================================================================
+// Live analysis: the position on the board is analysed while it is there, the
+// way the Lichess analysis board does it. The engine bridge searches it
+// without a depth limit and moves on with every move. The page shows whichever
+// is deeper, the live analysis or the saved one, and once the live analysis is
+// deeper than the saved Stockfish 19 analysis it is saved like any other
+// Stockfish result (see saveLiveAnalysis). What was found is also kept for as
+// long as this page is open, so going back to a position shows it again at
+// once (and the search carries on from there).
+// ===========================================================================
+const LIVE_POLL_MS=250, LIVE_CACHE_SIZE=2000;
+// While a position stays on the board, its live analysis is saved at most
+// this often; leaving it saves the deepest result at once.
+const LIVE_SAVE_EVERY_MS=30000;
+const liveState={
+  enabled:true,
+  key:null,          // the position the bridge is searching for this page
+  timer:null,
+  sending:Promise.resolve(),   // the request to the bridge last sent
+  failed:null,       // why the bridge could not search it
+  elsewhere:false,   // another tab has taken the live analysis over
+  cache:new Map(),   // position key -> the deepest result found
+  saves:new Map(),   // position key -> {depth, at, timer, busy}: what was sent to be saved
+  saveNote:null,     // the outcome of the last save, for the button's tooltip
+  savePausedUntil:0  // after "too many saves": no saving before then
+};
+try { liveState.enabled=localStorage.getItem("chessdb_live")!=="off"; } catch(error) { /* on, the default */ }
+// What the live analysis has found for a position. shownAnalysis() shows it
+// when it is deeper than what is saved. Not in the Lichess view, which shows
+// Lichess's evaluations only.
+function liveAnalysisFor(fen) {
+  if(!liveState.enabled || state.view==="lichess") return null;
+  // Not before what is saved is known: a deeper saved result would replace it a moment later.
+  const key=positionKey(fen);
+  return state.positions.has(key)&&liveState.cache.get(key)||null;
+}
+// Why a live result would not be saved now, or null when it would be.
+function liveSaveBlocked(entry) {
+  if(entry.depth<state.minDepth) return `it is saved from depth ${state.minDepth} on`;
+  if(Date.now()<liveState.savePausedUntil) return "too many saves in the last hour";
+  if(!state.positions.has(positionKey(entry.fen))) return "what is saved for this position is not known yet";
+  return blockedByExisting(entry.fen,"stockfish",!!state.role,entry.depth,false);
+}
+// Saves the live analysis of a position once it is deeper than its saved
+// Stockfish 19 analysis, the same way an analysis from the button is saved
+// (verified with a key, unverified without). To stay well within the site's
+// limits it is saved at most every LIVE_SAVE_EVERY_MS while the position stays
+// on the board; `now` (the search is leaving the position) saves at once.
+function saveLiveAnalysis(key, now=false) {
+  const entry=liveState.cache.get(key);
+  if(!entry || !liveState.enabled) return;
+  let record=liveState.saves.get(key);
+  if(!record) liveState.saves.set(key,record={depth:0,at:0,timer:null,busy:false});
+  // busy: looked at again when the request in flight returns.
+  if(record.busy || entry.depth<=record.depth || liveSaveBlocked(entry)) return;
+  const wait=record.at+LIVE_SAVE_EVERY_MS-Date.now();
+  if(!now && wait>0) {
+    record.timer||=setTimeout(()=>{ record.timer=null; saveLiveAnalysis(key,true); },wait);
+    return;
+  }
+  clearTimeout(record.timer); record.timer=null;
+  record.busy=true; record.depth=entry.depth; record.at=Date.now();
+  // live: counted against the live analysis's own share of the hourly limit.
+  api("/api/saved",{body:{fen:entry.fen,source:"stockfish",depth:entry.depth,pv:entry.pv,evaluation:entry.evaluation,live:true}})
+    .then(outcome=>{
+      setPosition(entry.fen,outcome.entries);
+      liveState.saveNote=outcome.saved
+        ? `Depth ${entry.depth} was saved${outcome.entry.verified?"":" (unverified)"}.`
+        : `Depth ${entry.depth} was not saved: ${outcome.reason}`;
+    },error=>{
+      if(error.code==="WRITE_RATE_LIMIT"||error.code==="LIVE_WRITE_RATE_LIMIT") liveState.savePausedUntil=Math.ceil(Date.now()/3600000)*3600000;
+      liveState.saveNote=`Depth ${entry.depth} was not saved: ${error.message}`;
+    })
+    .finally(()=>{
+      record.busy=false;
+      renderLiveToggle();
+      saveLiveAnalysis(key);   // it may have gone deeper meanwhile
+    });
+}
+// Is the live analysis searching this position for this page right now?
+function liveSearching(fen) {
+  return liveState.key===positionKey(fen) && !liveState.elsewhere && !liveState.failed;
+}
+function liveAvailable() {
+  return bridgeState.connected && !!bridgeState.status?.live && !!bridgeState.status.engine.ready;
+}
+// The position the bridge should be searching now, or null for none.
+function liveTarget() {
+  if(!liveState.enabled || state.view==="lichess" || document.hidden || !liveAvailable()) return null;
+  const fen=currentFen();
+  // A Stockfish analysis of this position is running: it shows its own progress.
+  const job=activeJobs.get(jobKey("stockfish",fen));
+  if(job && !job.finished) return null;
+  try { if(!chess.legalMoves(chess.parseFen(fen)).length) return null; } catch(error) { return null; }
+  return fen;
+}
+function renderLiveToggle() {
+  const button=document.querySelector("#live-toggle");
+  button.setAttribute("aria-pressed",String(liveState.enabled));
+  button.classList.toggle("unavailable",!liveAvailable() || state.view==="lichess");
+  button.textContent=liveState.enabled?"Live analysis: on":"Live analysis: off";
+  let note;
+  if(!liveState.enabled) note="Live analysis is off. Click to analyse each position while it is on the board.";
+  else if(state.view==="lichess") note="Live analysis is not used in the Lichess view.";
+  else if(!bridgeState.connected) note="Live analysis runs Stockfish on this computer through the engine bridge, which is not connected (see \"Engine bridge\" below the analyse button).";
+  else if(!bridgeState.status?.live) note="This engine bridge is too old for live analysis: run the install command again (Update).";
+  else if(!bridgeState.status.engine.ready) note="Live analysis starts once Stockfish 19 is ready in the engine bridge.";
+  else if(liveState.failed) note=`Live analysis failed: ${liveState.failed}`;
+  else if(liveState.elsewhere) note="Live analysis is following another tab of this site. Click this page to bring it back.";
+  else if(liveState.key) note="Live analysis is running for this position. It is shown in purple while it is deeper than the saved analysis, and saved once it is deeper than the saved Stockfish 19 analysis.";
+  else note="Live analysis is on: each position is analysed while it is on the board. Click to turn it off.";
+  if(liveState.enabled && liveState.saveNote) note+=`\nLast save: ${liveState.saveNote}`;
+  button.title=note;
+}
+// Points the bridge at the position that should be searched, or stops it.
+// Safe to call whenever anything changes: it only acts on a change.
+function syncLiveAnalysis() {
+  const fen=liveTarget(), key=fen?positionKey(fen):null;
+  if(key!==liveState.key) {
+    const wasSearching=liveState.key!==null;
+    // Leaving a position: save the deepest it got to without waiting.
+    if(wasSearching) saveLiveAnalysis(liveState.key,true);
+    clearTimeout(liveState.timer);
+    liveState.key=key; liveState.failed=null; liveState.elsewhere=false;
+    // One request at a time, so they reach the bridge in order; one that has
+    // been overtaken by a newer position before it was sent is left out.
+    if(fen) liveState.sending=liveState.sending.then(()=>{
+      if(liveState.key!==key) return;
+      return bridge("/api/live",{body:{fen}}).then(
+        ()=>{ if(liveState.key===key) pollLiveAnalysis(key); },
+        error=>{ if(liveState.key===key){ liveState.failed=error.message; syncLiveAnalysis(); } });
+    });
+    else if(wasSearching && bridgeState.connected) liveState.sending=liveState.sending.then(()=>{
+      if(liveState.key!==null) return;
+      return bridge("/api/live/stop",{method:"POST"}).catch(()=>{});
+    });
+  }
+  renderLiveToggle();
+  // The search started, stopped or failed: a result as deep as the saved one
+  // turns purple or back to green.
+  if(shownAnalysis(currentFen())!==state.shown) refreshShownAnalysis();
+}
+// Forgets which position the bridge was given, so the next sync gives it again.
+function liveLost() {
+  clearTimeout(liveState.timer);
+  liveState.key=null; liveState.failed=null; liveState.elsewhere=false;
+}
+async function pollLiveAnalysis(key) {
+  let view;
+  try { view=await bridge("/api/live"); }
+  catch(error) {
+    // The bridge has gone; checkBridge picks it up again when it is back.
+    if(liveState.key===key){ liveLost(); renderBridge(); syncLiveAnalysis(); }
+    return;
+  }
+  takeLiveAnalysis(view);
+  if(liveState.key!==key) return;   // moved on: the new position has its own loop
+  if(!view.fen || positionKey(view.fen)!==key) {
+    // Another tab gave the bridge its own position. Leave it to that tab
+    // until this page is used again, so that two tabs do not take turns.
+    liveState.elsewhere=true;
+    syncLiveAnalysis();
+    return;
+  }
+  if(view.status==="error") { liveState.failed=view.error||"Stockfish stopped."; syncLiveAnalysis(); return; }
+  if(view.status==="done") return;   // searched as deep as Stockfish goes
+  if(view.status==="idle") {
+    // The bridge stopped it (this page had been quiet too long): start again.
+    liveLost();
+    syncLiveAnalysis();
+    return;
+  }
+  liveState.timer=setTimeout(()=>pollLiveAnalysis(key),LIVE_POLL_MS);
+}
+// Keeps the deepest result the bridge has reported for each position, shows
+// it if that position is on the board, and saves it if it is this page's.
+function takeLiveAnalysis(view) {
+  const best=view.best;
+  if(!view.fen || !best || !Array.isArray(best.pv) || !best.pv.length) return;
+  const key=positionKey(view.fen), cached=liveState.cache.get(key);
+  if(cached && (cached.depth>best.depth || cached.depth===best.depth && cached.pv.join(" ")===best.pv.join(" ") && cached.evaluation===best.evaluation)) return;
+  liveState.cache.delete(key);   // re-added at the end: the least recently found go first
+  liveState.cache.set(key,{live:true,liveAnalysis:true,source:"stockfish",fen:view.fen,depth:best.depth,move_uci:best.pv[0],pv:best.pv,evaluation:best.evaluation,knodes:best.nodes?Math.round(best.nodes/1000):null});
+  while(liveState.cache.size>LIVE_CACHE_SIZE) liveState.cache.delete(liveState.cache.keys().next().value);
+  if(key===positionKey(currentFen())) refreshShownAnalysis();
+  // Another tab's search is saved by that tab.
+  if(key===liveState.key) saveLiveAnalysis(key);
+}
+document.querySelector("#live-toggle").onclick=()=>{
+  playMoveSound("ui");
+  liveState.enabled=!liveState.enabled;
+  try { localStorage.setItem("chessdb_live",liveState.enabled?"on":"off"); } catch(error) { /* just not remembered */ }
+  applyShownAnalysis(currentFen());
+  render();
+  if(!liveState.enabled) status("Live analysis is off");
+  else if(!liveAvailable()) status("Live analysis is on. It runs Stockfish through the engine bridge: see \"Engine bridge\" below the analyse button.");
+  else status("Live analysis is on");
+};
+// A hidden tab does not keep the engine busy, and coming back starts it
+// again. Using a tab after another one had taken the analysis over takes it back.
+document.addEventListener("visibilitychange",()=>{
+  if(!document.hidden && liveState.elsewhere) liveLost();
+  syncLiveAnalysis();
+});
+window.addEventListener("focus",()=>{
+  if(liveState.elsewhere){ liveLost(); syncLiveAnalysis(); }
+});
 
 const openingLookups = new Map();
 function jobMatchesCurrent(job) { return positionKey(job.fen)===positionKey(currentFen()); }
@@ -1361,15 +1615,17 @@ function renderActiveJobs() {
 function syncAnalysisProgressForCurrentPosition() {
   const fen=currentFen(), job=currentJob();
   const progress=document.querySelector("#analysis-progress");
+  // The job's own text is in the list of analyses; only the bar is shown here.
   if(job){
     progress.style.display="block";
     progress.value=job.progress||0;
-    status(job.statusText||"");
   } else {
     progress.style.display="none";
   }
   // A job that found a new depth, or ended, changes what this position shows.
   if(shownAnalysis(fen)!==state.shown) refreshShownAnalysis();
+  // A job for this position started or ended: the live analysis gives way to it, or takes over.
+  else syncLiveAnalysis();
 }
 function updateJobProgressUI(job) {
   renderActiveJobs();

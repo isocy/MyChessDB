@@ -75,9 +75,12 @@ func main() {
 			blackToMove = len(fields) > 3 && fields[1] == "fen" && fields[3] == "b"
 		case "go":
 			depth := 10
-			for i := 1; i+1 < len(fields); i++ {
-				if fields[i] == "depth" {
+			for i := 1; i < len(fields); i++ {
+				if fields[i] == "depth" && i+1 < len(fields) {
 					depth, _ = strconv.Atoi(fields[i+1])
+				}
+				if fields[i] == "infinite" {
+					depth = 245
 				}
 			}
 			pv := env("MOCK_PV_WHITE", "e2e4 e7e5 g1f3 b8c6")

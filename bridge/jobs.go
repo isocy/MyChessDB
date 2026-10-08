@@ -149,6 +149,9 @@ type jobManager struct {
 	// again) at the moment a job really starts, which for a queued job can be
 	// long after it was requested.
 	engine func() (string, error)
+	// liveLoad: 1 while the live analysis is searching, so a job starting
+	// then leaves it its share of the processor. nil counts as 0.
+	liveLoad func() int
 }
 
 func newJobManager(maxJobs int, engine func() (string, error)) *jobManager {
@@ -344,7 +347,11 @@ func (m *jobManager) promoteLocked() {
 		if next == nil || live >= m.maxJobs {
 			return
 		}
-		threads, hash := perJobResources(running + 1)
+		liveSearch := 0
+		if m.liveLoad != nil {
+			liveSearch = m.liveLoad()
+		}
+		threads, hash := perJobResources(running + liveSearch + 1)
 		free := availableMemoryMB()
 		hash = fitHashToFreeMemory(hash, free)
 		next.view.Status, next.view.Threads, next.view.Hash = "running", threads, hash
@@ -356,6 +363,19 @@ func (m *jobManager) promoteLocked() {
 		}
 		go m.run(next)
 	}
+}
+
+// runningCount is how many analyses are searching right now.
+func (m *jobManager) runningCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	running := 0
+	for _, j := range m.jobs {
+		if j.view.Status == "running" {
+			running++
+		}
+	}
+	return running
 }
 
 func (m *jobManager) update(j *job, change func(view *jobView)) {

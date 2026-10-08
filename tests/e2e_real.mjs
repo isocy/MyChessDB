@@ -56,6 +56,9 @@ const startBridge = () => launch("bridge", bridgeFile, ["-site", SITE, "-no-open
 
 const browser = await chromium.launch({ args: ["--no-sandbox"] });
 const page = await browser.newPage();
+// Live analysis (on by default) would run one more Stockfish process; the
+// steps below count them, so it stays off here.
+await page.addInitScript(() => localStorage.setItem("chessdb_live", "off"));
 const problems = [];
 page.on("pageerror", error => problems.push(error.message));
 await page.route("https://raw.githubusercontent.com/**", route => route.fulfill({ status: 200, contentType: "image/svg+xml", body: "<svg xmlns='http://www.w3.org/2000/svg'/>" }));
@@ -116,7 +119,7 @@ try {
     // While it runs: the page shows the depth Stockfish finished last, one
     // below the depth it is searching, with that depth's move, score and line.
     const live = await until(() => page.evaluate(() => {
-      const searching = /depth (\d+)\/60/.exec(document.querySelector("#status").innerText);
+      const searching = /depth (\d+)\/60/.exec(document.querySelector("#active-jobs li .job-status")?.innerText || "");
       const finished = /^Stockfish 19 · Depth (\d+) · still analysing$/.exec(document.querySelector("#depth-result").value);
       return searching && finished && Number(finished[1]) >= 8 ? {
         searching: Number(searching[1]), finished: Number(finished[1]),

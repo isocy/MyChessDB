@@ -13,8 +13,12 @@
 //                          expected to reach. The site shows moves found
 //                          below this depth in a paler colour, and starts
 //                          new analyses at it.
-//   ANON_WRITES_PER_HOUR   optional, default 60. Save attempts allowed per
+//   ANON_WRITES_PER_HOUR   optional, default 600. Save attempts allowed per
 //                          hour for one visitor without a key.
+//   ANON_LIVE_WRITES_PER_HOUR  optional, default 500. How many of those may
+//                          come from the page's live analysis, which saves
+//                          by itself; the rest stay free for analyses run
+//                          with the analyse button.
 //   LICHESS_API_BASE       optional, default https://lichess.org (tests point
 //                          this at a local stand-in).
 //
@@ -237,20 +241,31 @@ function parsePosition(fen) {
   }
 }
 
-async function countAnonymousWrite(request, env) {
-  const limit = intSetting(env.ANON_WRITES_PER_HOUR, 60);
+// Counts a save attempt by a visitor without a key against the hourly
+// limits. Saves from the live analysis (`live`) are also counted on their
+// own and have a lower limit, so that live analysis cannot use up the hour
+// and leave nothing for an analysis that was run on purpose.
+async function countAnonymousWrite(request, env, live) {
+  const limit = intSetting(env.ANON_WRITES_PER_HOUR, 600);
+  const liveLimit = Math.min(limit, intSetting(env.ANON_LIVE_WRITES_PER_HOUR, 500));
   const hour = Math.floor(Date.now() / 3600000);
   const ip = request.headers.get("CF-Connecting-IP") || "unknown";
   // The address is salted and hashed; the raw IP is never stored.
   const visitor = (await sha256Hex(`${env.ADMIN_TOKEN || "mychessdb"}|${ip}`)).slice(0, 32);
-  const row = await env.DB.prepare(
+  const count = async bucket => (await env.DB.prepare(
     `INSERT INTO rate_limits (bucket, hour, count) VALUES (?, ?, 1)
      ON CONFLICT(bucket) DO UPDATE SET count = count + 1 RETURNING count`,
-  ).bind(`${visitor}:${hour}`, hour).first();
-  if (row.count === 1) {
+  ).bind(bucket, hour).first()).count;
+  if (live && await count(`${visitor}:live:${hour}`) > liveLimit) {
+    throw new HttpError(429, `Live analysis has saved ${liveLimit} times from this network in the last hour, its share of the limit. `
+      + "It goes on analysing without saving until the next hour; analyses run with the button can still be saved.",
+      { code: "LIVE_WRITE_RATE_LIMIT" });
+  }
+  const total = await count(`${visitor}:${hour}`);
+  if (total === 1) {
     await env.DB.prepare("DELETE FROM rate_limits WHERE hour < ?").bind(hour - 1).run();
   }
-  if (row.count > limit) {
+  if (total > limit) {
     throw new HttpError(429, `Too many saves from this network in the last hour (limit ${limit}). Try again later.`,
       { code: "WRITE_RATE_LIMIT" });
   }
@@ -320,7 +335,7 @@ async function handleSave(request, env) {
   const body = await readJson(request, 16 * 1024);
   const who = await identify(request, env);
   if (who.sentKey && !who.role) throw new HttpError(401, "That key is not recognised. Log out or enter a valid key.");
-  if (!who.role) await countAnonymousWrite(request, env);
+  if (!who.role) await countAnonymousWrite(request, env, body.live === true);
 
   const { position, fen, key } = parsePosition(body.fen);
   if (!legalMoves(position).length) throw new HttpError(400, "The game is already over in this position.");
@@ -388,16 +403,33 @@ async function handleSave(request, env) {
 
 // GET /api/position?fen=...            -> { entries }
 // GET /api/position?fen=...&next=1     -> { entries, next: { key: entries } }
+// GET /api/position?fen=...&also=...&also=...  -> { entries, also: { key: entries } }
 // With next=1 the answer also covers every position one legal move away,
 // keyed like the position itself, so the page has them before a move is played.
+// `also` names further positions (at most MAX_ALSO_POSITIONS), such as the
+// moves leading to a position the page loads, so that going back through them
+// shows their results at once. One that is not a position is left out.
+const MAX_ALSO_POSITIONS = 100;
 async function handlePosition(env, url) {
   const { position, key } = parsePosition(url.searchParams.get("fen"));
-  if (url.searchParams.get("next") !== "1") return json(200, { entries: await positionEntries(env, key) });
-  const nextKeys = legalMoves(position).map(move => positionKey(toFen(makeMove(position, move))));
-  const found = await entriesFor(env, [key, ...nextKeys]);
-  const next = {};
-  for (const nextKey of nextKeys) next[nextKey] = found.get(nextKey);
-  return json(200, { entries: found.get(key), next });
+  const withNext = url.searchParams.get("next") === "1";
+  const alsoKeys = [];
+  for (const fen of url.searchParams.getAll("also").slice(0, MAX_ALSO_POSITIONS)) {
+    try { alsoKeys.push(parsePosition(fen).key); } catch (error) { /* nothing is saved for it */ }
+  }
+  if (!withNext && !alsoKeys.length) return json(200, { entries: await positionEntries(env, key) });
+  const nextKeys = withNext ? legalMoves(position).map(move => positionKey(toFen(makeMove(position, move)))) : [];
+  const found = await entriesFor(env, [key, ...nextKeys, ...alsoKeys]);
+  const answer = { entries: found.get(key) };
+  if (withNext) {
+    answer.next = {};
+    for (const nextKey of nextKeys) answer.next[nextKey] = found.get(nextKey);
+  }
+  if (alsoKeys.length) {
+    answer.also = {};
+    for (const alsoKey of alsoKeys) answer.also[alsoKey] = found.get(alsoKey);
+  }
+  return json(200, answer);
 }
 
 // Removes one engine's entry for a position (it stays in the history).

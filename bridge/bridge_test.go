@@ -77,10 +77,12 @@ func newHarness(t *testing.T, maxJobs int) *harness {
 		installer: &installer{dir: dir, store: store, verifier: verifier, status: installStatus{State: "idle"}},
 	}
 	srv.jobs = newJobManager(maxJobs, srv.currentEngine)
+	srv.live = newLiveEngine(srv.currentEngine, srv.jobs.runningCount)
+	srv.jobs.liveLoad = srv.live.load
 	ts := httptest.NewServer(srv)
 	fmt.Sscanf(ts.URL[strings.LastIndex(ts.URL, ":")+1:], "%d", &srv.port)
 	h := &harness{t: t, srv: srv, http: ts, dir: dir, origin: site}
-	t.Cleanup(func() { srv.jobs.shutdown(); ts.Close() })
+	t.Cleanup(func() { srv.shutdown(); ts.Close() })
 	return h
 }
 
@@ -607,6 +609,153 @@ func TestBestFollowsTheSearchAndSurvivesStop(t *testing.T) {
 	if done["status"] != "complete" || done["depth"].(float64) != 6 || !reflect.DeepEqual(done["best"], done["result"]) ||
 		done["result"].(map[string]any)["depth"].(float64) != 6 {
 		t.Fatalf("finished job: %v", done)
+	}
+}
+
+// liveAt waits until the live analysis reports fen searched to the end to at
+// least depth, and returns what it reports then.
+func (h *harness) liveAt(fen string, depth float64) map[string]any {
+	h.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		view := h.do("GET", "/api/live", nil, nil).body
+		if best, _ := view["best"].(map[string]any); view["fen"] == fen && best != nil && best["depth"].(float64) >= depth {
+			return view
+		}
+		if time.Now().After(deadline) {
+			h.t.Fatalf("live analysis of %s never reached depth %v: %v", fen, depth, view)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func countLines(t *testing.T, path, line string) int {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, sent := range strings.Split(string(raw), "\n") {
+		if strings.TrimSpace(sent) == line {
+			count++
+		}
+	}
+	return count
+}
+
+// Live analysis searches the position the site shows without a depth limit,
+// moves to the next position at once, and keeps one engine for all of them.
+func TestLiveAnalysis(t *testing.T) {
+	t.Setenv("MOCK_DELAY_MS", "10")
+	engineLog := filepath.Join(t.TempDir(), "engine.log")
+	t.Setenv("MOCK_LOG", engineLog)
+	h := newHarness(t, 4)
+
+	if r := h.do("GET", "/api/status", nil, nil); r.body["live"] != true {
+		t.Fatalf("the status names live analysis: %v", r.body)
+	}
+	if r := h.do("POST", "/api/live", map[string]any{"fen": "8/8/8 w - -\nquit"}, nil); r.status != 400 {
+		t.Fatalf("a bad FEN is refused: %d %v", r.status, r.body)
+	}
+	if r := h.do("POST", "/api/live", map[string]any{"fen": startFEN}, map[string]string{"Origin": ""}); r.status != 403 {
+		t.Fatalf("only the site may start it: %d %v", r.status, r.body)
+	}
+
+	r := h.do("POST", "/api/live", map[string]any{"fen": startFEN}, nil)
+	if r.status != 202 || r.body["fen"] != startFEN || r.body["status"] != "starting" || r.body["best"] != nil {
+		t.Fatalf("start: %d %v", r.status, r.body)
+	}
+	view := h.liveAt(startFEN, 3)
+	best := view["best"].(map[string]any)
+	if view["status"] != "running" || best["move_uci"] != "e2e4" || best["evaluation"] != "+0.32" {
+		t.Fatalf("live analysis of the start position: %v", view)
+	}
+	if view["depth"].(float64) < best["depth"].(float64) {
+		t.Fatalf("searching depth %v is behind finished depth %v", view["depth"], best["depth"])
+	}
+	if h.srv.live.load() != 1 {
+		t.Fatal("a live search counts when the processor is shared out")
+	}
+
+	// The next position replaces it at once: nothing found for the first
+	// position is ever reported for the second.
+	r = h.do("POST", "/api/live", map[string]any{"fen": blackFEN}, nil)
+	if r.body["fen"] != blackFEN || r.body["best"] != nil || r.body["depth"].(float64) != 0 {
+		t.Fatalf("switching position: %v", r.body)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		view = h.do("GET", "/api/live", nil, nil).body
+		best, _ = view["best"].(map[string]any)
+		if view["fen"] != blackFEN {
+			t.Fatalf("the live analysis went back to another position: %v", view)
+		}
+		if best != nil {
+			if best["move_uci"] != "e7e5" || best["evaluation"] != "-0.32" {
+				t.Fatalf("a line of the previous position was reported: %v", view)
+			}
+			if best["depth"].(float64) >= 3 {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no live analysis of the second position: %v", view)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Stop: no longer searching; what was found can still be read.
+	r = h.do("POST", "/api/live/stop", nil, nil)
+	if r.status != 200 || r.body["status"] != "idle" {
+		t.Fatalf("stop: %d %v", r.status, r.body)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if view = h.do("GET", "/api/live", nil, nil).body; view["status"] != "idle" || view["best"] == nil || h.srv.live.load() != 0 {
+		t.Fatalf("after stop: %v (load %d)", view, h.srv.live.load())
+	}
+
+	// And it starts again on the same engine.
+	h.do("POST", "/api/live", map[string]any{"fen": startFEN}, nil)
+	h.liveAt(startFEN, 2)
+	if n := countLines(t, engineLog, "ucinewgame"); n != 1 {
+		t.Fatalf("one engine for every position (ucinewgame sent %d times)", n)
+	}
+	if n := countLines(t, engineLog, "go infinite"); n != 3 {
+		t.Fatalf("each position is searched without a depth limit (go infinite sent %d times)", n)
+	}
+}
+
+// When the site stops asking (the tab was closed), the search stops, and
+// later the engine ends too.
+func TestLiveAnalysisStopsWhenTheSiteGoesAway(t *testing.T) {
+	savedStop, savedQuit, savedTick := liveIdleStop, liveIdleQuit, liveTick
+	liveIdleStop, liveIdleQuit, liveTick = 300*time.Millisecond, 600*time.Millisecond, 20*time.Millisecond
+	t.Cleanup(func() { liveIdleStop, liveIdleQuit, liveTick = savedStop, savedQuit, savedTick })
+	t.Setenv("MOCK_DELAY_MS", "10")
+	engineLog := filepath.Join(t.TempDir(), "engine.log")
+	t.Setenv("MOCK_LOG", engineLog)
+	h := newHarness(t, 4)
+
+	h.do("POST", "/api/live", map[string]any{"fen": startFEN}, nil)
+	h.liveAt(startFEN, 1)
+	time.Sleep(liveIdleStop + 200*time.Millisecond)
+	if h.srv.live.load() != 0 {
+		t.Fatal("the search did not stop when nobody asked for it")
+	}
+	time.Sleep(liveIdleQuit + 300*time.Millisecond)
+	// "quit" once from the check that the engine is genuine, once from here.
+	if n := countLines(t, engineLog, "quit"); n != 2 {
+		t.Fatalf("the idle engine was not closed (quit sent %d times)", n)
+	}
+	if view := h.do("GET", "/api/live", nil, nil).body; view["status"] != "idle" || view["fen"] != startFEN {
+		t.Fatalf("after going idle: %v", view)
+	}
+
+	// The next position starts a new engine.
+	h.do("POST", "/api/live", map[string]any{"fen": blackFEN}, nil)
+	if view := h.liveAt(blackFEN, 2); view["status"] != "running" {
+		t.Fatalf("restarted: %v", view)
 	}
 }
 

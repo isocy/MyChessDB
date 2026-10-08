@@ -97,6 +97,57 @@ the database; they are shown in the shared notation.)
 When a position is shown, the page also fetches what is stored for every
 position one legal move away (`GET /api/position?fen=...&next=1`, one request,
 at most a few hundred rows read), so a move shows its result at once.
+When a position is loaded together with the moves that led to it (from the
+list of analyses), what is stored for those earlier positions comes in one
+more request (`&also=...`, up to 100 positions per request), so going back
+through the moves shows their results at once. A live analysis result is not
+shown for a position until what is stored for it is known, so it never
+flashes purple before a deeper saved result.
+
+### Live analysis
+
+The position on the board is analysed while it is there, the way the Lichess
+analysis board does it: the bridge runs Stockfish on it without a depth
+limit, and the next move moves the search to the next position at once.
+Whether or not an analysis is saved for the position, the page shows the
+deeper of the two, the saved analysis or the live one. While the live one is
+shown, its best move is painted purple, not green, and the depth line ends
+in "live analysis". While the search goes on it stays purple also when it is
+only as deep as the saved result, as right after it has been saved ("live
+analysis, saved"); once the search stops (another position, the tab hidden,
+live analysis turned off) that saved result is shown in green.
+
+- **Saving.** Once the live analysis is deeper than the position's saved
+  Stockfish 19 analysis (or reaches depth 21 where none is saved), it is
+  saved like an analysis from the button: verified with a key, unverified
+  without, under the same rules (an unverified result never replaces a
+  verified one; the depth line then ends in "not saved"). While the position
+  stays on the board it is saved at most every 30 seconds; when the search
+  leaves the position (another move, the tab hidden) its deepest result is
+  saved at once. For visitors without a key, live analysis may save at most
+  500 times an hour (`ANON_LIVE_WRITES_PER_HOUR`) out of the 600 save
+  attempts they have in all (`ANON_WRITES_PER_HOUR`), so at least 100 stay
+  for analyses run with the button. When either limit is hit, live analysis
+  stops saving until the next hour and keeps analysing.
+- What was found is also kept while the page is open, so going back to a
+  position shows it again at once, and the search carries on from there.
+- It is not run for a position whose own analysis (from the button) is
+  running, which is shown as before, or where the game is over.
+- It is used in the Stockfish 19 view and in Combined (there it competes
+  with Lichess's entry too: the deepest is shown). The Lichess view does not
+  use it.
+- **Live analysis: on/off** above the board, next to Flip board, turns it on and off.
+  It is on until turned off; the choice is remembered in the browser. It needs
+  the engine bridge 1.0.6 or newer; without it the button's tooltip says why
+  nothing happens. The tooltip also tells how the last save went.
+
+The bridge keeps one Stockfish process for it, apart from the analysis
+queue: it gets a share of the processor like one more running analysis (and
+analyses started meanwhile count it), with a hash table of at most 1 GB. It
+stops searching when the page has not asked for 10 seconds (the tab was
+closed; a hidden tab stops it at once), and ends the process after another
+minute. Only one position is searched at a time: when two tabs are open, the
+one used last has it.
 
 ### The Lichess evaluation database
 
@@ -283,8 +334,12 @@ Log in with the admin token, then open **Position and engine settings**:
 Settings you can change in `wrangler.jsonc` under `vars`: `MIN_DEPTH`
 (default 21: nothing shallower is saved or can be chosen), `FULL_DEPTH`
 (default 46: the depth shown in full colour, and where the depth field
-starts) and `ANON_WRITES_PER_HOUR` (default 60 save attempts per hour for a
-visitor without a key).
+starts), `ANON_WRITES_PER_HOUR` (default 600 save attempts per hour for a
+visitor without a key) and `ANON_LIVE_WRITES_PER_HOUR` (default 500: how many
+of those may come from live analysis, which saves by itself; the rest stay
+for analyses run with the button). At about three rows written per save,
+600 an hour lets one visitor without a key use some 15% of the free plan's
+daily row writes in eight busy hours; lower it if many such visitors come.
 
 ## Free plan limits to know about
 
@@ -321,14 +376,15 @@ kept in the repository).
 plus `SHA256SUMS`. To rebuild after changing `bridge/*.go`, install Go and run
 `scripts\build_bridge.ps1` (Windows) or `sh scripts/build_bridge.sh`, then
 deploy. Builds are reproducible: the same Go version gives byte-identical
-files. The current ones (1.0.5) were built with Go 1.24.7.
+files. The current ones (1.0.6) were built with Go 1.24.7.
 
 The site names the bridge version it expects (`BRIDGE_MIN_VERSION` in
 `web/app.js`). An older bridge keeps working, and the site shows an **Update**
 button with the install command. Bridges before 1.0.4 do not report the search
 as it goes, so with them the page is not updated during an analysis and Stop
 saves nothing. Bridges before 1.0.5 cannot hold an analysis that is waiting in
-the queue; with them its Pause button stays disabled.
+the queue; with them its Pause button stays disabled. Bridges before 1.0.6 have
+no live analysis.
 
 If you deploy from another copy of the repository, make sure `web/bridge/` is
 there (commit it, or build it), otherwise the install command has nothing to
@@ -388,6 +444,10 @@ Not yet run anywhere:
   and marking Stockfish's memory as the first to give up when memory runs
   short
 - bridges 1.0.4 and 1.0.5 on Windows and macOS (their tests ran on Linux)
+- bridge 1.0.6 (live analysis) on Linux and macOS, and the live-analysis
+  step of `tests/e2e.mjs`. The bridge tests (`npm run test:bridge`) passed on
+  Windows 11 with Go 1.24.7; the page side was checked in Chromium against a
+  stand-in for the bridge's live-analysis API.
 - the depth field's reset, the evaluation bar and the paler greens in Firefox
   (tested in Chromium)
 - anything on macOS (bridge, installer, launcher)

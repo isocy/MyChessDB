@@ -115,6 +115,12 @@ function startBridge() {
 const browser = await chromium.launch({ args: ["--no-sandbox"] });
 const context = await browser.newContext({ acceptDownloads: true });
 await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: SITE });
+// Live analysis is on by default. The steps written before it expect only
+// saved and requested analyses on the page, so it starts off here; its own
+// step turns it on.
+await context.addInitScript(() => {
+  try { if (localStorage.getItem("chessdb_live") === null) localStorage.setItem("chessdb_live", "off"); } catch (error) { /* another origin */ }
+});
 const problems = [];
 const bridgeRequests = [];
 let lichessBrowser = () => ({ status: 404, body: "" });
@@ -150,13 +156,15 @@ async function toStart(page) {   // back to the first position of the current hi
   if (await page.locator("#history-first").isEnabled()) await page.click("#history-first");
 }
 const bestSquares = page => page.$$eval("#board .square.best", nodes => nodes.map(node => Number(node.dataset.index)).sort((a, b) => a - b));
+const liveSquares = page => page.$$eval("#board .square.live-best", nodes => nodes.map(node => Number(node.dataset.index)).sort((a, b) => a - b));
 const FULL_GREEN = "rgb(114, 213, 114)";
 // Everything the page shows about the analysis of the position on the board, read in one go.
 const shown = page => page.evaluate(() => ({
   evaluation: document.querySelector("#evaluation").value,
   depth: document.querySelector("#depth-result").value,
   line: document.querySelector("#notation").innerText,
-  status: document.querySelector("#status").innerText,
+  // The progress of the analysis of this position, from its line in the list of analyses.
+  job: document.querySelector("#active-jobs li .job-status")?.innerText || "",
   colours: [...document.querySelectorAll("#board .square.best")].map(node => getComputedStyle(node).backgroundColor),
   bar: {
     white: parseFloat(document.querySelector("#eval-bar-white").style.height),
@@ -259,7 +267,7 @@ try {
       const now = await shown(page);
       return /^Stockfish 19 · Depth \d+ · still analysing$/.test(now.depth) ? now : null;
     }, "the running analysis on the page");
-    const searching = Number(/depth (\d+)\/46/.exec(live.status)[1]), finished = Number(/Depth (\d+)/.exec(live.depth)[1]);
+    const searching = Number(/depth (\d+)\/46/.exec(live.job)[1]), finished = Number(/Depth (\d+)/.exec(live.depth)[1]);
     assert.equal(finished, searching - 1, `searching depth ${searching}: the page shows the last finished depth`);
     assert.deepEqual([live.evaluation, live.line], ["-0.32", "e5 Nf3 Nc6 Bb5"]);
     assert.deepEqual(await bestSquares(page), [square("e7"), square("e5")].sort((a, b) => a - b), "best move so far is highlighted");
@@ -341,7 +349,7 @@ try {
     const seen = { kept: 0, live: 0, wrong: [] };
     await until(async () => {
       const now = await shown(page);
-      const running = /Analyzing Stockfish\.\.\. depth (\d+)\/46/.exec(now.status);
+      const running = /Analyzing Stockfish\.\.\. depth (\d+)\/46/.exec(now.job);
       if (running) {
         const finished = Number(running[1]) - 1;   // the page writes both from the same answer of the bridge
         const kept = finished <= stoppedDepth;
@@ -349,7 +357,7 @@ try {
         if (now.depth !== expected) seen.wrong.push(`engine finished ${finished}: page shows "${now.depth}"`);
         seen[kept ? "kept" : "live"]++;
       }
-      return /Best move saved \(unverified\)/.test(now.status);
+      return /Best move saved \(unverified\)/.test(now.job);
     }, "second run saved", 20000);
     assert.deepEqual(seen.wrong, []);
     assert.ok(seen.kept >= 1 && seen.live >= 1, `saw both phases: ${JSON.stringify(seen)}`);
@@ -749,7 +757,7 @@ try {
     await drawArrow(page, "d2", "d2");
     assert.equal(await annotations(page), 3, "an arrow (line and head) and a circle are drawn");
     await jobItem(page, 0).locator(".job-opening").click();
-    await until(async () => /Paused at depth/.test(await text(page, "#status")), "first job's position loaded");
+    await until(async () => /^Loaded /.test(await text(page, "#status")), "first job's position loaded");
     assert.equal(await annotations(page), 0, "annotations are cleared when another analysis's position is loaded");
     await drawArrow(page, "g1", "f3");
     assert.equal(await annotations(page), 2);
@@ -818,6 +826,93 @@ try {
     await fresh.click("#flip");
     assert.deepEqual(await sides(), ["White captured +1:1", "Black captured:0"]);
     await fresh.close();
+  });
+
+  await step("live analysis: each position is analysed while it is shown; the deeper result is shown, and saved once it is deeper than the saved one", async () => {
+    const keyAfter = uci => positionKey(`${replayUci(START, [uci]).keys[0]} 0 1`);
+    const stockfishAt = async key => (await apiSaved()).find(e => e.source === "stockfish" && positionKey(e.fen) === key);
+    const play = (p, uci) => move(p, uci.slice(0, 2), uci.slice(2, 4));
+    const stockfishKeys = new Set((await apiSaved()).filter(e => e.source === "stockfish").map(e => positionKey(e.fen)));
+    const unsaved = ["a2a3", "h2h3", "a2a4", "h2h4", "b2b3", "g2g3"].find(uci => !stockfishKeys.has(keyAfter(uci)));
+    const unsavedKey = keyAfter(unsaved), e4Key = keyAfter("e2e4");
+    const e4Before = await stockfishAt(e4Key);
+    assert.ok(e4Before, "1. e4 has a saved Stockfish analysis from the steps above");
+    const bridgeLive = async () => (await fetch("http://127.0.0.1:8765/api/live")).json();
+    const depthOf = label => Number((/Depth (\d+)/.exec(label) || [])[1]);
+    const livePage = await newPage();
+    await showView(livePage, "stockfish");
+    await until(async () => /Stockfish 19 ready/.test(await text(livePage, "#bridge-status")), "bridge connected");
+    // With a key the live analysis is saved as verified, as from the analyse button.
+    const keyed = (await text(livePage, "#key-role")) !== "";
+    assert.equal(await text(livePage, "#live-toggle"), "Live analysis: off");
+    await play(livePage, unsaved);
+    await sleep(500);
+    assert.deepEqual([await liveSquares(livePage), await value(livePage, "#depth-result")], [[], ""], "off: nothing is analysed");
+
+    await livePage.click("#live-toggle");
+    assert.equal(await text(livePage, "#live-toggle"), "Live analysis: on");
+    const found = await until(async () => {
+      const now = await shown(livePage);
+      return /^Stockfish 19 · Depth \d+ \| \d+k nodes · live analysis(, saved from depth 21)?$/.test(now.depth) && depthOf(now.depth) >= 3 ? now : null;
+    }, "live analysis on the page");
+    assert.equal(found.evaluation, "-0.32");
+    assert.match(found.line, /^e5 Nf3/);
+    assert.deepEqual(await liveSquares(livePage), [square("e7"), square("e5")].sort((a, b) => a - b), "the best move so far is highlighted");
+    assert.deepEqual(await bestSquares(livePage), [], "but not in green");
+    const purple = await livePage.$$eval("#board .square.live-best", nodes => nodes.map(node => getComputedStyle(node).backgroundColor));
+    assert.ok(purple.every(colour => distanceFromFull(colour) > 100), `purple, far from the green: ${purple}`);
+    assert.ok(!found.bar.empty && found.bar.side === "for-black", JSON.stringify(found.bar));
+    const running = await bridgeLive();
+    assert.deepEqual([running.status, positionKey(running.fen)], ["running", unsavedKey]);
+
+    // Saved as soon as it reaches the least depth that is saved ...
+    const first = await until(() => stockfishAt(unsavedKey), "saved from depth 21");
+    assert.ok(first.depth >= 21 && first.move_uci === "e7e5" && first.verified === keyed, JSON.stringify(first));
+    // ... then at most every 30 seconds while the position stays on the board ...
+    await sleep(1500);
+    assert.equal((await stockfishAt(unsavedKey)).depth, first.depth, "not saved again within 30 seconds");
+    const reached = depthOf(await value(livePage, "#depth-result"));
+    assert.ok(reached > first.depth, `the search went on: ${reached}`);
+    // ... and leaving it saves the deepest result at once.
+    await toStart(livePage);
+    const flushed = await until(async () => { const entry = await stockfishAt(unsavedKey); return entry.depth > first.depth ? entry : null; }, "saved on leaving");
+    assert.ok(flushed.depth >= reached, `${flushed.depth} >= ${reached}`);
+
+    // A position with a deeper saved analysis shows that one, in green, until
+    // the live analysis passes it; past it, the live analysis is shown and saved.
+    await play(livePage, "e2e4");
+    const before = await shown(livePage);
+    assert.ok(depthOf(before.depth) === e4Before.depth && !/live analysis/.test(before.depth), before.depth);
+    assert.equal((await bestSquares(livePage)).length, 2);
+    const passed = await until(async () => {
+      const now = await shown(livePage);
+      return /live analysis/.test(now.depth) && depthOf(now.depth) > e4Before.depth ? now : null;
+    }, "the live analysis passes the saved depth", 20000);
+    assert.equal((await liveSquares(livePage)).length, 2);
+    if (keyed || !e4Before.verified) {
+      await until(async () => (await stockfishAt(e4Key)).depth > e4Before.depth, "saved past the saved depth");
+    } else {
+      // Without a key a verified analysis is never replaced.
+      assert.match(passed.depth, /, not saved$/);
+      await sleep(1000);
+      assert.equal((await stockfishAt(e4Key)).depth, e4Before.depth);
+    }
+
+    // Back again: shown at once, at least as deep as before.
+    await toStart(livePage);
+    await play(livePage, unsaved);
+    assert.ok(depthOf((await shown(livePage)).depth) >= flushed.depth, "shown again at once");
+    await until(async () => { const now = await bridgeLive(); return now.status === "running" && positionKey(now.fen) === unsavedKey; }, "searching again");
+
+    // Off: the saved analysis is shown, the search stops, and the choice is remembered.
+    await livePage.click("#live-toggle");
+    assert.deepEqual(await liveSquares(livePage), []);
+    assert.doesNotMatch(await value(livePage, "#depth-result"), /live analysis/);
+    await until(async () => (await bridgeLive()).status === "idle", "stopped when turned off");
+    await livePage.reload();
+    await livePage.waitForSelector("#board .square");
+    assert.equal(await text(livePage, "#live-toggle"), "Live analysis: off");
+    await livePage.close();
   });
 
   await step("another site cannot use the bridge from the browser", async () => {

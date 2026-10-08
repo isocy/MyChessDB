@@ -367,6 +367,32 @@ const at = async (env, fen) => (await call(env, "GET", "/api/position?fen=" + en
   eq((await call(env, "POST", "/api/saved", { body: sf(START, 61), key: ADMIN })).status, 200, "keys are not limited");
   ok(!JSON.stringify(env.DB.db.prepare("SELECT * FROM rate_limits").all()).includes("203.0.113.5"), "raw IPs are not stored");
 }
+{
+  // Live analysis has a share of the limit of its own; the rest stays free
+  // for analyses run with the button.
+  const env = makeEnv({ ANON_WRITES_PER_HOUR: "5", ANON_LIVE_WRITES_PER_HOUR: "2" });
+  const live = depth => call(env, "POST", "/api/saved", { body: { ...sf(START, depth), live: true } });
+  const statuses = [];
+  for (let depth = 40; depth < 43; depth++) statuses.push((await live(depth)).status);
+  eq(statuses, [200, 200, 429], "the third live save in an hour is refused");
+  eq((await live(50)).data.code, "LIVE_WRITE_RATE_LIMIT");
+  const r = await call(env, "POST", "/api/saved", { body: sf(START, 60) });
+  eq([r.status, r.data.saved], [200, true], "a save from the button still goes through");
+  eq((await call(env, "POST", "/api/saved", { body: sf(START, 61) })).status, 200);
+  eq((await call(env, "POST", "/api/saved", { body: sf(START, 62) })).status, 200);
+  eq((await call(env, "POST", "/api/saved", { body: sf(START, 63) })).data.code, "WRITE_RATE_LIMIT", "the overall limit still holds");
+  eq((await call(env, "POST", "/api/saved", { body: { ...sf(START, 70), live: true }, key: ADMIN })).status, 200, "keys are not limited");
+  // Without a setting: 600 in all, 500 of them for live analysis.
+  const defaults = makeEnv();
+  let refused = null;
+  for (let i = 0; i < 501 && !refused; i++) {
+    const answer = await call(defaults, "POST", "/api/saved", { body: { ...sf(START, 21 + (i % 200)), live: true } });
+    if (answer.status === 429) refused = i;
+  }
+  eq(refused, 500, "live analysis may save 500 times an hour by default");
+  for (let i = 0; i < 100; i++) eq((await call(defaults, "POST", "/api/saved", { body: sf(START, 30) })).status, 200);
+  eq((await call(defaults, "POST", "/api/saved", { body: sf(START, 30) })).data.code, "WRITE_RATE_LIMIT", "600 in all by default");
+}
 
 // --- a position and the ones a move away ---------------------------------
 {
@@ -384,6 +410,14 @@ const at = async (env, fen) => (await call(env, "GET", "/api/position?fen=" + en
   eq([wide.status, Object.keys(wide.data.next).length, wide.data.entries], [200, 218, {}]);
   eq((await call(env, "GET", "/api/position?next=1&fen=" + encodeURIComponent(MATED))).data, { entries: {}, next: {} }, "no moves, nothing next");
   eq((await call(env, "GET", "/api/position?next=1&fen=nonsense")).status, 400);
+  // `also`: further positions in the same request (the moves before a loaded position).
+  const also = (await call(env, "GET", `/api/position?fen=${encodeURIComponent(START)}&also=${encodeURIComponent(AFTER_E4)}&also=nonsense`)).data;
+  eq(Object.keys(also).sort(), ["also", "entries"]);
+  const e4Key = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -";
+  eq([also.entries.stockfish.depth, Object.keys(also.also), also.also[e4Key].stockfish.depth], [40, [e4Key], 30],
+    "the positions named with also come too; one that is not a position is left out");
+  const both = (await call(env, "GET", `/api/position?next=1&fen=${encodeURIComponent(START)}&also=${encodeURIComponent(MATED)}`)).data;
+  eq([Object.keys(both.next).length, both.also["rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq -"]], [20, {}], "next and also together");
 }
 
 // --- import -------------------------------------------------------------

@@ -27,7 +27,7 @@ import (
 
 const (
 	appName     = "mychessdb-bridge"
-	version     = "1.0.5"
+	version     = "1.0.6"
 	defaultPort = 8765
 	maxBody     = 4 << 20
 )
@@ -64,6 +64,7 @@ type server struct {
 	verifier  *engineVerifier
 	installer *installer
 	jobs      *jobManager
+	live      *liveEngine
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -162,7 +163,7 @@ func (s *server) statusBody() map[string]any {
 	return map[string]any{
 		"app": appName, "version": version, "os": runtime.GOOS, "arch": runtime.GOARCH,
 		"engine": engine, "install": s.installer.current(), "can_install": canInstall,
-		"threads": threads, "hash": hash, "max_jobs": s.jobs.maxJobs,
+		"threads": threads, "hash": hash, "max_jobs": s.jobs.maxJobs, "live": true,
 	}
 }
 
@@ -239,6 +240,40 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, 202, view)
 
+	case path == "/api/live" && get:
+		writeJSON(w, 200, s.live.get())
+
+	case path == "/api/live" && post:
+		var body struct {
+			Fen string `json:"fen"`
+		}
+		if err := s.readBody(r, &body); err != nil {
+			writeError(w, err)
+			return
+		}
+		if strings.TrimSpace(body.Fen) == "" {
+			writeJSON(w, 400, map[string]string{"error": "no position given"})
+			return
+		}
+		if _, err := s.currentEngine(); err != nil {
+			writeJSON(w, 400, map[string]string{"error": "Stockfish is not ready: " + err.Error()})
+			return
+		}
+		view, err := s.live.set(strings.TrimSpace(body.Fen))
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, 202, view)
+
+	case path == "/api/live/stop" && post:
+		view, err := s.live.set("")
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, 200, view)
+
 	case strings.HasPrefix(path, "/api/analyze/"):
 		parts := strings.Split(strings.TrimPrefix(path, "/api/analyze/"), "/")
 		id := parts[0]
@@ -284,6 +319,12 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, 404, map[string]string{"error": "Not found"})
 	}
+}
+
+// shutdown stops every engine the bridge started.
+func (s *server) shutdown() {
+	s.live.shutdown()
+	s.jobs.shutdown()
 }
 
 // alreadyRunning reports whether another copy of the bridge owns the port.
@@ -378,6 +419,8 @@ func main() {
 		installer: &installer{dir: dir, store: store, verifier: verifier, status: installStatus{State: "idle"}},
 	}
 	srv.jobs = newJobManager(*maxJobs, srv.currentEngine)
+	srv.live = newLiveEngine(srv.currentEngine, srv.jobs.runningCount)
+	srv.jobs.liveLoad = srv.live.load
 
 	logf("My Chess DB engine bridge %s", version)
 	logf("Listening on http://127.0.0.1:%d for %s", *port, strings.Join(cfg.Sites, ", "))
@@ -408,11 +451,11 @@ func main() {
 		// Stop answering first, so the site sees the bridge go away instead
 		// of a half-finished job state.
 		_ = httpServer.Close()
-		srv.jobs.shutdown()
+		srv.shutdown()
 	}()
 	if err := httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		srv.jobs.shutdown()
+		srv.shutdown()
 		log.Fatal(err)
 	}
-	srv.jobs.shutdown()
+	srv.shutdown()
 }
