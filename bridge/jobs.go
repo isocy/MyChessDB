@@ -110,9 +110,13 @@ type jobView struct {
 	Fen         string `json:"fen"`
 	Threads     int    `json:"threads"`
 	Hash        int    `json:"hash"`
-	// QueuePosition: 1 for the job that starts next; only set while queued.
-	QueuePosition int    `json:"queue_position,omitempty"`
-	Error         string `json:"error,omitempty"`
+	// QueuePosition: 1 for the job that starts next; only set while queued
+	// and not held.
+	QueuePosition int `json:"queue_position,omitempty"`
+	// Held: a queued job that was paused. It keeps its place but is passed
+	// over when a slot frees up, until it is resumed.
+	Held  bool   `json:"held,omitempty"`
+	Error string `json:"error,omitempty"`
 	// Best is the deepest depth searched to the end so far: its best move,
 	// line and evaluation. It follows the search while the job runs, and it
 	// is what remains of a job that was stopped before reaching its target.
@@ -204,10 +208,10 @@ func newJobID() string {
 // snapshot copies a job's view. The caller holds m.mu.
 func (m *jobManager) snapshot(j *job) jobView {
 	view := j.view
-	if view.Status == "queued" {
+	if view.Status == "queued" && !view.Held {
 		view.QueuePosition = 1
 		for _, other := range m.jobs {
-			if other.view.Status == "queued" && other.seq < j.seq {
+			if other.view.Status == "queued" && !other.view.Held && other.seq < j.seq {
 				view.QueuePosition++
 			}
 		}
@@ -332,7 +336,7 @@ func (m *jobManager) promoteLocked() {
 			case "paused":
 				live++
 			case "queued":
-				if next == nil || j.seq < next.seq {
+				if !j.view.Held && (next == nil || j.seq < next.seq) {
 					next = j
 				}
 			}
@@ -578,6 +582,14 @@ func (m *jobManager) pause(id string) error {
 	if err != nil {
 		return err
 	}
+	if j.view.Status == "queued" {
+		// Not started yet: keep it waiting, but let the jobs behind it go first.
+		if !j.view.Held {
+			j.view.Held = true
+			logf("Analysis %s is held in the queue.", shortID(j))
+		}
+		return nil
+	}
 	if j.view.Status != "running" || j.proc == nil {
 		return &httpError{409, "Job is not currently running"}
 	}
@@ -594,6 +606,14 @@ func (m *jobManager) resume(id string) error {
 	j, err := m.find(id)
 	if err != nil {
 		return err
+	}
+	if j.view.Status == "queued" {
+		if j.view.Held {
+			// Back in line where it was; it starts now if a slot is free.
+			j.view.Held = false
+			m.promoteLocked()
+		}
+		return nil
 	}
 	if j.view.Status != "paused" || j.proc == nil {
 		return &httpError{409, "Job is not currently paused"}

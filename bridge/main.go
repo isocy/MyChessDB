@@ -27,7 +27,7 @@ import (
 
 const (
 	appName     = "mychessdb-bridge"
-	version     = "1.0.4"
+	version     = "1.0.5"
 	defaultPort = 8765
 	maxBody     = 4 << 20
 )
@@ -266,6 +266,15 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				writeError(w, err)
 				return
+			}
+			if parts[1] != "stop" {
+				// A queued job stays queued: held when paused, back in line when resumed.
+				if view, ok := s.jobs.get(id); ok && view.Status == "queued" {
+					state = "queued"
+					if view.Held {
+						state = "held"
+					}
+				}
 			}
 			writeJSON(w, 200, map[string]string{"status": state})
 		default:

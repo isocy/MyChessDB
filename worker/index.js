@@ -39,7 +39,7 @@
 // (scripts/lichess_db.mjs). They are read-only reference data: a position's
 // Lichess entry is the deeper of the saved one and the one in lichess_db.
 
-import { parseFen, toFen, positionKey, legalMoves, sanitizeUciLine } from "../web/chesslib.js";
+import { parseFen, toFen, positionKey, legalMoves, makeMove, sanitizeUciLine } from "../web/chesslib.js";
 
 const MAX_DEPTH = 245;
 const MAX_PV_PLIES = 60;
@@ -144,7 +144,7 @@ function publicEntry(row) {
     fen: row.fen,
     move_uci: row.move_uci,
     pv: row.pv.split(" "),
-    evaluation: row.evaluation,
+    evaluation: plainEvaluation(row.evaluation),
     depth: row.depth,
     knodes: row.knodes,
     source: row.source,
@@ -153,11 +153,20 @@ function publicEntry(row) {
   };
 }
 
-// How a Lichess score is written in an entry: "Lichess Cloud: +0.25" or
-// "Lichess Cloud: mate -4" (always from White's side).
+// How a Lichess score is written in an entry, the same way as a Stockfish
+// one: "+0.25" in pawns or "#-4" for a forced mate, always from White's side.
 function lichessEvaluation(cp, mate) {
-  if (Number.isInteger(mate)) return `Lichess Cloud: mate ${mate}`;
-  return `Lichess Cloud: ${cp >= 0 ? "+" : "-"}${(Math.abs(cp) / 100).toFixed(2)}`;
+  if (Number.isInteger(mate)) return `#${mate}`;
+  return `${cp >= 0 ? "+" : "-"}${(Math.abs(cp) / 100).toFixed(2)}`;
+}
+
+// Lichess entries saved before the two engines shared one notation read
+// "Lichess Cloud: +0.25" or "Lichess Cloud: mate -4"; they are shown in the
+// shared one.
+function plainEvaluation(text) {
+  const old = /^Lichess Cloud: (?:mate (-?\d+)|([+-]\d+\.\d+))$/.exec(text || "");
+  if (!old) return text;
+  return old[1] !== undefined ? `#${old[1]}` : old[2];
 }
 
 // A row of lichess_db in the shape of an entry. `imported` tells the page
@@ -184,17 +193,38 @@ function importedEntry(row) {
  * in the imported Lichess database.
  */
 async function positionEntries(env, key) {
-  const [saved, imported] = await env.DB.batch([
-    env.DB.prepare(`SELECT ${COLUMNS} FROM saved_positions WHERE position_key = ?`).bind(key),
-    env.DB.prepare("SELECT position_key, depth, knodes, cp, mate, pv FROM lichess_db WHERE position_key = ?").bind(key),
-  ]);
-  const entries = {};
-  for (const row of saved.results) entries[row.source] = publicEntry(row);
-  const fromDatabase = imported.results[0];
-  if (fromDatabase && !(entries.lichess && entries.lichess.depth >= fromDatabase.depth)) {
-    entries.lichess = importedEntry(fromDatabase);
+  return (await entriesFor(env, [key])).get(key);
+}
+
+// D1 takes at most 100 bound values in one statement.
+const KEYS_PER_STATEMENT = 90;
+
+/** positionEntries for several positions at once: a Map from key to entries. */
+async function entriesFor(env, keys) {
+  const unique = [...new Set(keys)];
+  const statements = [];
+  for (let at = 0; at < unique.length; at += KEYS_PER_STATEMENT) {
+    const chunk = unique.slice(at, at + KEYS_PER_STATEMENT);
+    const marks = chunk.map(() => "?").join(", ");
+    statements.push(
+      env.DB.prepare(`SELECT ${COLUMNS} FROM saved_positions WHERE position_key IN (${marks})`).bind(...chunk),
+      env.DB.prepare(`SELECT position_key, depth, knodes, cp, mate, pv FROM lichess_db WHERE position_key IN (${marks})`).bind(...chunk),
+    );
   }
-  return entries;
+  const results = statements.length ? await env.DB.batch(statements) : [];
+  const found = new Map(unique.map(key => [key, {}]));
+  const imported = [];
+  results.forEach((result, index) => {
+    for (const row of result.results || []) {
+      if (index % 2 === 0) found.get(row.position_key)[row.source] = publicEntry(row);
+      else imported.push(row);
+    }
+  });
+  for (const row of imported) {
+    const entries = found.get(row.position_key);
+    if (!(entries.lichess && entries.lichess.depth >= row.depth)) entries.lichess = importedEntry(row);
+  }
+  return found;
 }
 
 function parsePosition(fen) {
@@ -356,9 +386,18 @@ async function handleSave(request, env) {
   return json(200, { saved: false, reason, entry: current, entries });
 }
 
+// GET /api/position?fen=...            -> { entries }
+// GET /api/position?fen=...&next=1     -> { entries, next: { key: entries } }
+// With next=1 the answer also covers every position one legal move away,
+// keyed like the position itself, so the page has them before a move is played.
 async function handlePosition(env, url) {
-  const { key } = parsePosition(url.searchParams.get("fen"));
-  return json(200, { entries: await positionEntries(env, key) });
+  const { position, key } = parsePosition(url.searchParams.get("fen"));
+  if (url.searchParams.get("next") !== "1") return json(200, { entries: await positionEntries(env, key) });
+  const nextKeys = legalMoves(position).map(move => positionKey(toFen(makeMove(position, move))));
+  const found = await entriesFor(env, [key, ...nextKeys]);
+  const next = {};
+  for (const nextKey of nextKeys) next[nextKey] = found.get(nextKey);
+  return json(200, { entries: found.get(key), next });
 }
 
 // Removes one engine's entry for a position (it stays in the history).

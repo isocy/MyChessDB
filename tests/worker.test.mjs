@@ -237,14 +237,14 @@ const at = async (env, fen) => (await call(env, "GET", "/api/position?fen=" + en
   // whatever the browser claims is ignored
   let r = await call(env, "POST", "/api/saved", { body: { fen: ITALIAN, source: "lichess", depth: 99, pv: ["a2a3"], evaluation: "+9.99" } });
   eq(r.status, 200);
-  eq(r.data.entry, { fen: ITALIAN, move_uci: "e1g1", pv: ["e1g1", "g8f6", "d2d3", "d7d6", "c2c3"], evaluation: "Lichess Cloud: +0.25",
+  eq(r.data.entry, { fen: ITALIAN, move_uci: "e1g1", pv: ["e1g1", "g8f6", "d2d3", "d7d6", "c2c3"], evaluation: "+0.25",
     depth: 50, knodes: 123456, source: "lichess", verified: true, saved_at: r.data.entry.saved_at }, "castling normalised, server data used");
   ok(lichessCalls[0].endsWith("&multiPv=1") && lichessCalls[0].includes(encodeURIComponent(ITALIAN)), "asked Lichess for this position");
 
   // Any depth from 21 on is stored, with or without a key.
   lichess = lichessJson({ depth: 40, knodes: 10, pvs: [{ moves: "e2e4", cp: -31 }] });
   r = await call(env, "POST", "/api/saved", { body: { fen: START, source: "lichess" } });
-  eq([r.data.saved, r.data.entry.evaluation, r.data.entry.depth, r.data.entry.verified], [true, "Lichess Cloud: -0.31", 40, true]);
+  eq([r.data.saved, r.data.entry.evaluation, r.data.entry.depth, r.data.entry.verified], [true, "-0.31", 40, true]);
   // Below depth 21 a Lichess evaluation is not stored, with a key either.
   lichess = lichessJson({ depth: 20, knodes: 10, pvs: [{ moves: "e7e5", cp: 15 }] });
   for (const key of [undefined, ADMIN]) {
@@ -258,7 +258,7 @@ const at = async (env, fen) => (await call(env, "GET", "/api/position?fen=" + en
 
   lichess = lichessJson({ depth: 60, knodes: 10, pvs: [{ moves: "e7e5", mate: -4 }] });
   r = await call(env, "POST", "/api/saved", { body: { fen: AFTER_E4, source: "lichess" } });
-  eq(r.data.entry.evaluation, "Lichess Cloud: mate -4");
+  eq(r.data.entry.evaluation, "#-4");
 
   lichess = () => new Response("", { status: 404 });
   r = await call(env, "POST", "/api/saved", { body: { fen: MATED.replace("Pq", "P1").replace(" w ", " w "), source: "lichess" } });
@@ -328,9 +328,9 @@ const at = async (env, fen) => (await call(env, "GET", "/api/position?fen=" + en
   add(AFTER_E4, 48, 77, null, -3, "e7e5");
   // The page gets it as the position's Lichess entry.
   eq(await at(env, START), { lichess: {
-    fen: START, move_uci: "e2e4", pv: ["e2e4", "e7e5", "g1f3"], evaluation: "Lichess Cloud: +0.23", depth: 60, knodes: 999,
+    fen: START, move_uci: "e2e4", pv: ["e2e4", "e7e5", "g1f3"], evaluation: "+0.23", depth: 60, knodes: 999,
     source: "lichess", verified: true, saved_at: null, imported: true } });
-  eq((await at(env, AFTER_E4_EP_ALWAYS)).lichess.evaluation, "Lichess Cloud: mate -3", "found whichever way the FEN is written");
+  eq((await at(env, AFTER_E4_EP_ALWAYS)).lichess.evaluation, "#-3", "found whichever way the FEN is written");
   eq(await at(env, ITALIAN), {});
   // A Stockfish entry saved from the site stands beside it.
   await call(env, "POST", "/api/saved", { body: sf(START, 30) });
@@ -368,6 +368,24 @@ const at = async (env, fen) => (await call(env, "GET", "/api/position?fen=" + en
   ok(!JSON.stringify(env.DB.db.prepare("SELECT * FROM rate_limits").all()).includes("203.0.113.5"), "raw IPs are not stored");
 }
 
+// --- a position and the ones a move away ---------------------------------
+{
+  const env = makeEnv();
+  eq((await call(env, "POST", "/api/saved", { body: sf(AFTER_E4, 30, ["e7e5"], "+0.30"), key: ADMIN })).status, 200);
+  eq((await call(env, "POST", "/api/saved", { body: sf(START, 40), key: ADMIN })).status, 200);
+  const r = await call(env, "GET", "/api/position?next=1&fen=" + encodeURIComponent(START));
+  eq(r.data.entries.stockfish.depth, 40);
+  eq(Object.keys(r.data.next).length, 20, "one entry for each legal move");
+  eq(r.data.next["rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -"].stockfish.depth, 30, "keyed the way the page keys positions");
+  eq(Object.values(r.data.next).filter(entries => Object.keys(entries).length).length, 1, "the others have nothing");
+  // More positions than one statement can look up: the 218-move position.
+  const MANY = "R6R/3Q4/1Q4Q1/4Q3/2Q4Q/Q4Q2/pp1Q4/kBNN1KB1 w - - 0 1";
+  const wide = await call(env, "GET", "/api/position?next=1&fen=" + encodeURIComponent(MANY));
+  eq([wide.status, Object.keys(wide.data.next).length, wide.data.entries], [200, 218, {}]);
+  eq((await call(env, "GET", "/api/position?next=1&fen=" + encodeURIComponent(MATED))).data, { entries: {}, next: {} }, "no moves, nothing next");
+  eq((await call(env, "GET", "/api/position?next=1&fen=nonsense")).status, 400);
+}
+
 // --- import -------------------------------------------------------------
 {
   const env = makeEnv();
@@ -385,6 +403,7 @@ const at = async (env, fen) => (await call(env, "GET", "/api/position?fen=" + en
     [AFTER_E4, 46, true, null, "2026-09-27T01:00:00.000Z"],
     [START, 75, true, 695524, "2026-09-26T17:37:11.158Z"],
   ].sort());
+  eq((await at(env, START)).lichess.evaluation, "+0.19", "an entry written the old way reads in the shared notation");
   // importing again changes nothing
   r = await call(env, "POST", "/api/import", { body: { entries: entries.slice(0, 2) }, key: ADMIN });
   eq([r.data.stored, r.data.kept_existing], [0, 2]);

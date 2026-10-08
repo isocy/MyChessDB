@@ -655,10 +655,7 @@ func TestQueue(t *testing.T) {
 	if !reflect.DeepEqual(order, []string{first, second, thirdID, fourthID}) {
 		t.Fatalf("listing order: %v", list)
 	}
-	// A waiting job has no engine: it cannot be paused, but it can be dropped.
-	if r := h.do("POST", "/api/analyze/"+fourthID+"/pause", nil, nil); r.status != 409 {
-		t.Fatalf("pausing a waiting job: %d %v", r.status, r.body)
-	}
+	// A waiting job can be dropped (holding one is TestHoldInQueue).
 	if r := h.do("POST", "/api/analyze/"+fourthID+"/stop", nil, nil); r.status != 200 {
 		t.Fatalf("dropping a waiting job: %d %v", r.status, r.body)
 	}
@@ -725,6 +722,74 @@ func TestQueue(t *testing.T) {
 	if r := h.do("POST", "/api/analyze", map[string]any{"fen": startFEN, "depth": 5}, nil); r.status != 503 {
 		t.Fatalf("starting during shutdown: %d %v", r.status, r.body)
 	}
+}
+
+// Pausing a waiting job holds it: it keeps its place in the list but the
+// jobs behind it start first, until it is resumed.
+func TestHoldInQueue(t *testing.T) {
+	t.Setenv("MOCK_DELAY_MS", "50")
+	h := newHarness(t, 1)
+	first := h.start(startFEN, 200)
+	a := h.queue(blackFEN, 200)["job_id"].(string)
+	b := h.queue(startFEN, 200)["job_id"].(string)
+	post := func(id, action string) string {
+		t.Helper()
+		r := h.do("POST", "/api/analyze/"+id+"/"+action, nil, nil)
+		if r.status != 200 {
+			t.Fatalf("%s %s: %d %v", action, id, r.status, r.body)
+		}
+		return r.body["status"].(string)
+	}
+	if state := post(a, "pause"); state != "held" {
+		t.Fatalf("pausing a waiting job should hold it, got %q", state)
+	}
+	if job := h.job(a); job["status"] != "queued" || job["held"] != true || job["queue_position"] != nil {
+		t.Fatalf("a held job: %v", job)
+	}
+	if job := h.job(b); job["queue_position"].(float64) != 1 {
+		t.Fatalf("the job behind a held one should be next: %v", job)
+	}
+	if state := post(a, "pause"); state != "held" {
+		t.Fatalf("holding twice: %q", state)
+	}
+	// The slot frees up: the held job is passed over.
+	post(first, "stop")
+	h.waitStatus(first, "stopped")
+	h.waitStatus(b, "running")
+	if job := h.job(a); job["status"] != "queued" || job["held"] != true {
+		t.Fatalf("a held job must not start: %v", job)
+	}
+	// Resumed while the slot is taken: back in line, first.
+	if state := post(a, "resume"); state != "queued" {
+		t.Fatalf("resuming a held job while the slot is busy: %q", state)
+	}
+	if job := h.job(a); job["held"] != nil || job["queue_position"].(float64) != 1 {
+		t.Fatalf("a resumed job: %v", job)
+	}
+	// Held again, and the slot frees with nothing else waiting: it stays put...
+	post(a, "pause")
+	post(b, "stop")
+	h.waitStatus(b, "stopped")
+	time.Sleep(150 * time.Millisecond)
+	if job := h.job(a); job["status"] != "queued" {
+		t.Fatalf("a held job must wait for resume even with a free slot: %v", job)
+	}
+	// ...and starts the moment it is resumed.
+	if state := post(a, "resume"); state != "running" {
+		t.Fatalf("resuming a held job with a free slot: %q", state)
+	}
+	for h.depth(a) < 1 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	// A held job can still be dropped.
+	c := h.queue(startFEN, 200)["job_id"].(string)
+	post(c, "pause")
+	post(c, "stop")
+	if job := h.job(c); job["status"] != "stopped" {
+		t.Fatalf("dropping a held job: %v", job)
+	}
+	post(a, "stop")
+	h.waitStatus(a, "stopped")
 }
 
 func TestQueueRunsToTheEnd(t *testing.T) {

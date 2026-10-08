@@ -8,7 +8,7 @@
 import * as chess from "./chesslib.js";
 
 const BRIDGE_URL = "http://127.0.0.1:8765";
-const BRIDGE_MIN_VERSION = "1.0.4";
+const BRIDGE_MIN_VERSION = "1.0.5";
 
 const symbols = {K:"♔",Q:"♕",R:"♖",B:"♗",N:"♘",P:"♙",k:"♚",q:"♛",r:"♜",b:"♝",n:"♞",p:"♟"};
 const boardEl = document.querySelector("#board"), annotationLayer = document.querySelector("#annotation-layer"), fenEl = document.querySelector("#fen");
@@ -57,32 +57,76 @@ function jobKey(source, fen) { return `${source}|${positionKey(fen)}`; }
 // position is fetched when it is first shown (state.positions) and then kept
 // up to date from the answers to this page's own saves.
 function entryFor(fen, source) { return state.positions.get(positionKey(fen))?.[source]||null; }
-const positionRequests=new Map();
-function loadPosition(fen) {
+// Pending fetches: positionRequests by position key (also set for the
+// positions a pending expansion will bring), expansions by the position asked.
+const positionRequests=new Map(), expansions=new Map();
+// Positions fetched together with every position one legal move away, so a
+// move shows its result at once. Kept until reloadPositions.
+const expandedPositions=new Set();
+// A fetch answers for how things were when it was sent. What this page set
+// itself since then (after a save, say) is newer and is kept.
+let positionWrites=0, positionsEpoch=0;
+const positionWrittenAt=new Map();
+function nextPositionKeys(fen) {
+  try {
+    const position=chess.parseFen(fen);
+    return chess.legalMoves(position).map(move=>positionKey(chess.toFen(chess.makeMove(position,move))));
+  } catch(error) { return []; }
+}
+// Fetches a position and the positions one move away, in one request.
+function expandPosition(fen) {
   const key=positionKey(fen);
-  if(state.positions.has(key)) return Promise.resolve();
-  let request=positionRequests.get(key);
-  if(!request) {
-    request=api(`/api/position?fen=${encodeURIComponent(fen)}`)
-      .then(data=>data.entries, error=>{
-        // A board that is not a legal position has nothing saved for it.
-        if(error.status===400) return {};
-        throw error;
-      })
-      .then(entries=>{ state.positions.set(key,entries); })
-      .finally(()=>positionRequests.delete(key));
-    positionRequests.set(key,request);
-  }
+  if(expansions.has(key)) return expansions.get(key);
+  const sentAt=positionWrites, epoch=positionsEpoch, covered=[key,...nextPositionKeys(fen)];
+  const take=(at,entries)=>{
+    if(entries && !((positionWrittenAt.get(at)||0)>sentAt)) state.positions.set(at,entries);
+  };
+  const request=api(`/api/position?next=1&fen=${encodeURIComponent(fen)}`)
+    .catch(error=>{
+      // A board that is not a legal position has nothing saved for it.
+      if(error.status===400) return {entries:{},next:{}};
+      throw error;
+    })
+    .then(data=>{
+      if(epoch!==positionsEpoch) return;   // everything was reloaded meanwhile
+      take(key,data.entries||{});
+      for(const [at,entries] of Object.entries(data.next||{})) take(at,entries);
+      expandedPositions.add(key);
+    })
+    .finally(()=>{
+      if(expansions.get(key)===request) expansions.delete(key);
+      for(const at of covered) if(positionRequests.get(at)===request) positionRequests.delete(at);
+    });
+  expansions.set(key,request);
+  for(const at of covered) if(!state.positions.has(at) && !positionRequests.has(at)) positionRequests.set(at,request);
   return request;
 }
+// Resolves once the position's entries are known. Also fetches the positions
+// one move away if that has not been done for this position yet.
+function loadPosition(fen) {
+  const key=positionKey(fen);
+  const own=expandedPositions.has(key)?null:expandPosition(fen);
+  if(state.positions.has(key)) {
+    own?.catch(()=>{});   // a failed look-ahead is not worth a message
+    return Promise.resolve();
+  }
+  const first=positionRequests.get(key)||own||Promise.resolve();
+  return first.then(()=>state.positions.has(key)||!own||first===own?undefined:own);
+}
 function setPosition(fen, entries) {
-  state.positions.set(positionKey(fen),entries);
-  if(positionKey(fen)===positionKey(currentFen())) { applyShownAnalysis(currentFen()); render(); }
+  const key=positionKey(fen);
+  positionWrittenAt.set(key,++positionWrites);
+  state.positions.set(key,entries);
+  if(key===positionKey(currentFen())) { applyShownAnalysis(currentFen()); render(); }
 }
 // After something that may have changed many positions (an import, a key
 // being unverified): forget what was fetched and look again.
 function reloadPositions() {
+  positionsEpoch++;
   state.positions.clear();
+  expandedPositions.clear();
+  positionRequests.clear();
+  expansions.clear();
   applyShownAnalysis(currentFen());
   render();
 }
@@ -120,9 +164,14 @@ function shownAnalysis(fen) {
   return live&&(!saved||live.depth>saved.depth)?live:saved;
 }
 function applyShownAnalysis(fen) {
-  if(!state.positions.has(positionKey(fen))) {
+  const key=positionKey(fen);
+  if(!state.positions.has(key)) {
     // Not fetched yet: show it as soon as it is here, if this is still the position on the board.
-    loadPosition(fen).then(()=>{ if(positionKey(fen)===positionKey(currentFen())) refreshShownAnalysis(); },error=>status(error.message));
+    loadPosition(fen).then(()=>{ if(key===positionKey(currentFen())) refreshShownAnalysis(); },error=>status(error.message));
+  } else if(!expandedPositions.has(key) && !expansions.has(key)) {
+    // Known already (fetched with the position before): look one move further
+    // ahead now, and show what is newest for this one when it comes.
+    expandPosition(fen).then(()=>{ if(key===positionKey(currentFen())) refreshShownAnalysis(); },()=>{});
   }
   const shown=shownAnalysis(fen);
   state.shown=shown;
@@ -376,8 +425,10 @@ function renderAnnotations() {
     annotationLayer.appendChild(head);
   }
 }
+// Each side's captures go next to that side of the board: the side at the
+// bottom (White, unless the board is flipped) below it, the other above.
 function renderMaterialStatus() {
-  const panel=document.querySelector("#material-status");
+  const top=document.querySelector("#captured-top"), bottom=document.querySelector("#captured-bottom");
   const scoreOf=piece=>({p:1,n:3,b:3,r:5,q:9}[piece.toLowerCase()]||0);
   const material={w:0,b:0};
   for(const piece of state.board.flat()) {
@@ -386,7 +437,7 @@ function renderMaterialStatus() {
   const difference=material.w-material.b;
   const advantagedColor=difference>0?"w":difference<0?"b":null;
   const advantage=Math.abs(difference);
-  panel.innerHTML="";
+  top.innerHTML=""; bottom.innerHTML="";
   for(const [color,label] of [["w","White captured"],["b","Black captured"]]) {
     const row=document.createElement("div");
     row.className="captured-row";
@@ -394,6 +445,10 @@ function renderMaterialStatus() {
     row.appendChild(name);
     const pieces=document.createElement("span");
     pieces.className="captured-pieces";
+    // The pieces themselves sit on a tile in the colour of a light square,
+    // so that captured black pieces stand out from the dark panel.
+    const set=document.createElement("span");
+    set.className="captured-set";
     for(const type of ["p","n","b","r","q"]) {
       const sameType=[...state.captured[color]].filter(piece=>piece.toLowerCase()===type);
       if(!sameType.length) continue;
@@ -408,8 +463,9 @@ function renderMaterialStatus() {
         image.title=`Captured ${piece}`;
         group.appendChild(image);
       }
-      pieces.appendChild(group);
+      set.appendChild(group);
     }
+    if(set.childElementCount) pieces.appendChild(set);
     row.appendChild(pieces);
     if(color===advantagedColor) {
       const points=document.createElement("span");
@@ -417,7 +473,7 @@ function renderMaterialStatus() {
       points.textContent=`+${advantage}`;
       row.appendChild(points);
     }
-    panel.appendChild(row);
+    ((color==="w")!==state.flipped?bottom:top).appendChild(row);
   }
 }
 function render() {
@@ -1293,7 +1349,7 @@ function renderActiveJobs() {
       const pauseBtn=actions.children[0];
       const pauseLabel=job.paused?"Resume":"Pause";
       if(pauseBtn.textContent!==pauseLabel) pauseBtn.textContent=pauseLabel;
-      pauseBtn.disabled=!job.stockfishJobId||job.cancelled||!!job.queued;
+      pauseBtn.disabled=!job.stockfishJobId||job.cancelled||(!!job.queued&&!bridgeCanHold());
     }
   }
   for(const li of [...list.children])
@@ -1379,7 +1435,7 @@ async function fetchLichessAndSave(job) {
     end(cloud.unreachable?"Lichess could not be reached.":"Lichess has no evaluation for this position.");
     return;
   }
-  setLiveAnalysis(job,"lichess",{depth:cloud.depth,knodes:cloud.knodes,pv:cloud.lines[0].pv,evaluation:`Lichess Cloud: ${cloud.lines[0].evaluation}`});
+  setLiveAnalysis(job,"lichess",{depth:cloud.depth,knodes:cloud.knodes,pv:cloud.lines[0].pv,evaluation:cloud.lines[0].evaluation});
   if(cloud.depth<state.minDepth) {
     job.unsaved=true;
     end(`Lichess has depth ${cloud.depth} for this position. It is shown but not saved: the least that is saved is depth ${state.minDepth}.`);
@@ -1419,21 +1475,28 @@ async function stopAnalysisJob(job) {
     try { await bridge(`/api/analyze/${job.stockfishJobId}/stop`,{method:"POST"}); } catch(e) {}
   }
 }
+// Bridges from 1.0.5 on can hold a job that is still waiting in the queue.
+function bridgeCanHold() {
+  return !!bridgeState.status && versionAtLeast(bridgeState.status.version,"1.0.5");
+}
 async function pauseAnalysisJob(job) {
-  if(!job || job.cancelled || !job.stockfishJobId || job.paused || job.queued) return;
+  if(!job || job.cancelled || !job.stockfishJobId || job.paused) return;
+  if(job.queued && !bridgeCanHold()) return;
   try {
-    await bridge(`/api/analyze/${job.stockfishJobId}/pause`,{method:"POST"});
+    const answer=await bridge(`/api/analyze/${job.stockfishJobId}/pause`,{method:"POST"});
     job.paused=true;
-    job.statusText=`Paused at depth ${job.depth||0}/${job.target||"?"}`;
+    if(answer?.status==="held") { job.queued=true; job.statusText=queuedText({held:true}); }
+    else { job.queued=false; job.statusText=`Paused at depth ${job.depth||0}/${job.target||"?"}`; }
   } catch(e) { job.statusText=e.message; }
   updateJobProgressUI(job);
 }
 async function resumeAnalysisJob(job) {
   if(!job || job.cancelled || !job.stockfishJobId || !job.paused) return;
   try {
-    await bridge(`/api/analyze/${job.stockfishJobId}/resume`,{method:"POST"});
+    const answer=await bridge(`/api/analyze/${job.stockfishJobId}/resume`,{method:"POST"});
     job.paused=false;
-    job.statusText=`Analyzing Stockfish... depth ${job.depth||0}/${job.target||"?"}`;
+    if(answer?.status==="queued") { job.queued=true; job.statusText=queuedText({}); }
+    else { job.queued=false; job.statusText=`Analyzing Stockfish... depth ${job.depth||0}/${job.target||"?"}`; }
   } catch(e) { job.statusText=e.message; }
   updateJobProgressUI(job);
 }
@@ -1457,11 +1520,12 @@ async function analyzeWithStockfish(job, fen, target) {
   return pollStockfishJob(job,started.job_id);
 }
 function queuedText(view) {
+  if(view.held) return "Paused while waiting in the queue. Analyses behind it start first; press Resume to put it back in line.";
   return `Waiting for a free engine slot${view.queue_position?` (number ${view.queue_position} in the queue)`:""}; it starts by itself.`;
 }
 function showQueued(job, view) {
   job.queued=true;
-  job.paused=false;
+  job.paused=!!view.held;
   job.depth=0;
   job.progress=0;
   job.statusText=queuedText(view);
@@ -1583,7 +1647,7 @@ async function restoreActiveAnalyses() {
           : savedJob.status==="queued"
             ? queuedText(savedJob)
             : `Analyzing Stockfish... depth ${depth}/${target}`,
-      paused:savedJob.status==="paused",
+      paused:savedJob.status==="paused"||!!savedJob.held,
       queued:savedJob.status==="queued",
       openingMoves:Array.isArray(context.openingMoves)?[...context.openingMoves]:null,
       positionHistory:Array.isArray(context.positionHistory)&&context.positionHistory.length
@@ -1680,7 +1744,8 @@ async function cloudEval(fen) {
     const cp=Number(pv.cp)||0;
     lines.push({
       pv:replay.uci,
-      evaluation:Number.isInteger(pv.mate)?`mate ${pv.mate}`:`${cp>=0?"+":"-"}${(Math.abs(cp)/100).toFixed(2)}`
+      // Written like a Stockfish score: "+0.32" or "#-3", from White's side.
+      evaluation:Number.isInteger(pv.mate)?`#${pv.mate}`:`${cp>=0?"+":"-"}${(Math.abs(cp)/100).toFixed(2)}`
     });
   }
   return {depth:Number(data.depth)||0,knodes:data.knodes,lines};

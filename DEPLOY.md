@@ -82,6 +82,22 @@ side of the board). If the position already has a saved analysis that is
 deeper than what the running one has reached, the saved one stays on screen
 until the running one has passed it.
 
+Both engines' evaluations are written the same way: in pawns from White's
+side ("+0.32"), or "#3" / "#-3" for a forced mate. The numbers are not on
+exactly the same scale, though. Stockfish 19 scales its score so that +1.00
+means roughly even winning chances for the side ahead, and in clearly won
+positions its numbers grow quickly (+5.56 where Lichess says +3.58 is
+typical). Lichess's evaluations were made by many visitors' browsers with
+many Stockfish versions over the years, some of them before that scaling.
+Where the two disagree by more than that, it is usually a difference in depth
+or a sharp position; the sign and the side are the same for both. (Lichess
+entries saved before this notation was shared read "Lichess Cloud: +0.25" in
+the database; they are shown in the shared notation.)
+
+When a position is shown, the page also fetches what is stored for every
+position one legal move away (`GET /api/position?fen=...&next=1`, one request,
+at most a few hundred rows read), so a move shows its result at once.
+
 ### The Lichess evaluation database
 
 Lichess publishes every evaluation it has stored
@@ -221,7 +237,10 @@ analysing.
 
 Up to four analyses run at the same time (`-max-jobs` changes that). Further
 ones wait in a queue, up to 100, and start by themselves, oldest first, as
-soon as one of the four ends; a paused analysis keeps its place. Stockfish
+soon as one of the four ends; a paused analysis keeps its slot. Pausing an
+analysis that is still waiting holds it: it keeps its place in the list, the
+ones behind it start first, and **Resume** puts it back in line where it was
+(it starts at once if a slot is free). Stockfish
 runs below normal priority. It may use all processor cores but one and a
 quarter of the memory (at most 8 GB) for its hash table, shared between the
 analyses running at that moment, and a new analysis never takes more than half
@@ -302,13 +321,14 @@ kept in the repository).
 plus `SHA256SUMS`. To rebuild after changing `bridge/*.go`, install Go and run
 `scripts\build_bridge.ps1` (Windows) or `sh scripts/build_bridge.sh`, then
 deploy. Builds are reproducible: the same Go version gives byte-identical
-files. The current ones (1.0.4) were built with Go 1.24.7.
+files. The current ones (1.0.5) were built with Go 1.24.7.
 
 The site names the bridge version it expects (`BRIDGE_MIN_VERSION` in
 `web/app.js`). An older bridge keeps working, and the site shows an **Update**
 button with the install command. Bridges before 1.0.4 do not report the search
 as it goes, so with them the page is not updated during an analysis and Stop
-saves nothing.
+saves nothing. Bridges before 1.0.5 cannot hold an analysis that is waiting in
+the queue; with them its Pause button stays disabled.
 
 If you deploy from another copy of the repository, make sure `web/bridge/` is
 there (commit it, or build it), otherwise the install command has nothing to
@@ -342,8 +362,11 @@ Automated tests (Linux, real browser):
   a running analysis (best move, evaluation, line, evaluation bar), Stop
   saving the depth finished last, a deeper saved analysis staying on screen,
   and the paler green below depth 46
-- the analysis queue (waiting, order, dropping a waiting job, starting by
-  itself, shutdown) and the free-memory limit on the hash size
+- the analysis queue (waiting, order, dropping or holding a waiting job,
+  starting by itself, shutdown) and the free-memory limit on the hash size
+- the positions one move away arriving with a position (a move shows its
+  saved result while the request for it is still held back), and the captured
+  pieces above and below the board following Flip board
 - the macOS/Linux install script (on Linux)
 - importing the real `saved_positions.json` (492 entries, none skipped)
 
@@ -355,16 +378,16 @@ Checked by hand on the live site, Windows 11 with Firefox:
 - the Windows bridge: Stockfish download, analysis, pause, resume, stop,
   closing the bridge window, reload during an analysis
 - an analysis saved from the PC and visible to a visitor who is not logged in
+- `migrations/0002_engines.sql` on the real D1 database, and the first file of
+  `scripts/lichess_db.mjs` output (`--max-moves 10 --min-pieces 28`, run on
+  the whole Lichess file) loaded with wrangler
 
 Not yet run anywhere:
 
-- `migrations/0002_engines.sql` on the real D1 database
-- `scripts/lichess_db.mjs` on the whole Lichess file (it was run on its first
-  four million positions), and loading its SQL into D1 with wrangler
 - the Windows-only parts of the bridge added in 1.0.3: reading free memory,
   and marking Stockfish's memory as the first to give up when memory runs
   short
-- bridge 1.0.4 on Windows and macOS (its tests ran on Linux)
+- bridges 1.0.4 and 1.0.5 on Windows and macOS (their tests ran on Linux)
 - the depth field's reset, the evaluation bar and the paler greens in Firefox
   (tested in Chromium)
 - anything on macOS (bridge, installer, launcher)

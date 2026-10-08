@@ -433,7 +433,7 @@ try {
     await until(async () => (await jobTexts(page)).some(t => /Lichess evaluation saved \(depth 50\)\./.test(t)), "saved");
     assert.equal(lichessServerCalls, before + 1);
     assert.deepEqual([await value(page, "#evaluation"), await value(page, "#depth-result"), await text(page, "#notation")],
-      ["Lichess Cloud: +0.25", "Lichess · Depth 50 | 1234k nodes", "c5 Nf3 d6"]);
+      ["+0.25", "Lichess · Depth 50 | 1234k nodes", "c5 Nf3 d6"]);
     assert.deepEqual(await bestSquares(page), [square("c7"), square("c5")].sort((a, b) => a - b));
     const both = (await apiSaved()).filter(e => e.fen === afterE4).map(e => [e.source, e.depth, e.verified, e.move_uci]).sort();
     assert.deepEqual(both, [["lichess", 50, true, "c7c5"], ["stockfish", 46, false, "e7e5"]], "one entry per engine for the same position");
@@ -465,7 +465,7 @@ try {
     await page.click("#analyze");
     await until(async () => (await jobTexts(page)).some(t => /Lichess has depth 18 for this position\. It is shown but not saved: the least that is saved is depth 21\./.test(t)), "explained");
     const now = await shown(page);
-    assert.deepEqual([now.depth, now.evaluation, now.line], ["Lichess · Depth 18 | 77k nodes · not saved", "Lichess Cloud: +0.40", "Nf6 Nc3"]);
+    assert.deepEqual([now.depth, now.evaluation, now.line], ["Lichess · Depth 18 | 77k nodes · not saved", "+0.40", "Nf6 Nc3"]);
     assert.deepEqual(await bestSquares(page), [square("g8"), square("f6")].sort((a, b) => a - b));
     assert.equal(lichessServerCalls, before, "the server was not asked to store it");
     // Sent straight to the server it is refused too.
@@ -732,11 +732,17 @@ try {
     await page.click("#analyze");
     await until(async () => /Waiting for a free engine slot \(number 1 in the queue\)/.test(await jobItem(page, 4).innerText()), "fifth job queued");
     assert.equal(await text(page, "#analyze"), "Stop analysis");
-    assert.equal(await jobItem(page, 4).locator("button:has-text('Pause')").isDisabled(), true, "a waiting job cannot be paused");
     await toStart(page);
     await move(page, "a2", "a3"); await move(page, "a7", "a6");
     await page.click("#analyze");
     await until(async () => /number 2 in the queue/.test(await jobItem(page, 5).innerText()), "sixth job queued");
+    // Pausing a waiting job holds it: the one behind it moves up.
+    await jobItem(page, 4).locator("button:has-text('Pause')").click();
+    await until(async () => /Paused while waiting in the queue/.test(await jobItem(page, 4).innerText()), "fifth job held");
+    await until(async () => /number 1 in the queue/.test(await jobItem(page, 5).innerText()), "sixth job moved up");
+    await jobItem(page, 4).locator("button:has-text('Resume')").click();
+    await until(async () => /number 1 in the queue/.test(await jobItem(page, 4).innerText()), "fifth job back in line");
+    await until(async () => /number 2 in the queue/.test(await jobItem(page, 5).innerText()), "sixth job second again");
 
     // An arrow drawn here must not show up on another analysis's position.
     await drawArrow(page, "e2", "e4");
@@ -776,6 +782,42 @@ try {
     while (await page.locator("#active-jobs li button:has-text('Dismiss')").count()) await page.click("#active-jobs li button:has-text('Dismiss')");
     assert.match(bridge.output, /is waiting for a free slot/);
     assert.match(bridge.output, /starts: depth 46, \d+ threads, \d+ MB hash \(\d+ MB of memory was free\)/);
+  });
+
+  await step("the positions one move away come with a position; captures sit beside their side of the board", async () => {
+    const AFTER_NC3 = "rnbqkbnr/pppppppp/8/8/8/2N5/PPPPPPPP/R1BQKBNR b KQkq - 1 1";
+    const saved = await fetch(SITE + "/api/saved", { method: "POST", headers: { "Content-Type": "application/json", "X-Key": ADMIN, Origin: SITE },
+      body: JSON.stringify({ fen: AFTER_NC3, source: "stockfish", depth: 30, pv: ["g8f6", "d2d4"], evaluation: "+0.11" }) });
+    assert.equal(saved.status, 200);
+    // Wait for the start position to be fetched (with its next positions), then hold back
+    // any request about the position after 1. Nc3 itself: what it shows must come from before.
+    const startFetched = context.waitForEvent("response", response => /\/api\/position\?next=1/.test(response.url()));
+    const fresh = await newPage();
+    await startFetched;
+    let held = 0;
+    await fresh.route(url => url.pathname === "/api/position" && /\/2N5\//.test(url.searchParams.get("fen") || ""), async route => {
+      held++;
+      await sleep(3000);
+      await route.continue().catch(() => {});
+    });
+    const shownAt = Date.now();
+    await move(fresh, "b1", "c3");
+    await until(async () => /Stockfish 19 · Depth 30/.test((await shown(fresh)).depth), "result shown at once", 1500);
+    assert.ok(Date.now() - shownAt < 1500 && held <= 1, `shown after ${Date.now() - shownAt} ms`);
+    await fresh.unrouteAll({ behavior: "ignoreErrors" });
+    // White takes a pawn: White's captures are below the board, Black's above; flipped, the other way round.
+    await move(fresh, "d7", "d5"); await move(fresh, "c3", "d5");
+    const sides = () => fresh.evaluate(() => ["#captured-top", "#captured-bottom"].map(id => {
+      const box = document.querySelector(id);
+      return `${box.innerText.replace(/\s+/g, " ").trim()}:${box.querySelectorAll("img").length}`;
+    }));
+    assert.deepEqual(await sides(), ["Black captured:0", "White captured +1:1"]);
+    const top = await fresh.locator("#captured-top").boundingBox(), board = await fresh.locator("#board-wrap").boundingBox(),
+      bottom = await fresh.locator("#captured-bottom").boundingBox();
+    assert.ok(top.y + top.height <= board.y && bottom.y >= board.y + board.height, "one above the board, one below");
+    await fresh.click("#flip");
+    assert.deepEqual(await sides(), ["White captured +1:1", "Black captured:0"]);
+    await fresh.close();
   });
 
   await step("another site cannot use the bridge from the browser", async () => {

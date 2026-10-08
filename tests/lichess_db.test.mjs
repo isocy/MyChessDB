@@ -181,9 +181,13 @@ try {
   eq(env.DB.db.prepare("SELECT COUNT(*) AS n FROM lichess_db").get().n, 4);
   eq(await at(ITALIAN + " 4 4"), { lichess: {
     fen: ITALIAN + " 0 1", move_uci: "e1g1", pv: "e1g1 g8f6 d2d3 d7d6 c2c3 a7a6 a2a4 c5a7 f1e1 e8g8".split(" "),
-    evaluation: "Lichess Cloud: +0.25", depth: 52, knodes: 123456, source: "lichess", verified: true, saved_at: null, imported: true } });
-  eq((await at(AFTER_E4_EP + " 0 1")).lichess.evaluation, "Lichess Cloud: -0.22");
-  eq((await at(MATE_IN_ONE + " 0 1")).lichess.evaluation, "Lichess Cloud: mate 1");
+    evaluation: "+0.25", depth: 52, knodes: 123456, source: "lichess", verified: true, saved_at: null, imported: true } });
+  eq((await at(AFTER_E4_EP + " 0 1")).lichess.evaluation, "-0.22");
+  eq((await at(MATE_IN_ONE + " 0 1")).lichess.evaluation, "#1");
+  // Asked with next=1, the positions one move away come along, imported rows included.
+  const withNext = await (await worker.fetch(new Request("https://chess.example/api/position?next=1&fen=" + encodeURIComponent(START + " 0 1")), env)).json();
+  eq([withNext.entries, Object.keys(withNext.next).length], [await at(START + " 0 1"), 20]);
+  eq(withNext.next[AFTER_E4].lichess.evaluation, "-0.22");
   // Loading the same files again changes nothing; a deeper row replaces, a shallower one does not.
   load();
   eq(env.DB.db.prepare("SELECT COUNT(*) AS n FROM lichess_db").get().n, 4);
