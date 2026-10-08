@@ -64,10 +64,30 @@ export class LocalD1 {
     return { count: 1 };
   }
 
-  /** Apply every .sql file in a migrations directory, in name order. */
+  /**
+   * Apply the .sql files of a migrations directory that this database has
+   * not seen yet, in name order, each one once (as wrangler does for D1).
+   */
   migrate(directory) {
+    this.db.exec("CREATE TABLE IF NOT EXISTS d1_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
+    const applied = new Set(this.db.prepare("SELECT name FROM d1_migrations").all().map(row => row.name));
+    // A database file from before migrations were recorded already has the
+    // first one in it.
+    if (!applied.size && this.db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'saved_positions'").get()) {
+      applied.add("0001_init.sql");
+      this.db.prepare("INSERT INTO d1_migrations VALUES ('0001_init.sql', ?)").run(new Date().toISOString());
+    }
     for (const name of readdirSync(directory).filter(file => file.endsWith(".sql")).sort()) {
-      this.db.exec(readFileSync(join(directory, name), "utf8"));
+      if (applied.has(name)) continue;
+      this.db.exec("BEGIN");
+      try {
+        this.db.exec(readFileSync(join(directory, name), "utf8"));
+        this.db.prepare("INSERT INTO d1_migrations VALUES (?, ?)").run(name, new Date().toISOString());
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw new Error(`Migration ${name} failed: ${error.message}`);
+      }
     }
     return this;
   }

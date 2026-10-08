@@ -48,7 +48,7 @@ const stockfishProcesses = () => readdirSync("/proc").filter(name => /^\d+$/.tes
 }).map(pid => ({ pid, state: readFileSync(`/proc/${pid}/stat`, "utf8").split(") ")[1][0] }));
 
 launch("dev server", process.execPath, ["--no-warnings", join(root, "scripts", "dev_server.mjs")],
-  { PORT: "8787", DEV_DB: ":memory:", ADMIN_TOKEN: ADMIN, MIN_DEPTH: "14", LICHESS_API_BASE: "http://127.0.0.1:9" });
+  { PORT: "8787", DEV_DB: ":memory:", ADMIN_TOKEN: ADMIN, MIN_DEPTH: "8", FULL_DEPTH: "14", LICHESS_API_BASE: "http://127.0.0.1:9" });
 await until(async () => (await fetch(SITE + "/api/session")).ok, "dev server");
 const bridgeFile = join(root, "web", "bridge", "mychessdb-bridge-linux-amd64");
 assert.ok(existsSync(bridgeFile), "run scripts/build_bridge.sh first");
@@ -66,10 +66,14 @@ const square = name => "abcdefgh".indexOf(name[0]) + (8 - Number(name[1])) * 8;
 const move = async (from, to) => { await page.click(`#board .square[data-index="${square(from)}"]`); await page.click(`#board .square[data-index="${square(to)}"]`); };
 const jobs = () => page.$$eval("#active-jobs li", nodes => nodes.map(node => node.innerText.replace(/\s+/g, " ")));
 
+// Everything saved from the site (the admin's backup).
+const saved = async () => (await (await fetch(SITE + "/api/export", { headers: { "X-Key": ADMIN } })).json()).saved;
+
 let bridge;
 try {
   await page.goto(SITE + "/");
   await page.waitForSelector("#board .square");
+  await page.click("#view-switch button[data-view='stockfish']");
 
   await step("released bridge downloads and verifies the official Stockfish 19", async () => {
     await page.click("#bridge-connect");
@@ -88,19 +92,19 @@ try {
     await until(async () => (await jobs()).some(t => /Best move saved \(unverified\)/.test(t)), "saved", 120000);
     const evaluation = await value("#evaluation"), depth = await value("#depth-result"), line = await text("#notation");
     assert.match(evaluation, /^[+-]\d+\.\d\d$/);
-    assert.equal(depth, "Depth 14 · unverified");
-    const entry = (await (await fetch(SITE + "/api/saved")).json()).entries[0];
+    assert.equal(depth, "Stockfish 19 · Depth 14 · unverified");
+    const entry = (await saved())[0];
     const replay = chess.replayUci(entry.fen, entry.pv);
     assert.ok(replay.complete && replay.san.length >= 1, "the stored line is fully legal");
     assert.equal(line, replay.san.join(" "));
     assert.equal(entry.depth, 14);
-    assert.equal((await page.$$("#board .square.saved")).length, 2);
+    assert.equal((await page.$$("#board .square.best")).length, 2);
     console.log(`\n    1. e4 -> ${line}  (${evaluation}, ${depth})`);
     await page.click("#active-jobs li button:has-text('Dismiss')");
     await until(() => stockfishProcesses().length === 0, "engine exits after the analysis");
   });
 
-  await step("pause really freezes Stockfish; resume and stop work", async () => {
+  await step("the page follows the search; pause really freezes Stockfish; stop saves the last finished depth", async () => {
     await page.fill("#key-input", ADMIN); await page.press("#key-input", "Enter");
     await until(async () => (await text("#key-role")) === "Admin", "admin");
     await page.click("#advanced-settings summary");
@@ -109,6 +113,21 @@ try {
     await page.click("#analyze");
     await until(async () => (await jobs()).some(t => /Analyzing Stockfish\.\.\. depth [1-9]\d*\/60/.test(t)), "running", 60000);
     await until(() => stockfishProcesses().length === 1, "one engine process");
+    // While it runs: the page shows the depth Stockfish finished last, one
+    // below the depth it is searching, with that depth's move, score and line.
+    const live = await until(() => page.evaluate(() => {
+      const searching = /depth (\d+)\/60/.exec(document.querySelector("#status").innerText);
+      const finished = /^Stockfish 19 · Depth (\d+) · still analysing$/.exec(document.querySelector("#depth-result").value);
+      return searching && finished && Number(finished[1]) >= 8 ? {
+        searching: Number(searching[1]), finished: Number(finished[1]),
+        evaluation: document.querySelector("#evaluation").value, line: document.querySelector("#notation").innerText,
+        best: document.querySelectorAll("#board .square.best").length,
+      } : null;
+    }), "live analysis on the page", 60000);
+    assert.equal(live.finished, live.searching - 1, JSON.stringify(live));
+    assert.match(live.evaluation, /^([+-]\d+\.\d\d|#-?\d+)$/);
+    assert.ok(live.line.split(" ").length >= 1 && live.best === 2, JSON.stringify(live));
+    console.log(`\n    searching depth ${live.searching}: showing depth ${live.finished}, ${live.evaluation}, ${live.line}`);
     // Every Stockfish thread runs at lowered priority (nice 10).
     const pid = stockfishProcesses()[0].pid;
     const nices = readdirSync(`/proc/${pid}/task`).map(tid => Number(readFileSync(`/proc/${pid}/task/${tid}/stat`, "utf8").split(") ")[1].split(" ")[16]));
@@ -126,6 +145,15 @@ try {
     await page.click("#active-jobs li button:has-text('Stop')");
     await until(async () => (await jobs()).some(t => /Analysis stopped/.test(t)), "stopped");
     await until(() => stockfishProcesses().length === 0, "engine process is gone");
+    // Stopped while searching depth N: what depth N-1 found is saved (as the admin, so verified).
+    const message = /Analysis stopped at depth (\d+)\. Depth (\d+) result saved\./.exec((await jobs())[0]);
+    assert.ok(message && Number(message[2]) === Number(message[1]) - 1, (await jobs())[0]);
+    const entries = await saved();
+    const partial = entries.find(e => e.depth === Number(message[2]));
+    assert.ok(partial && partial.verified === 1 && partial.source === "stockfish" && entries.length === 2, JSON.stringify(entries.map(e => [e.depth, e.verified])));
+    assert.ok(chess.replayUci(partial.fen, partial.pv).complete, "the stored line is fully legal");
+    assert.equal(await value("#depth-result"), `Stockfish 19 · Depth ${partial.depth}`);
+    console.log(`\n    ${message[0]} ${partial.evaluation} ${chess.replayUci(partial.fen, partial.pv).san.join(" ")}`);
     await page.click("#active-jobs li button:has-text('Dismiss')");
   });
 

@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "node --no-warnings scripts/dev_server.mjs",
-    "test": "node tests/chesslib.test.mjs && node --no-warnings tests/worker.test.mjs",
+    "test": "node tests/chesslib.test.mjs && node --no-warnings tests/worker.test.mjs && node --no-warnings tests/lichess_db.test.mjs",
     "test:bridge": "cd bridge && go test -tags testhooks ./...",
     "test:e2e": "node --no-warnings tests/e2e.mjs",
     "build:openings": "node scripts/build_openings.mjs",

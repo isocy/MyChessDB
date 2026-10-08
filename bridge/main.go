@@ -27,7 +27,7 @@ import (
 
 const (
 	appName     = "mychessdb-bridge"
-	version     = "1.0.3"
+	version     = "1.0.4"
 	defaultPort = 8765
 	maxBody     = 4 << 20
 )

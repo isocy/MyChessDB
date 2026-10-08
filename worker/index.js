@@ -5,21 +5,39 @@
 //
 //   ADMIN_TOKEN            secret, at least 16 characters. Whoever sends it in
 //                          the X-Key header is the admin.
-//   MIN_DEPTH              optional, default 46. Lowest depth accepted from
-//                          anyone who is not the admin.
+//   MIN_DEPTH              optional, default 21. Nothing shallower is saved,
+//                          whoever asks, and the site does not let a
+//                          shallower analysis depth be chosen. (Only the
+//                          admin's import of a backup is not held to it.)
+//   FULL_DEPTH             optional, default 46. The depth an analysis is
+//                          expected to reach. The site shows moves found
+//                          below this depth in a paler colour, and starts
+//                          new analyses at it.
 //   ANON_WRITES_PER_HOUR   optional, default 60. Save attempts allowed per
 //                          hour for one visitor without a key.
 //   LICHESS_API_BASE       optional, default https://lichess.org (tests point
 //                          this at a local stand-in).
+//
+// Results are kept per engine ("source"): a position can have a Stockfish 19
+// entry and a Lichess entry, and neither replaces the other. The page shows
+// one engine's entries, or for each position the deeper of the two.
 //
 // Trust model (there are no user accounts):
 //   * "lichess" entries: the server fetches the evaluation from Lichess
 //     itself, so nothing the browser claims is stored. Always verified.
 //   * "stockfish" entries sent with the admin token or a contributor key
 //     are verified; without a key they are stored as unverified.
-//   * A verified entry is never replaced by an unverified one. Within the
-//     same tier only a strictly deeper analysis replaces the stored one.
+//   * Among the entries of one engine, a verified one is never replaced by
+//     an unverified one, and within the same tier only a strictly deeper
+//     analysis replaces the stored one.
+//   * Nothing below MIN_DEPTH is saved. From there on, an analysis stopped
+//     early is saved as far as it got, and a deeper one replaces it later.
 //   * Whatever is replaced or removed is copied to saved_history first.
+//
+// Besides what visitors save, the lichess_db table can hold evaluations
+// taken over in bulk from the Lichess evaluation database
+// (scripts/lichess_db.mjs). They are read-only reference data: a position's
+// Lichess entry is the deeper of the saved one and the one in lichess_db.
 
 import { parseFen, toFen, positionKey, legalMoves, sanitizeUciLine } from "../web/chesslib.js";
 
@@ -27,23 +45,25 @@ const MAX_DEPTH = 245;
 const MAX_PV_PLIES = 60;
 const IMPORT_BATCH_LIMIT = 100;
 
+const SOURCES = ["stockfish", "lichess"];
+
 const COLUMNS = "position_key, fen, move_uci, pv, evaluation, depth, knodes, source, verified, saved_by, saved_at";
 
-// Copies the stored row to history when the incoming entry is allowed to
-// replace it. Binds: archived_at, reason, position_key, force, verified,
-// verified, depth.
+// Copies the stored row of the same engine to history when the incoming
+// entry is allowed to replace it. Binds: archived_at, reason, position_key,
+// source, force, verified, verified, depth.
 const ARCHIVE_IF_REPLACEABLE = `
   INSERT INTO saved_history (${COLUMNS}, archived_at, reason)
   SELECT ${COLUMNS}, ?, ? FROM saved_positions
-  WHERE position_key = ? AND (? = 1 OR ? > verified OR (? = verified AND ? > depth))`;
+  WHERE position_key = ? AND source = ? AND (? = 1 OR ? > verified OR (? = verified AND ? > depth))`;
 
 // Inserts, or replaces under the same rule. Binds: the 11 columns, force.
 const UPSERT_IF_ALLOWED = `
   INSERT INTO saved_positions (${COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  ON CONFLICT(position_key) DO UPDATE SET
+  ON CONFLICT(position_key, source) DO UPDATE SET
     fen = excluded.fen, move_uci = excluded.move_uci, pv = excluded.pv,
     evaluation = excluded.evaluation, depth = excluded.depth, knodes = excluded.knodes,
-    source = excluded.source, verified = excluded.verified,
+    verified = excluded.verified,
     saved_by = excluded.saved_by, saved_at = excluded.saved_at
   WHERE ? = 1 OR excluded.verified > saved_positions.verified
      OR (excluded.verified = saved_positions.verified AND excluded.depth > saved_positions.depth)
@@ -69,7 +89,8 @@ function intSetting(value, fallback) {
   return Number.isFinite(number) && number > 0 ? number : fallback;
 }
 
-const minDepth = env => intSetting(env.MIN_DEPTH, 46);
+const minDepth = env => intSetting(env.MIN_DEPTH, 21);
+const fullDepth = env => intSetting(env.FULL_DEPTH, 46);
 
 async function sha256Hex(text) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
@@ -130,6 +151,50 @@ function publicEntry(row) {
     verified: row.verified === 1,
     saved_at: row.saved_at,
   };
+}
+
+// How a Lichess score is written in an entry: "Lichess Cloud: +0.25" or
+// "Lichess Cloud: mate -4" (always from White's side).
+function lichessEvaluation(cp, mate) {
+  if (Number.isInteger(mate)) return `Lichess Cloud: mate ${mate}`;
+  return `Lichess Cloud: ${cp >= 0 ? "+" : "-"}${(Math.abs(cp) / 100).toFixed(2)}`;
+}
+
+// A row of lichess_db in the shape of an entry. `imported` tells the page
+// that it is reference data, not something saved from the site.
+function importedEntry(row) {
+  const pv = row.pv.split(" ");
+  return {
+    fen: `${row.position_key} 0 1`,
+    move_uci: pv[0],
+    pv,
+    evaluation: lichessEvaluation(row.cp, row.mate),
+    depth: row.depth,
+    knodes: row.knodes,
+    source: "lichess",
+    verified: true,
+    saved_at: null,
+    imported: true,
+  };
+}
+
+/**
+ * What is stored for one position, by engine: { stockfish?, lichess? }.
+ * The Lichess entry is the deeper of the one saved from the site and the one
+ * in the imported Lichess database.
+ */
+async function positionEntries(env, key) {
+  const [saved, imported] = await env.DB.batch([
+    env.DB.prepare(`SELECT ${COLUMNS} FROM saved_positions WHERE position_key = ?`).bind(key),
+    env.DB.prepare("SELECT position_key, depth, knodes, cp, mate, pv FROM lichess_db WHERE position_key = ?").bind(key),
+  ]);
+  const entries = {};
+  for (const row of saved.results) entries[row.source] = publicEntry(row);
+  const fromDatabase = imported.results[0];
+  if (fromDatabase && !(entries.lichess && entries.lichess.depth >= fromDatabase.depth)) {
+    entries.lichess = importedEntry(fromDatabase);
+  }
+  return entries;
 }
 
 function parsePosition(fen) {
@@ -196,15 +261,14 @@ async function fetchLichessEval(env, fen) {
   if (!first || typeof first.moves !== "string" || !Number.isInteger(depth)) {
     throw new HttpError(502, "Lichess sent an incomplete evaluation.", { code: "LICHESS_UNAVAILABLE" });
   }
-  let evaluation;
-  if (Number.isInteger(first.mate)) evaluation = `mate ${first.mate}`;
-  else if (Number.isFinite(first.cp)) evaluation = `${first.cp >= 0 ? "+" : "-"}${(Math.abs(first.cp) / 100).toFixed(2)}`;
-  else throw new HttpError(502, "Lichess sent an evaluation without a score.", { code: "LICHESS_UNAVAILABLE" });
+  if (!Number.isInteger(first.mate) && !Number.isFinite(first.cp)) {
+    throw new HttpError(502, "Lichess sent an evaluation without a score.", { code: "LICHESS_UNAVAILABLE" });
+  }
   return {
     depth,
     knodes: Number.isFinite(data.knodes) ? Math.round(data.knodes) : null,
     moves: first.moves.trim().split(/\s+/).slice(0, MAX_PV_PLIES),
-    evaluation: `Lichess Cloud: ${evaluation}`,
+    evaluation: lichessEvaluation(first.cp, first.mate),
   };
 }
 
@@ -214,7 +278,7 @@ async function storeEntry(env, entry, force) {
   const now = new Date().toISOString();
   const results = await env.DB.batch([
     env.DB.prepare(ARCHIVE_IF_REPLACEABLE).bind(
-      now, "replaced", entry.position_key, force ? 1 : 0, entry.verified, entry.verified, entry.depth),
+      now, "replaced", entry.position_key, entry.source, force ? 1 : 0, entry.verified, entry.verified, entry.depth),
     env.DB.prepare(UPSERT_IF_ALLOWED).bind(
       entry.position_key, entry.fen, entry.move_uci, entry.pv, entry.evaluation, entry.depth,
       entry.knodes, entry.source, entry.verified, entry.saved_by, entry.saved_at, force ? 1 : 0),
@@ -230,8 +294,6 @@ async function handleSave(request, env) {
 
   const { position, fen, key } = parsePosition(body.fen);
   if (!legalMoves(position).length) throw new HttpError(400, "The game is already over in this position.");
-  const required = minDepth(env);
-  const isAdmin = who.role === "admin";
 
   const entry = {
     position_key: key, fen, knodes: null,
@@ -241,8 +303,8 @@ async function handleSave(request, env) {
 
   if (body.source === "lichess") {
     const cloud = await fetchLichessEval(env, fen);
-    if (!isAdmin && cloud.depth < required) {
-      throw new HttpError(409, `Lichess only has depth ${cloud.depth} for this position; depth ${required} is required.`,
+    if (cloud.depth < minDepth(env)) {
+      throw new HttpError(409, `Lichess only has depth ${cloud.depth} for this position; nothing below depth ${minDepth(env)} is saved.`,
         { code: "LICHESS_TOO_SHALLOW", depth: cloud.depth });
     }
     // Rewrites Lichess's king-takes-rook castling into the standard form.
@@ -254,9 +316,11 @@ async function handleSave(request, env) {
     });
   } else if (body.source === "stockfish") {
     const depth = body.depth;
-    if (!Number.isInteger(depth) || depth < 1 || depth > MAX_DEPTH) throw new HttpError(400, "depth must be a whole number");
-    if (!isAdmin && depth < required) {
-      throw new HttpError(400, `Depth ${depth} is below the required depth ${required}.`, { code: "DEPTH_TOO_LOW" });
+    if (!Number.isInteger(depth) || depth < 1 || depth > MAX_DEPTH) {
+      throw new HttpError(400, `depth must be a whole number from 1 to ${MAX_DEPTH}`);
+    }
+    if (depth < minDepth(env)) {
+      throw new HttpError(400, `Depth ${depth} is not saved: the least is depth ${minDepth(env)}.`, { code: "DEPTH_TOO_LOW" });
     }
     if (typeof body.evaluation !== "string" || !/^([+-]\d{1,3}\.\d{2}|#-?\d{1,3})$/.test(body.evaluation)) {
       throw new HttpError(400, "evaluation must look like +0.32 or #-3");
@@ -272,27 +336,45 @@ async function handleSave(request, env) {
     throw new HttpError(400, "source must be \"stockfish\" or \"lichess\"");
   }
 
+  // `entry` in the answer is what the position now has for this engine,
+  // `entries` everything it has, so the page can update itself.
+  const before = await positionEntries(env, key);
+  if (entry.source === "lichess" && before.lichess?.imported && before.lichess.depth >= entry.depth) {
+    return json(200, {
+      saved: false, entry: before.lichess, entries: before,
+      reason: `The Lichess database already gives depth ${before.lichess.depth} for this position; depth ${entry.depth} does not replace it.`,
+    });
+  }
   const saved = await storeEntry(env, entry, false);
-  const current = await env.DB.prepare(`SELECT ${COLUMNS} FROM saved_positions WHERE position_key = ?`).bind(key).first();
-  if (saved) return json(200, { saved: true, entry: publicEntry(current) });
-  const reason = current.verified === 1 && entry.verified === 0
+  const entries = await positionEntries(env, key);
+  const current = entries[entry.source];
+  if (saved) return json(200, { saved: true, entry: current, entries });
+  const what = entry.source === "lichess" ? "A Lichess evaluation" : "An analysis";
+  const reason = current.verified && entry.verified === 0
     ? "A verified analysis is already saved for this position; an unverified one cannot replace it."
-    : `An analysis at depth ${current.depth} is already saved for this position; depth ${entry.depth} does not replace it.`;
-  return json(200, { saved: false, reason, entry: publicEntry(current) });
+    : `${what} at depth ${current.depth} is already saved for this position; depth ${entry.depth} does not replace it.`;
+  return json(200, { saved: false, reason, entry: current, entries });
 }
 
+async function handlePosition(env, url) {
+  const { key } = parsePosition(url.searchParams.get("fen"));
+  return json(200, { entries: await positionEntries(env, key) });
+}
+
+// Removes one engine's entry for a position (it stays in the history).
 async function handleRemove(request, env) {
   await requireAdmin(request, env);
   const body = await readJson(request, 4096);
+  if (!SOURCES.includes(body.source)) throw new HttpError(400, "source must be \"stockfish\" or \"lichess\"");
   const key = positionKey(String(body.fen || ""));
   const now = new Date().toISOString();
   const results = await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO saved_history (${COLUMNS}, archived_at, reason)
-       SELECT ${COLUMNS}, ?, 'removed' FROM saved_positions WHERE position_key = ?`).bind(now, key),
-    env.DB.prepare("DELETE FROM saved_positions WHERE position_key = ? RETURNING position_key").bind(key),
+       SELECT ${COLUMNS}, ?, 'removed' FROM saved_positions WHERE position_key = ? AND source = ?`).bind(now, key, body.source),
+    env.DB.prepare("DELETE FROM saved_positions WHERE position_key = ? AND source = ? RETURNING position_key").bind(key, body.source),
   ]);
-  return json(200, { removed: (results[1].results || []).length === 1 });
+  return json(200, { removed: (results[1].results || []).length === 1, entries: await positionEntries(env, key) });
 }
 
 async function handleHistory(request, env, url) {
@@ -318,13 +400,13 @@ async function handleRestore(request, env) {
   await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO saved_history (${COLUMNS}, archived_at, reason)
-       SELECT ${COLUMNS}, ?, 'restored-over' FROM saved_positions WHERE position_key = ?`).bind(now, row.position_key),
+       SELECT ${COLUMNS}, ?, 'restored-over' FROM saved_positions WHERE position_key = ? AND source = ?`).bind(now, row.position_key, row.source),
     env.DB.prepare(
       `INSERT OR REPLACE INTO saved_positions (${COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
       row.position_key, row.fen, row.move_uci, row.pv, row.evaluation, row.depth, row.knodes,
       row.source, row.verified, row.saved_by, row.saved_at),
   ]);
-  return json(200, { restored: true, entry: publicEntry(row) });
+  return json(200, { restored: true, entry: publicEntry(row), entries: await positionEntries(env, row.position_key) });
 }
 
 // ----------------------------------------------------------------- keys ----
@@ -417,7 +499,7 @@ async function handleImport(request, env) {
     }
     statements.push(
       env.DB.prepare(ARCHIVE_IF_REPLACEABLE).bind(
-        now, "replaced", entry.position_key, force ? 1 : 0, entry.verified, entry.verified, entry.depth),
+        now, "replaced", entry.position_key, entry.source, force ? 1 : 0, entry.verified, entry.verified, entry.depth),
       env.DB.prepare(UPSERT_IF_ALLOWED).bind(
         entry.position_key, entry.fen, entry.move_uci, entry.pv, entry.evaluation, entry.depth,
         entry.knodes, entry.source, entry.verified, entry.saved_by, entry.saved_at, force ? 1 : 0),
@@ -469,13 +551,10 @@ async function route(request, env) {
     const who = await identify(request, env);
     return json(200, {
       role: who.role, label: who.label || null,
-      min_depth: minDepth(env), admin_configured: adminConfigured(env),
+      min_depth: minDepth(env), full_depth: fullDepth(env), admin_configured: adminConfigured(env),
     });
   }
-  if (path === "/api/saved" && method === "GET") {
-    const { results } = await env.DB.prepare(`SELECT ${COLUMNS} FROM saved_positions`).all();
-    return json(200, { entries: results.map(publicEntry) });
-  }
+  if (path === "/api/position" && method === "GET") return handlePosition(env, url);
   if (path === "/api/saved" && method === "POST") return handleSave(request, env);
   if (path === "/api/remove" && method === "POST") return handleRemove(request, env);
   if (path === "/api/history" && method === "GET") return handleHistory(request, env, url);

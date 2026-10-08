@@ -8,10 +8,24 @@
     :root { color-scheme: dark; --bg:#171717; --panel:#242424; --light:#f0d9b5; --dark:#b58863; }
     * { box-sizing:border-box; }
     body { margin:0; font:14px Segoe UI, sans-serif; background:var(--bg); color:#eee; }
-    main { display:flex; gap:18px; padding:18px; max-width:1160px; margin:auto; }
+    main { display:flex; gap:18px; padding:18px; max-width:1194px; margin:auto; }
     #board { display:grid; grid-template-columns:repeat(8,70px); grid-template-rows:repeat(8,70px); width:560px; height:560px; }
     #board-wrap { position:relative; width:560px; height:560px; }
     #annotation-layer { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+    /* The evaluation bar stands left of the board; everything else in the
+       column lines up with the board. */
+    #board-row { display:flex; gap:8px; }
+    .board-tools, #material-status, .history-controls, #opening-status, .board-hints { margin-left:34px; }
+    #eval-bar { position:relative; flex:0 0 26px; height:560px; background:#262626; border:1px solid #555; border-radius:4px; overflow:hidden; }
+    #eval-bar-white { position:absolute; left:0; right:0; bottom:0; height:50%; background:#ededed; transition:height .35s ease; }
+    #eval-bar::after { content:""; position:absolute; left:0; right:0; top:50%; height:2px; margin-top:-1px; background:#d0803c; }
+    #eval-bar-label { position:absolute; left:0; right:0; z-index:1; text-align:center; font:700 10px/1 Segoe UI,sans-serif; font-variant-numeric:tabular-nums; }
+    #eval-bar-label.for-white { bottom:5px; color:#262626; }
+    #eval-bar-label.for-black { top:5px; color:#ededed; }
+    #eval-bar.flipped #eval-bar-white { bottom:auto; top:0; }
+    #eval-bar.flipped #eval-bar-label.for-white { bottom:auto; top:5px; }
+    #eval-bar.flipped #eval-bar-label.for-black { top:auto; bottom:5px; }
+    #eval-bar.empty { opacity:.4; }
     .board-tools { width:560px; display:flex; justify-content:flex-end; margin-bottom:6px; }
     .board-tools button { padding:5px 10px; }
     #opening-status { display:none; width:560px; margin-top:8px; padding:8px 10px; background:var(--panel); border-radius:4px; color:#c8d8ff; overflow-wrap:anywhere; }
@@ -22,9 +36,12 @@
     .drag-preview { position:fixed; width:62px; height:62px; pointer-events:none; z-index:10; transform:translate(-50%,-50%) scale(1.14); }
     .light { background:var(--light); } .dark { background:var(--dark); }
     .last { background:#c9e6ff !important; }
-    .saved { background:#72d572 !important; }
+    /* The best move. app.js sets --best-light / --best-dark on the board:
+       full green from the full depth on, paler the shallower the analysis. */
+    .light.best { background:var(--best-light,#72d572) !important; }
+    .dark.best { background:var(--best-dark,#72d572) !important; }
     .selected { background:#f6f669 !important; }
-    .saved.selected { background:#f6f669 !important; }
+    .best.selected { background:#f6f669 !important; }
     .coordinate { position:absolute; z-index:2; font:700 11px/1 Segoe UI,sans-serif; pointer-events:none; }
     .coordinate.rank { top:3px; left:4px; }
     .coordinate.file { right:4px; bottom:3px; }
@@ -60,7 +77,7 @@
     .material-advantage { margin-left:5px; color:#d9d9d9; font-variant-numeric:tabular-nums; }
     .annotation-arrow { fill:none; stroke-width:9; stroke-linecap:butt; stroke-linejoin:round; opacity:.78; filter:drop-shadow(0 1px 1px rgba(0,0,0,.4)); }
     .annotation-circle { stroke-width:3; opacity:.88; }
-    @media (max-width: 1080px) {
+    @media (max-width: 1120px) {
       main { flex-direction:column; align-items:center; }
       aside { width:min(100%,560px); }
     }
@@ -68,6 +85,8 @@
     #analysis-progress { width:100%; height:18px; display:none; }
     small { color:#aaa; }
     .key-role { color:#9bd49b; align-self:center; white-space:nowrap; }
+    #view-switch button[aria-pressed="true"] { background:#2f5d3a; border-color:#6bbf7b; }
+    #view-note { display:block; }
     #bridge-bar { display:flex; align-items:center; gap:8px; margin-top:8px; font-size:12px; color:#bbb; }
     #bridge-bar span { flex:1; min-width:0; overflow-wrap:anywhere; }
     #bridge-bar button { padding:3px 8px; flex:0 0 auto; }
@@ -87,9 +106,12 @@
 <main>
   <section>
     <div class="board-tools"><button id="flip">↻ Flip board</button></div>
-    <div id="board-wrap">
-      <div id="board" aria-label="Chess board"></div>
-      <svg id="annotation-layer" aria-hidden="true"></svg>
+    <div id="board-row">
+      <div id="eval-bar" class="empty" role="img" aria-label="No evaluation for this position"><div id="eval-bar-white"></div><span id="eval-bar-label" class="for-white"></span></div>
+      <div id="board-wrap">
+        <div id="board" aria-label="Chess board"></div>
+        <svg id="annotation-layer" aria-hidden="true"></svg>
+      </div>
     </div>
     <div id="material-status" aria-live="polite"></div>
     <div class="history-controls" aria-label="Move navigation">
@@ -99,9 +121,12 @@
       <button id="history-last" aria-label="Go to latest position" title="Go to latest position">▶|</button>
     </div>
     <div id="opening-status" role="status" aria-live="polite">Opening: Starting position</div>
-    <small>Scroll over the board to move through the current history.</small><br>
-    <small>Right-click a square or drag to annotate; hold Ctrl for red annotations.</small><br>
-    <small>Green squares show the saved best move automatically.</small>
+    <div class="board-hints">
+      <small>Scroll over the board to move through the current history.</small><br>
+      <small>Right-click a square or drag to annotate; hold Ctrl for red annotations.</small><br>
+      <small id="best-move-hint">Green squares show the best move: full colour from depth 46, paler the shallower the analysis.</small><br>
+      <small>The bar left of the board shows the evaluation, also while an analysis is running.</small>
+    </div>
   </section>
   <aside>
     <div class="row" id="key-bar" title="Optional. A key marks the analyses you save as verified; the admin token also unlocks the admin tools.">
@@ -117,8 +142,8 @@
       <label for="engine">Stockfish 19 executable (optional: only to use a copy you already have)</label>
       <input id="engine" placeholder="Leave empty: the engine bridge downloads Stockfish 19 for you" autocomplete="off" disabled>
       <div id="engine-status" class="status"></div>
-      <label for="depth" id="depth-label">Analysis depth</label>
-      <input id="depth" type="number" min="8" max="60" value="46" autocomplete="off" disabled>
+      <label for="depth" id="depth-label">Stockfish analysis depth</label>
+      <input id="depth" type="number" min="21" max="245" value="46" autocomplete="off">
       <div class="row"><button id="remove" style="display:none">Remove saved move</button></div>
       <div id="admin-tools" style="display:none">
         <label>Admin tools</label>
@@ -131,7 +156,14 @@
         <div id="admin-note"></div>
       </div>
     </details>
-    <div class="row"><button id="analyze">Find and save best move</button></div>
+    <label id="view-label">Results shown</label>
+    <div class="row" id="view-switch" role="group" aria-labelledby="view-label">
+      <button data-view="combined" aria-pressed="true">Combined</button>
+      <button data-view="stockfish" aria-pressed="false">Stockfish 19</button>
+      <button data-view="lichess" aria-pressed="false">Lichess</button>
+    </div>
+    <small id="view-note"></small>
+    <div class="row" id="analyze-row"><button id="analyze">Find and save best move</button></div>
     <progress id="analysis-progress" max="100" value="0"></progress>
     <div id="bridge-bar"><span id="bridge-status">Engine bridge: not connected</span><button id="bridge-connect">Connect</button><button id="bridge-install" style="display:none">Install Stockfish 19</button></div>
     <div id="bridge-setup">

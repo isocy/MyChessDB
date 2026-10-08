@@ -22,7 +22,9 @@ try {
         Write-Host "building $name"
         $env:GOOS = $os
         $env:GOARCH = $arch
-        & go build -trimpath -ldflags '-s -w -buildid=' -o (Join-Path $out $name) .
+        # -buildvcs=false: without it Go stamps the Git commit into the file, and
+        # the same source would no longer give byte-identical files.
+        & go build -trimpath -buildvcs=false -ldflags '-s -w -buildid=' -o (Join-Path $out $name) .
         if ($LASTEXITCODE -ne 0) { throw "go build failed for $target" }
     }
 } finally {

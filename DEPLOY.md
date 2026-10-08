@@ -19,24 +19,138 @@ from the Stockfish project's GitHub release, checks it against SHA-256 values
 built into the bridge, and runs it locally. No engine work happens in the
 cloud or in the browser.
 
+### Engines and views
+
+Results are kept per engine: a position can have a **Stockfish 19** entry and
+a **Lichess** entry, and neither replaces the other. **Results shown** above
+the analyse button chooses what is on screen, and what the button does:
+
+| View | Shows | The button |
+|---|---|---|
+| Combined (first visit) | for each position the deeper of the two; Stockfish 19 when they are equally deep | no button: nothing is analysed here |
+| Stockfish 19 | Stockfish 19 entries only | **Find and save best move** runs Stockfish through the bridge; Lichess is not asked |
+| Lichess | Lichess entries only | **Get Lichess evaluation** fetches the evaluation Lichess has stored and saves it |
+
+The choice is remembered in the browser. The depth line always names the
+engine ("Stockfish 19 · Depth 46", "Lichess · Depth 50 | 1234k nodes").
+
+What is saved for a position is fetched when the position is shown, one small
+request per position, so the size of the database does not matter to the
+page.
+
 ### Who can save what
 
 There are no accounts. Trust comes from where an entry came from:
 
 - **Lichess entries** are fetched from Lichess by the server itself, so the
-  browser cannot fake them. They count as verified. Both the page and the
-  server ask Lichess for one line (`multiPv=1`): Lichess answers with its
-  deepest evaluation that has at least the number of lines asked for, and
-  its deepest ones are mostly single-line.
+  browser cannot fake them. They count as verified, with or without a key.
+  Both the page and the server ask Lichess for one line (`multiPv=1`):
+  Lichess answers with its deepest evaluation that has at least the number of
+  lines asked for, and its deepest ones are mostly single-line.
 - **Stockfish entries saved with a key** (your admin token, or a contributor
   key you created for someone) count as verified.
 - **Stockfish entries without a key** are stored as *unverified* and shown with
   that mark. A depth reported by someone's own computer cannot be checked.
 
-A verified entry is never replaced by an unverified one. Within the same tier
-only a strictly deeper analysis replaces the stored one. Everyone except the
-admin must reach depth 46. Whatever gets replaced or removed is copied to a
+Among the entries of one engine, a verified one is never replaced by an
+unverified one, and within the same tier only a strictly deeper analysis
+replaces the stored one. Whatever gets replaced or removed is copied to a
 history table first and can be restored from the admin tools.
+
+### Depth
+
+The least depth is 21. Nothing shallower is saved, for anyone, the admin
+included, from either engine, and the **Stockfish analysis depth** field does
+not take less (it corrects itself to 21). A Lichess evaluation below depth 21
+is shown while its line stays in the list, but not saved. The only exception
+is the admin's import, so that a backup is restored exactly as it was.
+
+From depth 21 on, anyone can choose the analysis depth (it starts at 46 on
+every visit), and an analysis that is stopped early is saved as far as it got:
+stopped while Stockfish is searching depth 40, the result of depth 39 is
+saved. Nothing is saved if the depth it had finished is below 21, or if what
+is already stored would not be replaced by it.
+
+Depth 46 is the *full depth*. The best move of an analysis at depth 46 or more
+is painted in the full green. Below that the green is much paler, and paler
+still the shallower the analysis, so depth 45 cannot be mistaken for depth 46.
+
+While Stockfish runs, the page follows it: the best move on the board, the
+evaluation, the depth and the line are those of the depth it finished last,
+and the bar left of the board shows the evaluation (White's share from White's
+side of the board). If the position already has a saved analysis that is
+deeper than what the running one has reached, the saved one stays on screen
+until the running one has passed it.
+
+### The Lichess evaluation database
+
+Lichess publishes every evaluation it has stored
+(<https://database.lichess.org/#evals>, about 416 million positions in one
+file). `scripts/lichess_db.mjs` takes the deep ones out of it and turns them
+into SQL for the `lichess_db` table. A position's Lichess entry is then the
+deeper of what was saved from the site and what is in that table; on the page
+such an entry is marked "Lichess database". These rows are reference data:
+they have no history, are not in the backup, and the admin's **Remove** does
+not touch them.
+
+This has to be run on your own PC (the file is large and its address is not
+reachable from where the site was developed), with Node.js 22.15 or newer:
+
+```powershell
+# 1. Download lichess_db_eval.jsonl.zst from database.lichess.org, then:
+node scripts/lichess_db.mjs extract lichess_db_eval.jsonl.zst
+# 2. Turn what was kept (lichess_db.jsonl) into SQL files:
+node scripts/lichess_db.mjs sql
+# 3. Optional: try it locally with `npm run dev` first
+node scripts/lichess_db.mjs load-dev
+# 4. Run each file on the real database:
+npx wrangler d1 execute mychessdb --remote --file=lichess_db_sql/lichess_db_0001.sql
+```
+
+Step 1 reads the whole file once (22 GB packed; expect about an hour) and
+changes nothing anywhere. It writes what it keeps to `lichess_db.jsonl` and
+prints how many positions reach depth 46, divided by depth, by number of
+pieces on the board and into forced mates and the rest, and roughly how much
+room they take. `--limit 4000000` reads only the first four million positions,
+to see it work in under a minute. `--min-depth` and `--pv-plies` (moves kept
+per line, 16 by default) change what is kept.
+
+Expect a very large number. In the first 1.4% of the October 2026 file, 15%
+of the positions reached depth 46, which would be around 43 million in all,
+some 5 GB. Most of them are positions where depth costs nothing: 71% were
+forced mates and 57% had seven pieces or fewer. Only about 5% had 30 or more
+pieces on the board. (The file is not in random order, so the whole of it may
+divide differently.)
+
+So decide what to load once you have the real numbers. The free plan allows
+500 MB per database (roughly 4 million of these rows) and 100,000 row writes
+a day; the paid plan 10 GB and 50 million writes a month. Step 2 can take a
+part of what was extracted without reading the dump again:
+
+```powershell
+node scripts/lichess_db.mjs count --min-pieces 28          # how many, and what each --max-moves N would keep of them
+node scripts/lichess_db.mjs count --max-moves 10           # how many, and what each --min-pieces P would keep of them
+node scripts/lichess_db.mjs sql --max-moves 10             # positions from the first 10 moves
+node scripts/lichess_db.mjs sql --min-pieces 30            # nearly everything still on the board
+node scripts/lichess_db.mjs sql --no-mates --min-pieces 16 # no forced mates, no bare endings
+```
+
+`count` takes the same options as `sql` and writes nothing: its first line is
+the number of rows `sql` would write with them.
+
+`--max-moves N` keeps the positions that can be from the first N moves of a
+game. The Lichess file does not say at which move a position was reached, so
+this is worked out from the position: the fewest moves each side must have
+made to get its pawns and pieces where they stand, counting one more for
+every piece the other side has lost. Every position that really is from the
+first N moves is kept. Others are kept too, because that least number can be
+far below what a real game took: above all positions with many pieces gone,
+which need only one move for each piece taken. Use `--min-pieces` with it (in
+the first ten moves of a real game there are seldom fewer than 28 pieces).
+
+Each SQL file holds 50,000 rows, can be run in any order and more than once,
+and a row only replaces a stored one that is less deep, so the import can be
+spread over days and repeated when Lichess publishes a newer file.
 
 ## Deploy to Cloudflare (free plan)
 
@@ -58,6 +172,11 @@ npx wrangler d1 migrations apply mychessdb --remote
 npx wrangler deploy
 npx wrangler secret put ADMIN_TOKEN
 ```
+
+When a later version adds a file to `migrations/` (as the per-engine storage
+did with `0002_engines.sql`), download a backup from the admin tools first,
+then run the first two of these commands again, one right after the other:
+between them the old site code meets the new tables and saving fails.
 
 `deploy` prints the site address, something like
 `https://mychessdb.<your-subdomain>.workers.dev`. For `ADMIN_TOKEN` enter a
@@ -128,37 +247,38 @@ Deleting those folders and the launcher uninstalls it.
 
 Log in with the admin token, then open **Position and engine settings**:
 
-- **Analysis depth**: only you can change it; it resets to 46 on each visit.
-- **Remove saved move**: removes the entry for the position on the board. It
-  stays in the history.
+- **Remove saved move**: removes the entry that is on screen for the position
+  on the board (one engine's; the other engine's stays). It stays in the
+  history.
 - **History of this position**: every replaced or removed entry, each with a
   **Restore** button.
 - **Contributor keys**: create a key for someone you trust; it is shown once.
   Their Stockfish results are then saved as verified. **Revoke** stops the
   key; **Revoke + unverify entries** also marks everything saved with it as
   unverified, so it can be replaced.
-- **Download backup**: the whole database, including history, as one JSON
-  file. The same file can be imported again; entries that were unverified
+- **Download backup**: everything saved from the site, including history, as
+  one JSON file (not the rows imported from the Lichess evaluation database). The same file can be imported again; entries that were unverified
   stay unverified. Import only fills gaps: it never replaces an entry of equal
   or greater depth, and it does not restore history or contributor keys.
 
 Settings you can change in `wrangler.jsonc` under `vars`: `MIN_DEPTH`
-(default 46) and `ANON_WRITES_PER_HOUR` (default 60 save attempts per hour for
-a visitor without a key).
+(default 21: nothing shallower is saved or can be chosen), `FULL_DEPTH`
+(default 46: the depth shown in full colour, and where the depth field
+starts) and `ANON_WRITES_PER_HOUR` (default 60 save attempts per hour for a
+visitor without a key).
 
 ## Free plan limits to know about
 
 - 100,000 API requests per day; static files do not count.
-- D1: 5 million rows read and 100,000 rows written per day, 5 GB storage.
-  Opening the site reads every saved position once, so with 500 entries that
-  is about 10,000 page loads a day.
+- D1: 5 million rows read and 100,000 rows written per day, 500 MB per
+  database. Showing a position reads its own rows only (three at most).
 - When a daily limit is hit, the API returns errors until 00:00 UTC.
 
 ## Development
 
 ```powershell
 npm run dev          # http://localhost:8787, local SQLite file, no Cloudflare needed
-npm test             # chess rules + API rules
+npm test             # chess rules, API rules, Lichess database import
 ```
 
 `npm run dev` prints a development admin token. To use the bridge with the
@@ -182,7 +302,13 @@ kept in the repository).
 plus `SHA256SUMS`. To rebuild after changing `bridge/*.go`, install Go and run
 `scripts\build_bridge.ps1` (Windows) or `sh scripts/build_bridge.sh`, then
 deploy. Builds are reproducible: the same Go version gives byte-identical
-files. The current ones were built with Go 1.24.7.
+files. The current ones (1.0.4) were built with Go 1.24.7.
+
+The site names the bridge version it expects (`BRIDGE_MIN_VERSION` in
+`web/app.js`). An older bridge keeps working, and the site shows an **Update**
+button with the install command. Bridges before 1.0.4 do not report the search
+as it goes, so with them the page is not updated during an analysis and Stop
+saves nothing.
 
 If you deploy from another copy of the repository, make sure `web/bridge/` is
 there (commit it, or build it), otherwise the install command has nothing to
@@ -205,8 +331,17 @@ Automated tests (Linux, real browser):
 - chess rules against published perft counts and 28,694 positions from
   python-chess; opening table identical to the old `app.py` logic
 - every API rule against SQLite (the engine behind D1)
+- the per-engine views in the browser (combined, Stockfish 19, Lichess), and
+  `migrations/0002_engines.sql` on a copy of the development database (501
+  entries, all carried over unchanged)
+- `scripts/lichess_db.mjs` against a small stand-in for the Lichess file, in
+  the same format and packed the same way
 - the released Linux bridge downloading the official Stockfish 19 from GitHub,
   analysing, pausing, resuming, stopping, and cleaning up
+- with that real Stockfish 19 and with a stand-in engine: the page following
+  a running analysis (best move, evaluation, line, evaluation bar), Stop
+  saving the depth finished last, a deeper saved analysis staying on screen,
+  and the paler green below depth 46
 - the analysis queue (waiting, order, dropping a waiting job, starting by
   itself, shutdown) and the free-memory limit on the hash size
 - the macOS/Linux install script (on Linux)
@@ -223,9 +358,15 @@ Checked by hand on the live site, Windows 11 with Firefox:
 
 Not yet run anywhere:
 
-- the Windows-only parts of bridge 1.0.3: reading free memory, and marking
-  Stockfish's memory as the first to give up when memory runs short
-- the depth field's reset in Firefox (tested in Chromium)
+- `migrations/0002_engines.sql` on the real D1 database
+- `scripts/lichess_db.mjs` on the whole Lichess file (it was run on its first
+  four million positions), and loading its SQL into D1 with wrangler
+- the Windows-only parts of the bridge added in 1.0.3: reading free memory,
+  and marking Stockfish's memory as the first to give up when memory runs
+  short
+- bridge 1.0.4 on Windows and macOS (its tests ran on Linux)
+- the depth field's reset, the evaluation bar and the paler greens in Firefox
+  (tested in Chromium)
 - anything on macOS (bridge, installer, launcher)
 - the Linux launcher on a real desktop
 - the permission prompt in Chrome and Edge

@@ -16,8 +16,10 @@ for target in windows/amd64 windows/arm64 darwin/amd64 darwin/arm64 linux/amd64 
   name="mychessdb-bridge-$os-$arch"
   [ "$os" = windows ] && name="$name.exe"
   echo "building $name"
+  # -buildvcs=false: without it Go stamps the Git commit into the file, and
+  # the same source would no longer give byte-identical files.
   (cd bridge && CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
-    go build -trimpath -ldflags "-s -w -buildid=" -o "../$out/$name" .)
+    go build -trimpath -buildvcs=false -ldflags "-s -w -buildid=" -o "../$out/$name" .)
 done
 
 (cd "$out" && if command -v sha256sum >/dev/null 2>&1; then sha256sum mychessdb-bridge-*; else shasum -a 256 mychessdb-bridge-*; fi) > "$out/SHA256SUMS"

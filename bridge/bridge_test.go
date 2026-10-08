@@ -533,6 +533,83 @@ func TestPauseResumeStop(t *testing.T) {
 	}
 }
 
+// While a job runs the site can read the deepest depth searched to the end
+// ("best"); stopping keeps it, so the site can save it.
+func TestBestFollowsTheSearchAndSurvivesStop(t *testing.T) {
+	t.Setenv("MOCK_DELAY_MS", "25")
+	h := newHarness(t, 4)
+	id := h.start(blackFEN, 200)
+	var running map[string]any
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		running = h.job(id)
+		if best, _ := running["best"].(map[string]any); best != nil && best["depth"].(float64) >= 4 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no finished depth was reported while running: %v", running)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	best := running["best"].(map[string]any)
+	if running["status"] != "running" || running["result"] != nil {
+		t.Fatalf("a running job has no result yet: %v", running)
+	}
+	// The engine is always one depth ahead of the last one it finished.
+	if running["depth"].(float64) != best["depth"].(float64)+1 {
+		t.Fatalf("searching depth %v, finished depth %v", running["depth"], best["depth"])
+	}
+	if best["move_uci"] != "e7e5" || best["evaluation"] != "-0.32" ||
+		!reflect.DeepEqual(best["pv"], []any{"e7e5", "g1f3", "b8c6", "f1b5"}) {
+		t.Fatalf("best while running: %v", best)
+	}
+
+	// A paused job still shows what it had found.
+	h.do("POST", "/api/analyze/"+id+"/pause", nil, nil)
+	time.Sleep(100 * time.Millisecond)
+	paused := h.job(id)
+	if paused["status"] != "paused" || paused["best"] == nil {
+		t.Fatalf("paused job lost its best line: %v", paused)
+	}
+	h.do("POST", "/api/analyze/"+id+"/resume", nil, nil)
+
+	if r := h.do("POST", "/api/analyze/"+id+"/stop", nil, nil); r.status != 200 {
+		t.Fatalf("stop: %d %v", r.status, r.body)
+	}
+	stopped := h.waitStatus(id, "stopped", "error", "complete")
+	kept, _ := stopped["best"].(map[string]any)
+	if stopped["status"] != "stopped" || stopped["result"] != nil || kept == nil {
+		t.Fatalf("a stopped job keeps its last finished depth, and has no result: %v", stopped)
+	}
+	if kept["depth"].(float64) < best["depth"].(float64) || kept["depth"].(float64) != stopped["depth"].(float64)-1 {
+		t.Fatalf("stopped while searching depth %v, kept depth %v (had %v before)", stopped["depth"], kept["depth"], best["depth"])
+	}
+	if kept["move_uci"] != "e7e5" || kept["evaluation"] != "-0.32" {
+		t.Fatalf("kept: %v", kept)
+	}
+	if list := h.do("GET", "/api/analyze", nil, nil).list; len(list) != 0 {
+		t.Fatalf("a stopped job is not listed as active: %v", list)
+	}
+
+	// Stopped before the first depth was finished: nothing to keep.
+	t.Setenv("MOCK_DELAY_MS", "2000")
+	id = h.start(startFEN, 50)
+	h.waitStatus(id, "running")
+	h.do("POST", "/api/analyze/"+id+"/stop", nil, nil)
+	if job := h.waitStatus(id, "stopped", "error", "complete"); job["status"] != "stopped" || job["best"] != nil || job["result"] != nil {
+		t.Fatalf("stopped before any depth was finished: %v", job)
+	}
+
+	// A finished job: best and result are the same, at the target depth.
+	t.Setenv("MOCK_DELAY_MS", "5")
+	id = h.start(startFEN, 6)
+	done := h.waitStatus(id, "complete", "error")
+	if done["status"] != "complete" || done["depth"].(float64) != 6 || !reflect.DeepEqual(done["best"], done["result"]) ||
+		done["result"].(map[string]any)["depth"].(float64) != 6 {
+		t.Fatalf("finished job: %v", done)
+	}
+}
+
 func (h *harness) queue(fen string, depth int) map[string]any {
 	h.t.Helper()
 	r := h.do("POST", "/api/analyze", map[string]any{"fen": fen, "depth": depth}, nil)

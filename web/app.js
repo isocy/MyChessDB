@@ -1,17 +1,24 @@
 // My Chess DB - page logic.
 //
-// Saved best moves come from this site's API (/api/*). Opening names are
-// looked up in the browser. Lichess is asked directly. Stockfish runs on the
-// user's own computer through the engine bridge at http://127.0.0.1:8765.
+// Saved best moves come from this site's API (/api/*), which keeps them per
+// engine: Stockfish 19 and Lichess. The page shows one engine's results or,
+// combined, the deeper of the two. Opening names are looked up in the
+// browser. Lichess is asked directly. Stockfish runs on the user's own
+// computer through the engine bridge at http://127.0.0.1:8765.
 import * as chess from "./chesslib.js";
 
 const BRIDGE_URL = "http://127.0.0.1:8765";
-const BRIDGE_MIN_VERSION = "1.0.3";
+const BRIDGE_MIN_VERSION = "1.0.4";
 
 const symbols = {K:"♔",Q:"♕",R:"♖",B:"♗",N:"♘",P:"♙",k:"♚",q:"♛",r:"♜",b:"♝",n:"♞",p:"♟"};
 const boardEl = document.querySelector("#board"), annotationLayer = document.querySelector("#annotation-layer"), fenEl = document.querySelector("#fen");
 const notationEl = document.querySelector("#notation");
-let state = { board: [], turn:"w", castling:"-", ep:"-", selected:null, last:null, lastSound:"move", captured:{w:[],b:[]}, savedMove:null, saved:[], analysis:null, history:[], historyIndex:0, openingMoves:[], openingTracking:false, flipped:false, annotations:[], annotationStart:null, suppressRightAnnotation:false, lichessRetryUntil:0, dragging:false, pointerStart:null, pointerCurrent:null, dragPreview:null, ignoreNextClick:false, savedIndex:new Map(), key: localStorage.getItem("chessdb_key")||"", role:null, roleLabel:null, minDepth:46 };
+let state = { board: [], turn:"w", castling:"-", ep:"-", selected:null, last:null, lastSound:"move", captured:{w:[],b:[]}, shown:null, shownMove:null, analysis:null, history:[], historyIndex:0, openingMoves:[], openingTracking:false, flipped:false, annotations:[], annotationStart:null, suppressRightAnnotation:false, lichessRetryUntil:0, dragging:false, pointerStart:null, pointerCurrent:null, dragPreview:null, ignoreNextClick:false, positions:new Map(), view:"combined", key: localStorage.getItem("chessdb_key")||"", role:null, roleLabel:null, minDepth:21, fullDepth:46 };
+// The engines results are kept for, with the names shown for them.
+const ENGINES = {stockfish:"Stockfish 19",lichess:"Lichess"};
+// Analyses started from this page (or picked up from the bridge), by engine
+// and position (see jobKey).
+const activeJobs = new Map();
 let audioContext=null;
 function status(text) { document.querySelector("#status").textContent=text; }
 function playMoveSound(kind) {
@@ -45,7 +52,49 @@ function playMoveSound(kind) {
 }
 // Same position => same key, however the en passant square was written.
 function positionKey(fen) { return chess.positionKey(fen); }
-function savedMatch(fen) { return state.savedIndex.get(positionKey(fen)); }
+function jobKey(source, fen) { return `${source}|${positionKey(fen)}`; }
+// What is saved for a position, by engine: {stockfish?, lichess?}. Each
+// position is fetched when it is first shown (state.positions) and then kept
+// up to date from the answers to this page's own saves.
+function entryFor(fen, source) { return state.positions.get(positionKey(fen))?.[source]||null; }
+const positionRequests=new Map();
+function loadPosition(fen) {
+  const key=positionKey(fen);
+  if(state.positions.has(key)) return Promise.resolve();
+  let request=positionRequests.get(key);
+  if(!request) {
+    request=api(`/api/position?fen=${encodeURIComponent(fen)}`)
+      .then(data=>data.entries, error=>{
+        // A board that is not a legal position has nothing saved for it.
+        if(error.status===400) return {};
+        throw error;
+      })
+      .then(entries=>{ state.positions.set(key,entries); })
+      .finally(()=>positionRequests.delete(key));
+    positionRequests.set(key,request);
+  }
+  return request;
+}
+function setPosition(fen, entries) {
+  state.positions.set(positionKey(fen),entries);
+  if(positionKey(fen)===positionKey(currentFen())) { applyShownAnalysis(currentFen()); render(); }
+}
+// After something that may have changed many positions (an import, a key
+// being unverified): forget what was fetched and look again.
+function reloadPositions() {
+  state.positions.clear();
+  applyShownAnalysis(currentFen());
+  render();
+}
+// The saved analysis the chosen view shows for a position: one engine's, or,
+// combined, the deeper of the two (Stockfish 19 when they are equally deep).
+function savedMatch(fen) {
+  const entries=state.positions.get(positionKey(fen));
+  if(!entries) return null;
+  if(state.view!=="combined") return entries[state.view]||null;
+  const {stockfish,lichess}=entries;
+  return lichess&&(!stockfish||lichess.depth>stockfish.depth)?lichess:stockfish||null;
+}
 function pvSan(entry) {
   if(!entry.pv_san) {
     try { entry.pv_san=chess.replayUci(entry.fen,entry.pv).san; } catch(error) { entry.pv_san=[]; }
@@ -53,20 +102,88 @@ function pvSan(entry) {
   return entry.pv_san;
 }
 function depthLabel(entry) {
-  return `Depth ${entry.depth}${entry.knodes?` | ${entry.knodes}k nodes`:""}${entry.verified?"":" · unverified"}`;
+  const depth=`${ENGINES[entry.source]} · Depth ${entry.depth}${entry.knodes?` | ${entry.knodes}k nodes`:""}`;
+  if(entry.live) return `${depth} · ${entry.source==="lichess"?"not saved":"still analysing"}`;
+  return `${depth}${entry.imported?" · Lichess database":""}${entry.verified?"":" · unverified"}`;
 }
-function applySavedMatch(fen) {
-  const match=savedMatch(fen);
-  state.savedMove=match?.move_uci||null;
-  if(match) {
-    notationEl.textContent=pvSan(match).join(" ");
-    document.querySelector("#evaluation").value=match.evaluation||"";
-    document.querySelector("#depth-result").value=depthLabel(match);
-  } else {
-    notationEl.textContent="";
-    document.querySelector("#evaluation").value="";
-    document.querySelector("#depth-result").value="";
+// What the page shows for a position: its saved analysis in the chosen view,
+// or what a job of that view's engine has found so far (job.live) once that
+// is deeper than the saved one.
+function shownAnalysis(fen) {
+  const saved=savedMatch(fen);
+  let live=null;
+  for(const source of state.view==="combined"?Object.keys(ENGINES):[state.view]) {
+    const job=activeJobs.get(jobKey(source,fen));
+    const found=job&&(!job.finished||job.unsaved)?job.live:null;
+    if(found&&(!live||found.depth>live.depth)) live=found;
   }
+  return live&&(!saved||live.depth>saved.depth)?live:saved;
+}
+function applyShownAnalysis(fen) {
+  if(!state.positions.has(positionKey(fen))) {
+    // Not fetched yet: show it as soon as it is here, if this is still the position on the board.
+    loadPosition(fen).then(()=>{ if(positionKey(fen)===positionKey(currentFen())) refreshShownAnalysis(); },error=>status(error.message));
+  }
+  const shown=shownAnalysis(fen);
+  state.shown=shown;
+  state.shownMove=shown?.move_uci||null;
+  notationEl.textContent=shown?pvSan(shown).join(" "):"";
+  document.querySelector("#evaluation").value=shown?.evaluation||"";
+  document.querySelector("#depth-result").value=shown?depthLabel(shown):"";
+}
+// The same without rebuilding the board, so it is safe while a piece is
+// being dragged. Used when a running analysis reports a new depth.
+function refreshShownAnalysis() {
+  applyShownAnalysis(currentFen());
+  updateSelectionVisual();
+  renderEvalBar();
+}
+// How strongly the best move is painted, 0..1. From the site's full depth
+// (46) on: 1, the full green. Below it: from 0.12 at depth 1 up to 0.5 just
+// under the full depth, so that depth 45 still cannot be mistaken for 46.
+function depthStrength(depth) {
+  const full=state.fullDepth;
+  if(!(depth<full)) return 1;
+  return 0.12+0.38*Math.max(0,Math.min(1,(depth-1)/Math.max(1,full-2)));
+}
+const BEST_MOVE_COLOUR=[0x72,0xd5,0x72];
+function cssColour(name) {
+  const hex=getComputedStyle(document.documentElement).getPropertyValue(name).trim().slice(1);
+  return [0,2,4].map(start=>parseInt(hex.slice(start,start+2),16));
+}
+const SQUARE_COLOURS={light:cssColour("--light"),dark:cssColour("--dark")};
+function applyBestMoveColour() {
+  const strength=state.shown?depthStrength(state.shown.depth):1;
+  for(const [shade,base] of Object.entries(SQUARE_COLOURS)) {
+    const mixed=base.map((channel,i)=>Math.round(channel+(BEST_MOVE_COLOUR[i]-channel)*strength));
+    boardEl.style.setProperty(`--best-${shade}`,`rgb(${mixed.join(",")})`);
+  }
+}
+// Reads "+0.32", "#-3", "Lichess Cloud: -0.31" or "Lichess Cloud: mate 4"
+// (always from White's side). Returns White's share of the evaluation bar in
+// percent and a short label, or null when the text holds no score.
+function parseEvaluation(text) {
+  const mate=/(?:#|mate )(-?)(\d+)/.exec(text||"");
+  if(mate) return {white:mate[1]?0:100,label:`M${mate[2]}`};
+  const score=/[+-]?\d+\.\d+/.exec(text||"");
+  if(!score) return null;
+  const pawns=Number(score[0]), size=Math.abs(pawns);
+  // The usual winning-chances curve: +1 is about 59%, +3 about 75%.
+  const white=Math.max(4,Math.min(96,100/(1+Math.exp(-0.368208*pawns))));
+  return {white,label:size<100?size.toFixed(1):String(Math.round(size))};
+}
+function renderEvalBar() {
+  const bar=document.querySelector("#eval-bar"), label=document.querySelector("#eval-bar-label");
+  const score=parseEvaluation(state.shown?.evaluation);
+  bar.classList.toggle("flipped",state.flipped);
+  bar.classList.toggle("empty",!score);
+  document.querySelector("#eval-bar-white").style.height=`${score?score.white:50}%`;
+  label.textContent=score?score.label:"";
+  // The number sits at the end of the side that is ahead.
+  label.className=score&&score.white<50?"for-black":"for-white";
+  const description=score?`Evaluation ${state.shown.evaluation} at depth ${state.shown.depth}`:"No evaluation for this position";
+  bar.title=description;
+  bar.setAttribute("aria-label",description);
 }
 function currentFen() {
   const rows=state.board.map(row=>{let s="", empty=0; for(const p of row){if(!p) empty++; else {if(empty){s+=empty;empty=0} s+=p}} if(empty)s+=empty; return s}).join("/");
@@ -142,7 +259,7 @@ function showHistoryPosition(index) {
   state.dragging=false;
   if(state.dragPreview){state.dragPreview.remove();state.dragPreview=null;}
   fenEl.value=currentFen();
-  applySavedMatch(fenEl.value);
+  applyShownAnalysis(fenEl.value);
   render();
   updateHistoryControls();
   playMoveSound(index>previousIndex?position.lastSound||"move":previousPosition?.lastSound||"move");
@@ -160,7 +277,7 @@ function parseFen(fen, openingMoves=null, positionHistory=null) {
     if(out.length!==8) throw Error("Invalid FEN row");
     board.push(out);
   }
-  state.board=board; state.turn=parts[1]; state.castling=parts[2]; state.ep=parts[3]; state.selected=null; state.last=null; state.lastSound="move"; state.captured={w:[],b:[]}; state.analysis=null; state.savedMove=null; state.history=[];
+  state.board=board; state.turn=parts[1]; state.castling=parts[2]; state.ep=parts[3]; state.selected=null; state.last=null; state.lastSound="move"; state.captured={w:[],b:[]}; state.analysis=null; state.shown=null; state.shownMove=null; state.history=[];
   // Arrows and circles belong to the position they were drawn on.
   state.annotations=[]; state.annotationStart=null;
   const preferences=flipPreferences(), savedFlip=preferences[positionKey(fen)];
@@ -188,10 +305,10 @@ function parseFen(fen, openingMoves=null, positionHistory=null) {
     state.history.push(current);
   }
   state.historyIndex=state.history.length-1;
-  fenEl.value=fen; applySavedMatch(fen); render(); updateHistoryControls(); void updateOpeningDisplay();
+  fenEl.value=fen; applyShownAnalysis(fen); render(); updateHistoryControls(); void updateOpeningDisplay();
 }
 function moveSquares(uci) { return uci ? [("abcdefgh".indexOf(uci[0]) + (8-+uci[1])*8), ("abcdefgh".indexOf(uci[2]) + (8-+uci[3])*8)] : []; }
-function savedMoveSquares(uci) {
+function bestMoveSquares(uci) {
   const squares=moveSquares(uci);
   if(squares.length!==2) return squares;
   const [from,to]=squares, fr=Math.floor(from/8), ff=from%8, tr=Math.floor(to/8), tf=to%8;
@@ -304,7 +421,8 @@ function renderMaterialStatus() {
   }
 }
 function render() {
-  boardEl.innerHTML=""; const saved=savedMoveSquares(state.savedMove), last=moveSquares(state.last);
+  boardEl.innerHTML=""; const best=bestMoveSquares(state.shownMove), last=moveSquares(state.last);
+  applyBestMoveColour();
   const legalMoves=state.selected===null ? [] : getLegalDestinations(state.selected);
   const castleMoves=state.selected===null ? [] : getCastleHighlights(state.selected);
   for(let display=0;display<64;display++){
@@ -315,7 +433,7 @@ function render() {
     b.dataset.index=String(i);
     b.className="square "+(((displayRow+displayCol)%2)?"dark":"light");
     b.setAttribute("aria-label",`${squareName(i)}${piece?` ${piece}`:""}`);
-    if(saved.includes(i))b.classList.add("saved");
+    if(best.includes(i))b.classList.add("best");
     if(last.includes(i)&&!castle)b.classList.add("last");
     if(state.selected===i)b.classList.add("selected");
     if(castle)b.classList.add("legal-castle");
@@ -344,6 +462,7 @@ function render() {
   }
   renderAnnotations();
   renderMaterialStatus();
+  renderEvalBar();
   setAnalyzeButtonLabel();
   syncAnalysisProgressForCurrentPosition();
 }
@@ -420,11 +539,12 @@ function hasAnyLegalMove(color) {
 function updateSelectionVisual() {
   const legalMoves=state.selected===null ? [] : getLegalDestinations(state.selected);
   const castleMoves=state.selected===null ? [] : getCastleHighlights(state.selected);
-  const saved=savedMoveSquares(state.savedMove);
+  const best=bestMoveSquares(state.shownMove);
+  applyBestMoveColour();
   document.querySelectorAll("#board .square").forEach(square=>{
     const index=Number(square.dataset.index), piece=state.board[Math.floor(index/8)][index%8];
     const castle=castleMoves.includes(index);
-    square.classList.toggle("saved",saved.includes(index));
+    square.classList.toggle("best",best.includes(index));
     square.classList.toggle("last",state.last && moveSquares(state.last).includes(index) && !castle);
     square.classList.toggle("selected",state.selected===index);
     square.classList.toggle("legal-castle",castle);
@@ -558,6 +678,10 @@ document.addEventListener("contextmenu",e=>{
 });
 document.addEventListener("pointermove",e=>{
   if(cancelOnRightButton(e)) return;
+  // The right button that cancelled a piece drag has been let go. While the
+  // left button is still down that arrives as a pointermove, not a pointerup,
+  // so without this the flag stayed set and swallowed the next right-drag.
+  if(!(e.buttons & 2)) state.suppressRightAnnotation=false;
   if(!state.pointerStart) return;
   const square=document.elementFromPoint(e.clientX,e.clientY)?.closest(".square");
   pointerMoveSquare(e,square ? Number(square.dataset.index) : -1);
@@ -646,7 +770,7 @@ function movePiece(from,to) {
   playMoveSound(state.lastSound);
   state.history.push(positionSnapshot());
   state.historyIndex=state.history.length-1;
-  fenEl.value=currentFen(); applySavedMatch(fenEl.value); state.selected=null; render(); updateHistoryControls(); void updateOpeningDisplay();
+  fenEl.value=currentFen(); applyShownAnalysis(fenEl.value); state.selected=null; render(); updateHistoryControls(); void updateOpeningDisplay();
 }
 function undoMove() {
   if(state.historyIndex<=0){status("Already at the first position");return;}
@@ -754,24 +878,21 @@ function setRoleUI() {
   document.querySelector("#key-input").style.display=state.role?"none":"";
   document.querySelector("#key-login").textContent=state.role?"🔓 Logout":"Login";
   document.querySelector("#key-role").textContent=admin?"Admin":state.role==="contributor"?`Contributor: ${state.roleLabel||""}`:"";
-  const depthInput=document.querySelector("#depth");
-  depthInput.disabled=!admin;
-  if(!admin) depthInput.value=state.minDepth;
-  document.querySelector("#depth-label").textContent=admin
-    ? "Analysis depth"
-    : `Analysis depth (fixed at ${state.minDepth}; only the admin can change it)`;
+  document.querySelector("#depth").min=state.minDepth;
+  document.querySelector("#depth-label").textContent=`Stockfish analysis depth (${state.minDepth} or more; ${state.fullDepth} is the full depth)`;
+  document.querySelector("#best-move-hint").textContent=`Green squares show the best move: full colour from depth ${state.fullDepth}, paler the shallower the analysis.`;
 }
 async function loadSession() {
   const session=await api("/api/session");
-  state.minDepth=session.min_depth;
+  state.minDepth=session.min_depth; state.fullDepth=session.full_depth;
   if(state.key && !session.role) {
     state.key="";
     localStorage.removeItem("chessdb_key");
     status("Your saved key is no longer valid; you are logged out.");
   }
   state.role=session.role; state.roleLabel=session.label;
-  // Every visit starts at the site's depth, whatever was typed last time.
-  document.querySelector("#depth").value=state.minDepth;
+  // Every visit starts at the site's full depth, whatever was typed last time.
+  document.querySelector("#depth").value=state.fullDepth;
   setRoleUI();
   return session;
 }
@@ -796,42 +917,47 @@ document.querySelector("#key-login").onclick=async()=>{
     }
     localStorage.setItem("chessdb_key",key);
     input.value="";
-    state.role=session.role; state.roleLabel=session.label; state.minDepth=session.min_depth;
+    state.role=session.role; state.roleLabel=session.label; state.minDepth=session.min_depth; state.fullDepth=session.full_depth;
     setRoleUI();
     status(session.role==="admin"?"Admin mode enabled":"Contributor key accepted: your analyses are saved as verified");
   } catch(error) { state.key=""; status(error.message); }
 };
 document.querySelector("#key-input").addEventListener("keydown",e=>{ if(e.key==="Enter") document.querySelector("#key-login").click(); });
-
-async function refreshSaved() {
-  const data=await api("/api/saved");
-  state.saved=data.entries;
-  state.savedIndex=new Map(state.saved.map(entry=>[positionKey(entry.fen),entry]));
-  applySavedMatch(currentFen());
-  render();
+// The depth an analysis is asked to reach: what is typed, kept between the
+// least depth the site saves and the most the engine takes. The field is
+// corrected to match, so a depth that would not be saved cannot be chosen.
+function chosenDepth() {
+  const input=document.querySelector("#depth");
+  const depth=Math.min(245,Math.max(state.minDepth,Math.floor(+input.value)||state.fullDepth));
+  input.value=depth;
+  return depth;
 }
-// Sends a finished analysis to the server, which decides whether it replaces
-// what is stored. Returns {saved, reason, entry}.
+document.querySelector("#depth").addEventListener("change",chosenDepth);
+
+// Sends an analysis to the server, which decides whether it replaces what is
+// stored for that engine. Returns {saved, reason, entry, entries}.
 async function saveAnalysisFor(fen, analysis) {
   const body=analysis.source==="lichess"
+    // The server fetches the evaluation from Lichess itself.
     ? {fen,source:"lichess"}
     : {fen,source:"stockfish",depth:analysis.depth,pv:analysis.pv,evaluation:analysis.evaluation};
   const outcome=await api("/api/saved",{body});
-  await refreshSaved();
-  playMoveSound("complete");
+  setPosition(fen,outcome.entries);
+  if(!analysis.partial) playMoveSound("complete");
   return outcome;
 }
 // Would an analysis of this kind replace what is already saved? Mirrors the
 // server's rule so a long Stockfish run is not started for nothing.
-function blockedByExisting(fen, verified, depth) {
-  const existing=savedMatch(fen);
+function blockedByExisting(fen, source, verified, depth, beforeStarting=true) {
+  const existing=entryFor(fen,source);
   if(!existing) return null;
   if(existing.verified && !verified)
     return `A verified analysis (depth ${existing.depth}) is already saved for this position; an unverified one cannot replace it.`;
-  if(existing.verified===verified && existing.depth>=depth)
-    return `An analysis at depth ${existing.depth} is already saved for this position; depth ${depth} would not replace it.`
-      +(state.role==="admin"?" Remove the saved move first to analyse it again.":"");
-  return null;
+  if(existing.verified!==verified || existing.depth<depth) return null;
+  if(source==="lichess")
+    return `Lichess's evaluation at depth ${existing.depth} is already here for this position; depth ${depth} would not replace it.`;
+  return `An analysis at depth ${existing.depth} is already saved for this position; depth ${depth} would not replace it.`
+    +(beforeStarting&&state.role==="admin"?" Remove the saved move first to analyse it again.":"");
 }
 
 // ===========================================================================
@@ -1044,13 +1170,39 @@ async function requireEngine() {
 }
 
 
-const activeJobs = new Map();
 const openingLookups = new Map();
 function jobMatchesCurrent(job) { return positionKey(job.fen)===positionKey(currentFen()); }
-function setAnalyzeButtonLabel() {
-  const job=activeJobs.get(positionKey(currentFen()));
-  document.querySelector("#analyze").textContent=job&&!job.finished?"Stop analysis":"Find and save best move";
+// The job the analyse button and the progress bar belong to: the one of the
+// chosen view's engine for the position on the board.
+function currentJob() {
+  const fen=currentFen();
+  if(state.view!=="combined") return activeJobs.get(jobKey(state.view,fen))||null;
+  return activeJobs.get(jobKey("stockfish",fen))||activeJobs.get(jobKey("lichess",fen))||null;
 }
+function setAnalyzeButtonLabel() {
+  const job=currentJob(), busy=job&&!job.finished;
+  document.querySelector("#analyze").textContent=busy?"Stop analysis":state.view==="lichess"?"Get Lichess evaluation":"Find and save best move";
+}
+// The view decides what is shown and what the analyse button does:
+// "stockfish" runs Stockfish 19, "lichess" fetches Lichess's evaluation, and
+// "combined" only shows, for each position, the deeper of the two.
+function setView(view) {
+  state.view=Object.hasOwn(ENGINES,view)?view:"combined";
+  try { localStorage.setItem("chessdb_view",state.view); } catch(error) { /* the choice just is not remembered */ }
+  for(const button of document.querySelectorAll("#view-switch button"))
+    button.setAttribute("aria-pressed",String(button.dataset.view===state.view));
+  const combined=state.view==="combined";
+  document.querySelector("#analyze-row").style.display=combined?"none":"";
+  document.querySelector("#view-note").textContent=combined
+    ? "Combined shows, for each position, the deeper of the Stockfish 19 and Lichess results. Choose one of them to analyse."
+    : state.view==="lichess"
+      ? "Lichess's stored evaluation is fetched as it is; depth is not chosen here."
+      : "";
+  applyShownAnalysis(currentFen());
+  render();
+}
+for(const button of document.querySelectorAll("#view-switch button"))
+  button.onclick=()=>{ playMoveSound("ui"); setView(button.dataset.view); };
 function loadJobPosition(job) {
   parseFen(job.fen,job.openingMoves,job.positionHistory);
   state.flipped=!!job.flipped;
@@ -1060,8 +1212,7 @@ function loadJobPosition(job) {
   status(job.openingName?`Loaded ${job.openingName}`:"Loaded analyzed position");
 }
 function dismissAnalysisJob(job) {
-  const key=positionKey(job.fen);
-  if(activeJobs.get(key)===job) activeJobs.delete(key);
+  if(activeJobs.get(job.key)===job) activeJobs.delete(job.key);
   renderActiveJobs();
   setAnalyzeButtonLabel();
   syncAnalysisProgressForCurrentPosition();
@@ -1070,16 +1221,18 @@ function completeAnalysisJob(job, outcome) {
   job.completed=true;
   job.finished=true;
   job.progress=100;
-  job.statusText=outcome.saved
-    ? `Analysis complete. Best move saved${outcome.entry.verified?"":" (unverified)"}.`
-    : `Analysis complete. ${outcome.reason}`;
+  job.statusText=job.source==="lichess"
+    ? outcome.saved?`Lichess evaluation saved (depth ${outcome.entry.depth}).`:outcome.reason
+    : outcome.saved
+      ? `Analysis complete. Best move saved${outcome.entry.verified?"":" (unverified)"}.`
+      : `Analysis complete. ${outcome.reason}`;
   updateJobProgressUI(job);
 }
 function renderActiveJobs() {
   const list=document.querySelector("#active-jobs"), label=document.querySelector("#active-jobs-label");
   const currentKeys=new Set();
   for(const job of activeJobs.values()){
-    const key=positionKey(job.fen);
+    const key=job.key;
     currentKeys.add(key);
     let elements=job.elements;
     if(!elements) {
@@ -1112,24 +1265,12 @@ function renderActiveJobs() {
       elements.openingButton.setAttribute("aria-label",openingLabel);
     const statusText=job.statusText||"Queued...";
     if(elements.statusSpan.textContent!==statusText) elements.statusSpan.textContent=statusText;
-    const actionMode=job.awaitingCloudFallback?"fallback":job.finished?"finished":"running";
+    const actionMode=job.finished?"finished":"running";
     if(elements.actionMode!==actionMode) {
       elements.li.querySelector(".job-actions, .job-dismiss, .job-running-actions")?.remove();
       elements.actionMode=actionMode;
     }
-    if(actionMode==="fallback" && !elements.li.querySelector(".job-actions")) {
-      const actions=document.createElement("span"); actions.className="job-actions";
-      const fallbackBtn=document.createElement("button");
-      fallbackBtn.textContent="Use Stockfish";
-      fallbackBtn.setAttribute("aria-label","Continue with Stockfish");
-      fallbackBtn.onclick=()=>continueWithStockfishFallback(job);
-      const dismissBtn=document.createElement("button");
-      dismissBtn.textContent="Dismiss";
-      dismissBtn.setAttribute("aria-label","Dismiss rate-limit fallback choice");
-      dismissBtn.onclick=()=>dismissCloudFallbackChoice(job);
-      actions.append(fallbackBtn,dismissBtn);
-      elements.li.appendChild(actions);
-    } else if(actionMode==="finished" && !elements.li.querySelector(".job-dismiss")) {
+    if(actionMode==="finished" && !elements.li.querySelector(".job-dismiss")) {
       const dismissBtn=document.createElement("button");
       dismissBtn.className="job-dismiss";
       dismissBtn.textContent="Dismiss";
@@ -1162,7 +1303,7 @@ function renderActiveJobs() {
   label.style.display=hasJobs?"block":"none";
 }
 function syncAnalysisProgressForCurrentPosition() {
-  const job=activeJobs.get(positionKey(currentFen()));
+  const fen=currentFen(), job=currentJob();
   const progress=document.querySelector("#analysis-progress");
   if(job){
     progress.style.display="block";
@@ -1171,27 +1312,48 @@ function syncAnalysisProgressForCurrentPosition() {
   } else {
     progress.style.display="none";
   }
+  // A job that found a new depth, or ended, changes what this position shows.
+  if(shownAnalysis(fen)!==state.shown) refreshShownAnalysis();
 }
 function updateJobProgressUI(job) {
   renderActiveJobs();
   if(jobMatchesCurrent(job)) syncAnalysisProgressForCurrentPosition();
 }
-function dismissCloudFallbackChoice(job) {
-  job.awaitingCloudFallback=false;
-  job.finished=true;
-  job.statusText=job.rateLimitMessage;
-  updateJobProgressUI(job);
-  setAnalyzeButtonLabel();
+// Keeps what a job's analysis has found so far; shownAnalysis() puts it on
+// the page while the job runs. `found` is {depth, pv, evaluation, knodes?}.
+function setLiveAnalysis(job, source, found) {
+  job.live={live:true,source,fen:job.fen,depth:found.depth,move_uci:found.pv[0],pv:found.pv,evaluation:found.evaluation,knodes:found.knodes||null};
 }
-function askCloudFallback(job, message) {
-  job.awaitingCloudFallback=true;
-  job.rateLimitMessage=message;
-  job.statusText=`${message} Choose whether to continue with Stockfish.`;
+// `best` is the bridge's report of the deepest depth Stockfish has searched
+// to the end (absent until depth 1 is done, and from a bridge before 1.0.4).
+function noteEngineBest(job, best) {
+  if(!best || !Array.isArray(best.pv) || !best.pv.length) return;
+  if(job.live?.source==="stockfish" && job.live.depth===best.depth) return;
+  setLiveAnalysis(job,"stockfish",best);
+}
+// Sends what a Stockfish run produced to the server and reports the outcome
+// on the job. For a run that was stopped, that is the deepest depth it had
+// searched to the end: stopped while on depth 40, depth 39 is saved. Nothing
+// is saved below the site's least depth (21).
+async function saveStockfishAnalysis(job, analysis) {
+  if(!analysis.partial) {
+    completeAnalysisJob(job,await saveAnalysisFor(job.fen,analysis));
+    return;
+  }
+  let result=analysis.depth<state.minDepth
+    ? `Nothing was saved: depth ${analysis.depth} had been finished, and the least that is saved is depth ${state.minDepth}.`
+    : blockedByExisting(job.fen,"stockfish",!!state.role,analysis.depth,false);
+  if(!result) {
+    const outcome=await saveAnalysisFor(job.fen,analysis);
+    result=outcome.saved?`Depth ${analysis.depth} result saved${outcome.entry.verified?"":" (unverified)"}.`:outcome.reason;
+  }
+  job.finished=true;
+  job.statusText=`Analysis stopped at depth ${analysis.stoppedAt}. ${result}`;
   updateJobProgressUI(job);
 }
 // Runs Stockfish through the bridge and sends the result to the server.
 async function runStockfishAndSave(job, target) {
-  const blocked=blockedByExisting(job.fen,!!state.role,target);
+  const blocked=blockedByExisting(job.fen,"stockfish",!!state.role,target);
   if(blocked) {
     job.statusText=blocked;
     job.finished=true;
@@ -1200,30 +1362,32 @@ async function runStockfishAndSave(job, target) {
   }
   await requireEngine();
   const analysis=await analyzeWithStockfish(job,job.fen,target);
-  if(!analysis) return;
-  const outcome=await saveAnalysisFor(job.fen,analysis);
-  completeAnalysisJob(job,outcome);
+  if(analysis) await saveStockfishAnalysis(job,analysis);
 }
-async function continueWithStockfishFallback(job) {
-  if(job.cancelled || !job.awaitingCloudFallback) return;
-  job.awaitingCloudFallback=false;
-  job.statusText="Starting Stockfish...";
+// Lichess view: asks Lichess for the evaluation it has stored and has the
+// server save it. Below the least depth it is only shown, for as long as the
+// job stays in the list.
+async function fetchLichessAndSave(job) {
+  const remaining=Math.ceil((state.lichessRetryUntil-Date.now())/1000);
+  if(remaining>0) throw Error(`Lichess Cloud rate limit. Try again in about ${remaining} seconds.`);
+  job.statusText="Asking Lichess for its evaluation...";
   updateJobProgressUI(job);
-  try {
-    await runStockfishAndSave(job,job.target);
-  } catch(e) {
-    job.statusText=e.message;
-    job.finished=true;
-    updateJobProgressUI(job);
-  } finally {
-    if(!job.finished) {
-      job.finished=true;
-      if(job.cancelled) job.statusText="Analysis stopped.";
-    }
-    renderActiveJobs();
-    if(jobMatchesCurrent(job)) syncAnalysisProgressForCurrentPosition();
-    setAnalyzeButtonLabel();
+  const cloud=await cloudEval(job.fen);
+  if(job.cancelled) return;
+  const end=text=>{ job.statusText=text; job.finished=true; updateJobProgressUI(job); };
+  if(!cloud.lines.length) {
+    end(cloud.unreachable?"Lichess could not be reached.":"Lichess has no evaluation for this position.");
+    return;
   }
+  setLiveAnalysis(job,"lichess",{depth:cloud.depth,knodes:cloud.knodes,pv:cloud.lines[0].pv,evaluation:`Lichess Cloud: ${cloud.lines[0].evaluation}`});
+  if(cloud.depth<state.minDepth) {
+    job.unsaved=true;
+    end(`Lichess has depth ${cloud.depth} for this position. It is shown but not saved: the least that is saved is depth ${state.minDepth}.`);
+    return;
+  }
+  const blocked=blockedByExisting(job.fen,"lichess",true,cloud.depth);
+  if(blocked) { end(blocked); return; }
+  completeAnalysisJob(job,await saveAnalysisFor(job.fen,{source:"lichess"}));
 }
 async function lookupOpeningForJob(job) {
   const key=`${positionKey(job.fen)}|${job.openingMoves?.join(" ")||""}`;
@@ -1248,6 +1412,7 @@ async function lookupOpeningForJob(job) {
 async function stopAnalysisJob(job) {
   if(!job || job.cancelled) return;
   job.cancelled=true;
+  job.cancelledAt=Date.now();
   job.statusText="Stopping analysis...";
   updateJobProgressUI(job);
   if(job.stockfishJobId) {
@@ -1302,17 +1467,21 @@ function showQueued(job, view) {
   job.statusText=queuedText(view);
   updateJobProgressUI(job);
 }
+// Follows a job on the bridge to its end. Returns the analysis to save: the
+// full result, or, for a job that was stopped, the deepest depth it had
+// finished ({partial:true}). Returns null when there is nothing to save.
 async function pollStockfishJob(job, jobId) {
-  const LIMIT_MS=12*60*60*1000;
+  const LIMIT_MS=12*60*60*1000, STOP_WAIT_MS=5000;
   let d, failures=0, worked=0, last=Date.now();
   for(;;){
-    if(job.cancelled) { job.statusText="Analysis stopped"; updateJobProgressUI(job); return null; }
-    // A waiting job changes rarely; look at it less often.
-    await new Promise(r=>setTimeout(r,job.queued?1500:500));
+    // A waiting job changes rarely; look at it less often. After Stop the
+    // bridge reports the job as stopped within moments.
+    await new Promise(r=>setTimeout(r,job.cancelled?150:job.queued?1500:500));
     try {
       d=await bridge(`/api/analyze/${jobId}`);
       failures=0;
     } catch(error) {
+      if(job.cancelled) { d=null; break; }
       // Ride out a short hiccup; give up if the bridge is really gone.
       if(error.status || ++failures>=6) throw error.status?error:Error("Lost contact with the engine bridge. If it is still running, reconnect to pick the analysis up again.");
       continue;
@@ -1321,12 +1490,20 @@ async function pollStockfishJob(job, jobId) {
     // Time spent waiting in the queue does not count towards the limit.
     if(d.status!=="queued") worked+=now-last;
     last=now;
+    if(!["queued","running","paused"].includes(d.status)) break;
+    if(job.cancelled) {
+      // Stop was pressed: wait for the bridge to confirm it, because the
+      // stopped job then holds the last depth it finished.
+      if(now-job.cancelledAt>STOP_WAIT_MS) break;
+      continue;
+    }
     if(d.status==="queued"){
       showQueued(job,d);
       continue;
     }
     job.queued=false;
     if(worked>LIMIT_MS) break;
+    noteEngineBest(job,d.best);
     if(d.status==="running"){
       job.paused=false;
       job.depth=d.depth||0;
@@ -1342,10 +1519,17 @@ async function pollStockfishJob(job, jobId) {
       updateJobProgressUI(job);
       continue;
     }
-    break;
   }
   job.queued=false;
+  if(d?.status==="complete" && d.result) {
+    job.progress=100;
+    updateJobProgressUI(job);
+    return {source:"stockfish",depth:d.result.depth,pv:d.result.pv,evaluation:d.result.evaluation};
+  }
   if(job.cancelled || d?.status==="stopped") {
+    const best=d?.status==="stopped"?d.best:null;
+    if(best && Array.isArray(best.pv) && best.pv.length)
+      return {source:"stockfish",depth:best.depth,pv:best.pv,evaluation:best.evaluation,partial:true,stoppedAt:d.depth};
     job.finished=true;
     job.statusText="Analysis stopped";
     updateJobProgressUI(job);
@@ -1353,10 +1537,7 @@ async function pollStockfishJob(job, jobId) {
   }
   if(!d||d.status==="running"||d.status==="paused") throw Error("Stockfish analysis did not finish within 12 hours");
   if(d.status==="error") throw Error(d.error);
-  if(d.status!=="complete"||!d.result) throw Error("Stockfish returned an invalid analysis status.");
-  job.progress=100;
-  updateJobProgressUI(job);
-  return {source:"stockfish",depth:d.result.depth,pv:d.result.pv,evaluation:d.result.evaluation};
+  throw Error("Stockfish returned an invalid analysis status.");
 }
 function clonePosition(position) {
   return {
@@ -1374,16 +1555,18 @@ async function restoreActiveAnalyses() {
   const jobs=await bridge("/api/analyze");
   for(const savedJob of jobs) {
     if(!savedJob.job_id || !savedJob.fen) continue;
-    const key=positionKey(savedJob.fen);
+    const key=jobKey("stockfish",savedJob.fen);
     const existing=activeJobs.get(key);
     if(existing) {
       if(!existing.finished || existing.completed) continue;
       existing.elements?.li.remove();   // a job that lost contact earlier is replaced
     }
     const context=savedJob.context&&typeof savedJob.context==="object"?savedJob.context:{};
-    const target=savedJob.target_depth||state.minDepth;
+    const target=savedJob.target_depth||state.fullDepth;
     const depth=savedJob.depth||0;
     const job={
+      key,
+      source:"stockfish",
       fen:savedJob.fen,
       flipped:!!context.flipped,
       cancelled:false,
@@ -1407,14 +1590,13 @@ async function restoreActiveAnalyses() {
         ? context.positionHistory.map(clonePosition)
         : null
     };
+    noteEngineBest(job,savedJob.best);
     activeJobs.set(key,job);
     void lookupOpeningForJob(job);
     void (async()=>{
       try {
         const analysis=await pollStockfishJob(job,job.stockfishJobId);
-        if(!analysis) return;
-        const outcome=await saveAnalysisFor(job.fen,analysis);
-        completeAnalysisJob(job,outcome);
+        if(analysis) await saveStockfishAnalysis(job,analysis);
       } catch(error) {
         job.statusText=error.message;
         job.finished=true;
@@ -1497,8 +1679,7 @@ async function cloudEval(fen) {
     if(!replay.uci.length) continue;
     const cp=Number(pv.cp)||0;
     lines.push({
-      move_uci:replay.uci[0],
-      pv_san:replay.san,
+      pv:replay.uci,
       evaluation:Number.isInteger(pv.mate)?`mate ${pv.mate}`:`${cp>=0?"+":"-"}${(Math.abs(cp)/100).toFixed(2)}`
     });
   }
@@ -1506,8 +1687,8 @@ async function cloudEval(fen) {
 }
 document.querySelector("#analyze").onclick=async()=>{
   playMoveSound("ui");
-  const fen=currentFen();
-  const key=positionKey(fen);
+  if(state.view==="combined") return;   // the button is not shown there
+  const source=state.view, fen=currentFen(), key=jobKey(source,fen);
   const existing=activeJobs.get(key);
   if(existing) {
     if(!existing.finished) await stopAnalysisJob(existing);
@@ -1521,74 +1702,25 @@ document.querySelector("#analyze").onclick=async()=>{
     return;
   }
   rememberFlipForPosition(fen);
-  const job={fen,flipped:state.flipped,cancelled:false,finished:false,completed:false,stockfishJobId:null,depth:0,progress:0,target:0,statusText:"Queued...",openingMoves:state.openingTracking?[...state.openingMoves]:null,positionHistory:state.history.slice(0,state.historyIndex+1).map(clonePosition)};
+  const target=source==="stockfish"?chosenDepth():0;
+  const job={key,source,fen,flipped:state.flipped,cancelled:false,finished:false,completed:false,stockfishJobId:null,depth:0,progress:0,target,statusText:"Queued...",openingMoves:state.openingTracking?[...state.openingMoves]:null,positionHistory:state.history.slice(0,state.historyIndex+1).map(clonePosition)};
   activeJobs.set(key,job);
   setAnalyzeButtonLabel();
   updateJobProgressUI(job);
   void lookupOpeningForJob(job);
-  const target=state.role==="admin"
-    ? Math.min(245,Math.max(1,Math.floor(+document.querySelector("#depth").value)||state.minDepth))
-    : state.minDepth;
-  job.target=target;
   try{
-    const remaining=Math.ceil((state.lichessRetryUntil-Date.now())/1000);
-    if(remaining>0) {
-      askCloudFallback(job,`Lichess Cloud rate limit. Try again in about ${remaining} seconds.`);
-      return;
-    }
-    job.statusText="Querying Lichess Cloud Evaluation...";
-    updateJobProgressUI(job);
-    let cloud;
-    try {
-      cloud=await cloudEval(fen);
-    } catch(e) {
-      if(e.code!=="LICHESS_RATE_LIMIT") throw e;
-      askCloudFallback(job,e.message);
-      return;
-    }
+    // What is already saved decides whether a new analysis could replace it.
+    await loadPosition(fen);
     if(job.cancelled) return;
-    if(cloud.lines.length){
-      if(jobMatchesCurrent(job))
-        notationEl.textContent=cloud.lines.map(x=>`${x.pv_san.join(" ")} (${x.evaluation})`).join(" | ");
-      if(cloud.depth>=target){
-        const blocked=blockedByExisting(fen,true,cloud.depth);
-        if(blocked) {
-          job.statusText=blocked;
-          job.finished=true;
-          updateJobProgressUI(job);
-          return;
-        }
-        try {
-          // The server fetches the evaluation from Lichess itself.
-          const outcome=await saveAnalysisFor(fen,{source:"lichess"});
-          completeAnalysisJob(job,outcome);
-          return;
-        } catch(e) {
-          if(e.code==="LICHESS_RATE_LIMIT" || e.code==="LICHESS_UNAVAILABLE") {
-            askCloudFallback(job,"The server could not confirm the Lichess evaluation just now.");
-            return;
-          }
-          if(e.code!=="LICHESS_TOO_SHALLOW" && e.code!=="LICHESS_NOT_FOUND") throw e;
-          job.statusText="Lichess could not confirm that depth; starting Stockfish...";
-        }
-      } else {
-        job.statusText=`Lichess depth ${cloud.depth} is below target ${target}; starting Stockfish...`;
-      }
-    } else {
-      job.statusText=cloud.unreachable
-        ? "Lichess could not be reached; starting Stockfish..."
-        : "No suitable Lichess cache; starting Stockfish...";
-    }
-    updateJobProgressUI(job);
-    await runStockfishAndSave(job,target);
-    if(jobMatchesCurrent(job)) setTimeout(()=>{ if(!activeJobs.has(key)) syncAnalysisProgressForCurrentPosition(); },800);
+    if(source==="lichess") await fetchLichessAndSave(job);
+    else await runStockfishAndSave(job,target);
   }catch(e){
     job.statusText=e.message;
     job.finished=true;
     updateJobProgressUI(job);
   }
   finally{
-    if(!job.finished && !job.awaitingCloudFallback) {
+    if(!job.finished) {
       job.finished=true;
       if(job.cancelled) job.statusText="Analysis stopped.";
     }
@@ -1597,11 +1729,15 @@ document.querySelector("#analyze").onclick=async()=>{
     if(jobMatchesCurrent(job)) syncAnalysisProgressForCurrentPosition();
   }
 };
+// Removes the saved entry that is on screen (one engine's; the other stays).
 document.querySelector("#remove").onclick=async()=>{
+  const fen=currentFen(), shown=savedMatch(fen);
+  if(!shown) { status("There is no saved move for this position in this view"); return; }
+  if(shown.imported) { status("This evaluation comes from the imported Lichess database and cannot be removed here"); return; }
   try {
-    const result=await api("/api/remove",{body:{fen:currentFen()}});
-    await refreshSaved();
-    status(result.removed?"Saved move removed (it stays in the history and can be restored)":"There is no saved move for this position");
+    const result=await api("/api/remove",{body:{fen,source:shown.source}});
+    setPosition(fen,result.entries);
+    status(result.removed?`${ENGINES[shown.source]} move removed (it stays in the history and can be restored)`:"There is no saved move for this position");
   } catch(e) { status(e.message); }
 };
 
@@ -1653,7 +1789,7 @@ document.querySelector("#import-file").addEventListener("change",async e=>{
       stored+=result.stored; kept+=result.kept_existing;
       for(const item of result.invalid) skipped.push(`#${start+item.index+1} ${String(item.fen||"").split(" ")[0]}: ${item.error}`);
     }
-    await refreshSaved();
+    reloadPositions();
     adminNote(`Import finished: ${stored} stored, ${kept} already present with equal or deeper analysis, ${skipped.length} skipped.`
       +(skipped.length?`\nSkipped:\n${skipped.join("\n")}`:""));
   } catch(error) { adminNote(`Import failed: ${error.message}`); }
@@ -1689,7 +1825,7 @@ async function renderKeys() {
           try {
             const result=await api("/api/keys/revoke",{body:{id:key.id,demote}});
             adminNote(`Key "${key.label}" revoked${demote?`; ${result.demoted} of its entries are now unverified`:""}.`);
-            await renderKeys(); await refreshSaved();
+            await renderKeys(); reloadPositions();
           } catch(error) { adminNote(error.message); }
         };
         li.appendChild(button);
@@ -1721,14 +1857,14 @@ document.querySelector("#history-button").onclick=async()=>{
       label.className="admin-item-text";
       let san=item.move_uci;
       try { san=chess.replayUci(item.fen,item.pv).san[0]||item.move_uci; } catch(error) { /* keep UCI */ }
-      label.textContent=`${san} · ${item.evaluation} · depth ${item.depth} · ${item.source}${item.verified?"":" · unverified"} · ${item.reason} ${item.archived_at.slice(0,16).replace("T"," ")}`;
+      label.textContent=`${ENGINES[item.source]||item.source} · ${san} · ${item.evaluation} · depth ${item.depth}${item.verified?"":" · unverified"} · ${item.reason} ${item.archived_at.slice(0,16).replace("T"," ")}`;
       const button=document.createElement("button");
       button.textContent="Restore";
       button.onclick=async()=>{
         try {
-          await api("/api/restore",{body:{id:item.id}});
-          await refreshSaved();
-          adminNote(`Restored ${san} (depth ${item.depth}) for this position.`);
+          const result=await api("/api/restore",{body:{id:item.id}});
+          setPosition(fen,result.entries);
+          adminNote(`Restored ${san} (${ENGINES[item.source]||item.source}, depth ${item.depth}) for this position.`);
           document.querySelector("#history-button").click();
         } catch(error) { adminNote(error.message); }
       };
@@ -1739,10 +1875,12 @@ document.querySelector("#history-button").onclick=async()=>{
 };
 
 (async()=>{
+  let view="combined";
+  try { view=localStorage.getItem("chessdb_view")||view; } catch(error) { /* start with the combined view */ }
   parseFen(chess.START_FEN);
+  setView(view);
   try {
     await loadSession();
-    await refreshSaved();
   } catch(e) { status(e.message); }
   // Only look for the bridge by ourselves if this browser has used it before.
   if(localStorage.getItem("chessdb_bridge_used")) await checkBridge();

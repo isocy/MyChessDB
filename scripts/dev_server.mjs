@@ -4,7 +4,7 @@
 //
 // It serves web/ and runs worker/index.js against a local SQLite file
 // (.dev/mychessdb.sqlite) through the D1 stand-in in d1_local.mjs.
-// Environment: PORT, ADMIN_TOKEN, MIN_DEPTH, ANON_WRITES_PER_HOUR,
+// Environment: PORT, ADMIN_TOKEN, MIN_DEPTH, FULL_DEPTH, ANON_WRITES_PER_HOUR,
 // LICHESS_API_BASE, DEV_DB (":memory:" for a throwaway database).
 import { createServer } from "node:http";
 import { readFile, stat, mkdir } from "node:fs/promises";
@@ -69,6 +69,7 @@ const env = {
   ASSETS: { fetch: serveAsset },
   ADMIN_TOKEN: process.env.ADMIN_TOKEN || "dev-admin-token-change-me",
   MIN_DEPTH: process.env.MIN_DEPTH,
+  FULL_DEPTH: process.env.FULL_DEPTH,
   ANON_WRITES_PER_HOUR: process.env.ANON_WRITES_PER_HOUR,
   LICHESS_API_BASE: process.env.LICHESS_API_BASE,
 };

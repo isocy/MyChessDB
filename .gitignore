@@ -14,3 +14,8 @@ node_modules/
 .dev/
 .dev.vars
 tests/chess_fixture.json
+
+# Lichess evaluation database import (scripts/lichess_db.mjs)
+lichess_db_eval.jsonl.zst
+lichess_db.jsonl
+lichess_db_sql/

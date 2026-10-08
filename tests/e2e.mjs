@@ -149,9 +149,35 @@ async function move(page, from, to) {
 async function toStart(page) {   // back to the first position of the current history
   if (await page.locator("#history-first").isEnabled()) await page.click("#history-first");
 }
-const savedSquares = page => page.$$eval("#board .square.saved", nodes => nodes.map(node => Number(node.dataset.index)).sort((a, b) => a - b));
+const bestSquares = page => page.$$eval("#board .square.best", nodes => nodes.map(node => Number(node.dataset.index)).sort((a, b) => a - b));
+const FULL_GREEN = "rgb(114, 213, 114)";
+// Everything the page shows about the analysis of the position on the board, read in one go.
+const shown = page => page.evaluate(() => ({
+  evaluation: document.querySelector("#evaluation").value,
+  depth: document.querySelector("#depth-result").value,
+  line: document.querySelector("#notation").innerText,
+  status: document.querySelector("#status").innerText,
+  colours: [...document.querySelectorAll("#board .square.best")].map(node => getComputedStyle(node).backgroundColor),
+  bar: {
+    white: parseFloat(document.querySelector("#eval-bar-white").style.height),
+    label: document.querySelector("#eval-bar-label").innerText,
+    side: document.querySelector("#eval-bar-label").className,
+    empty: document.querySelector("#eval-bar").classList.contains("empty"),
+  },
+}));
+// How far a colour is from the full green, 0..441.
+const distanceFromFull = colour => {
+  const [r, g, b] = colour.match(/\d+/g).map(Number);
+  return Math.hypot(r - 114, g - 213, b - 114);
+};
 const jobTexts = page => page.$$eval("#active-jobs li", nodes => nodes.map(node => node.innerText.replace(/\s+/g, " ")));
-const apiSaved = async () => (await (await fetch(SITE + "/api/saved")).json()).entries;
+// Everything saved from the site (the admin's backup), in the shape the page is given entries.
+const apiSaved = async () => (await (await fetch(SITE + "/api/export", { headers: { "X-Key": ADMIN } })).json()).saved.map(row => ({
+  fen: row.fen, move_uci: row.move_uci, pv: row.pv, evaluation: row.evaluation, depth: row.depth, knodes: row.knodes,
+  source: row.source, verified: row.verified === 1, saved_at: row.saved_at,
+}));
+// Which results are shown: "combined", "stockfish" or "lichess".
+const showView = (page, name) => page.click(`#view-switch button[data-view="${name}"]`);
 
 try {
   let page = await newPage();
@@ -163,10 +189,22 @@ try {
     assert.equal(await text(page, "#bridge-status"), "Engine bridge: not connected");
     assert.equal(await text(page, "#opening-status"), "Opening: Starting position");
     assert.equal(await value(page, "#depth"), "46");
-    assert.equal(await page.locator("#depth").isDisabled(), true);
+    assert.equal(await page.locator("#depth").isDisabled(), false, "anyone may choose the depth");
+    assert.equal(await page.getAttribute("#depth", "min"), "21");
     assert.equal(await page.locator("#remove").isVisible(), false);
+    const bar = (await shown(page)).bar;
+    assert.deepEqual([bar.empty, bar.white, bar.label], [true, 50, ""], "the evaluation bar is neutral without an analysis");
+    const board = await page.locator("#board-wrap").boundingBox(), barBox = await page.locator("#eval-bar").boundingBox();
+    assert.ok(barBox.x + barBox.width <= board.x && barBox.y === board.y && barBox.height === board.height, "the bar stands left of the board");
     const csp = (await (await fetch(SITE + "/")).headers.get("content-security-policy")) || "";
     assert.ok(csp.includes("script-src 'self';") && csp.includes("frame-ancestors 'none'"), csp);
+    // A first visit shows the combined results, where nothing is analysed.
+    assert.equal(await page.getAttribute("#view-switch button[data-view='combined']", "aria-pressed"), "true");
+    assert.equal(await page.locator("#analyze").isVisible(), false, "no analyse button in the combined view");
+    assert.match(await text(page, "#view-note"), /the deeper of the Stockfish 19 and Lichess results/);
+    await showView(page, "stockfish");
+    assert.equal(await page.locator("#analyze").isVisible(), true);
+    assert.equal(await text(page, "#analyze"), "Find and save best move");
   });
 
   await step("moves work and the opening is named in the browser", async () => {
@@ -213,14 +251,32 @@ try {
     assert.match(bridge.output, /is installed/);
   });
 
-  await step("anonymous Stockfish analysis is saved as unverified and highlighted", async () => {
+  await step("while Stockfish runs the page follows it: best move, evaluation, line and bar", async () => {
     await page.click("#analyze");   // position after 1. e4, black to move, depth 46
     await until(async () => (await jobTexts(page)).some(t => /depth \d+\/46/.test(t)), "progress with depth");
+    // One reading of the page while the engine is somewhere below depth 46.
+    const live = await until(async () => {
+      const now = await shown(page);
+      return /^Stockfish 19 · Depth \d+ · still analysing$/.test(now.depth) ? now : null;
+    }, "the running analysis on the page");
+    const searching = Number(/depth (\d+)\/46/.exec(live.status)[1]), finished = Number(/Depth (\d+)/.exec(live.depth)[1]);
+    assert.equal(finished, searching - 1, `searching depth ${searching}: the page shows the last finished depth`);
+    assert.deepEqual([live.evaluation, live.line], ["-0.32", "e5 Nf3 Nc6 Bb5"]);
+    assert.deepEqual(await bestSquares(page), [square("e7"), square("e5")].sort((a, b) => a - b), "best move so far is highlighted");
+    assert.ok(live.colours.length === 2 && live.colours.every(colour => distanceFromFull(colour) > 40), `pale while below depth 46: ${live.colours}`);
+    // Black is ahead by 0.32: White's part of the bar is a little under half.
+    assert.ok(!live.bar.empty && live.bar.white > 40 && live.bar.white < 50, JSON.stringify(live.bar));
+    assert.deepEqual([live.bar.label, live.bar.side], ["0.3", "for-black"]);
+    assert.deepEqual(await apiSaved(), [], "nothing is saved while it runs");
+  });
+
+  await step("anonymous Stockfish analysis is saved as unverified and highlighted in full colour", async () => {
     await until(async () => (await jobTexts(page)).some(t => /Analysis complete\. Best move saved \(unverified\)\./.test(t)), "saved", 20000);
     assert.equal(await value(page, "#evaluation"), "-0.32");
-    assert.equal(await value(page, "#depth-result"), "Depth 46 · unverified");
+    assert.equal(await value(page, "#depth-result"), "Stockfish 19 · Depth 46 · unverified");
     assert.equal(await text(page, "#notation"), "e5 Nf3 Nc6 Bb5");
-    assert.deepEqual(await savedSquares(page), [square("e7"), square("e5")].sort((a, b) => a - b));
+    assert.deepEqual(await bestSquares(page), [square("e7"), square("e5")].sort((a, b) => a - b));
+    assert.deepEqual((await shown(page)).colours, [FULL_GREEN, FULL_GREEN], "depth 46 is painted in the full green");
     const saved = await apiSaved();
     assert.equal(saved.length, 1);
     assert.deepEqual([saved[0].verified, saved[0].depth, saved[0].source, saved[0].move_uci], [false, 46, "stockfish", "e7e5"]);
@@ -232,10 +288,11 @@ try {
     await page.reload();
     await page.waitForSelector("#board .square");
     await until(async () => /Stockfish 19 ready/.test(await text(page, "#bridge-status")), "auto reconnect");
-    assert.deepEqual(await savedSquares(page), []);
+    assert.equal(await page.getAttribute("#view-switch button[data-view='stockfish']", "aria-pressed"), "true", "the chosen view is remembered");
+    assert.deepEqual(await bestSquares(page), []);
     await move(page, "e2", "e4");
-    await until(async () => (await savedSquares(page)).length === 2, "highlight");
-    assert.equal(await value(page, "#depth-result"), "Depth 46 · unverified");
+    await until(async () => (await bestSquares(page)).length === 2, "highlight");
+    assert.equal(await value(page, "#depth-result"), "Stockfish 19 · Depth 46 · unverified");
   });
 
   await step("a second analysis that could not replace the saved one is refused up front", async () => {
@@ -244,7 +301,8 @@ try {
     await page.click("#active-jobs li button:has-text('Dismiss')");
   });
 
-  await step("pause freezes the engine, resume continues, stop ends it", async () => {
+  let stoppedDepth;
+  await step("pause freezes the engine, resume continues; stop saves the last finished depth", async () => {
     await toStart(page);
     await page.click("#analyze");
     await until(async () => (await jobTexts(page)).some(t => /Analyzing Stockfish\.\.\. depth [1-9]\d*\/46/.test(t)), "running");
@@ -257,10 +315,84 @@ try {
     assert.equal((await jobTexts(page))[0], frozen, "no progress while paused");
     await page.click("#active-jobs li button:has-text('Resume')");
     await until(async () => (await jobTexts(page))[0] !== frozen && /Analyzing/.test((await jobTexts(page))[0]), "resumed");
+    await until(async () => (await jobTexts(page)).some(t => /depth (2[3-9]|[34]\d)\/46/.test(t)), "past depth 21, the least that is saved");
     await page.click("#active-jobs li button:has-text('Stop')");
     await until(async () => (await jobTexts(page)).some(t => /Analysis stopped/.test(t)), "stopped");
-    assert.equal((await apiSaved()).length, 1, "a stopped analysis saves nothing");
+    // Stopped while searching depth N: the result of depth N-1 is saved.
+    const message = /Analysis stopped at depth (\d+)\. Depth (\d+) result saved \(unverified\)\./.exec((await jobTexts(page))[0]);
+    assert.ok(message, (await jobTexts(page))[0]);
+    stoppedDepth = Number(message[2]);
+    assert.equal(stoppedDepth, Number(message[1]) - 1);
+    assert.ok(stoppedDepth >= 21 && stoppedDepth < 46);
+    const saved = (await apiSaved()).find(e => e.fen === START);
+    assert.deepEqual([saved.depth, saved.verified, saved.move_uci, saved.evaluation], [stoppedDepth, false, "e2e4", "+0.32"]);
+    assert.equal((await apiSaved()).length, 2);
+    const now = await shown(page);
+    assert.equal(now.depth, `Stockfish 19 · Depth ${stoppedDepth} · unverified`);
+    assert.ok(now.colours.length === 2 && now.colours.every(colour => distanceFromFull(colour) > 40), `a shallow saved move is pale: ${now.colours}`);
+    assert.deepEqual([now.bar.label, now.bar.side, now.bar.white > 50], ["0.3", "for-white", true], "White is ahead by 0.32");
     await page.click("#active-jobs li button:has-text('Dismiss')");
+  });
+
+  await step("a deeper saved analysis stays on screen until the running one has passed it", async () => {
+    // The start position is saved at stoppedDepth. Analysing it again shows
+    // the saved one while the engine is at or below that depth.
+    await page.click("#analyze");
+    const seen = { kept: 0, live: 0, wrong: [] };
+    await until(async () => {
+      const now = await shown(page);
+      const running = /Analyzing Stockfish\.\.\. depth (\d+)\/46/.exec(now.status);
+      if (running) {
+        const finished = Number(running[1]) - 1;   // the page writes both from the same answer of the bridge
+        const kept = finished <= stoppedDepth;
+        const expected = kept ? `Stockfish 19 · Depth ${stoppedDepth} · unverified` : `Stockfish 19 · Depth ${finished} · still analysing`;
+        if (now.depth !== expected) seen.wrong.push(`engine finished ${finished}: page shows "${now.depth}"`);
+        seen[kept ? "kept" : "live"]++;
+      }
+      return /Best move saved \(unverified\)/.test(now.status);
+    }, "second run saved", 20000);
+    assert.deepEqual(seen.wrong, []);
+    assert.ok(seen.kept >= 1 && seen.live >= 1, `saw both phases: ${JSON.stringify(seen)}`);
+    const now = await shown(page);
+    assert.equal(now.depth, "Stockfish 19 · Depth 46 · unverified", "the deeper result replaced the shallow one");
+    assert.deepEqual(now.colours, [FULL_GREEN, FULL_GREEN]);
+    assert.equal((await apiSaved()).length, 2);
+    await page.click("#active-jobs li button:has-text('Dismiss')");
+  });
+
+  await step("the paler the green, the shallower the analysis; depth 45 is clearly short of depth 46", async () => {
+    // Without a key: choose the depth, here 25 and then 45, for two new positions.
+    await page.click("#advanced-settings summary");
+    // Less than 21 cannot be chosen: the field corrects itself.
+    await page.fill("#depth", "20");
+    await page.press("#depth", "Tab");
+    assert.equal(await value(page, "#depth"), "21");
+    await page.fill("#depth", "9999");
+    await page.press("#depth", "Tab");
+    assert.equal(await value(page, "#depth"), "245");
+    const colourAt = async (depth, from, to) => {
+      await toStart(page);
+      await move(page, from, to);
+      await page.fill("#depth", String(depth));
+      await page.click("#analyze");
+      await until(async () => (await jobTexts(page)).some(t => /Best move saved \(unverified\)/.test(t)), `depth ${depth} saved`, 20000);
+      const now = await shown(page);
+      assert.equal(now.depth, `Stockfish 19 · Depth ${depth} · unverified`);
+      await page.click("#active-jobs li button:has-text('Dismiss')");
+      return now.colours;
+    };
+    const at25 = await colourAt(25, "h2", "h3"), at45 = await colourAt(45, "g2", "g3");
+    await page.fill("#depth", "46");
+    await page.click("#advanced-settings summary");
+    // Both highlighted squares (e7 and e5, dark ones) get greener with depth ...
+    for (const index of [0, 1]) {
+      const [far, near] = [distanceFromFull(at25[index]), distanceFromFull(at45[index])];
+      assert.ok(far > near + 8, `depth 25 (${at25[index]}) is paler than depth 45 (${at45[index]})`);
+      // ... and depth 45 is still far from the full green of depth 46.
+      assert.ok(near > 40, `depth 45 (${at45[index]}) must not be mistaken for depth 46 (${FULL_GREEN})`);
+    }
+    assert.equal((await apiSaved()).length, 4);
+    await toStart(page);
   });
 
   await step("an analysis survives a reload and one that finishes while the page is closed is still saved", async () => {
@@ -271,7 +403,7 @@ try {
     await page.waitForSelector("#board .square");
     await until(async () => (await jobTexts(page)).some(t => /A40 · Queen's Pawn Game.*(depth \d+\/46|Analysis complete)/.test(t)), "restored with its opening");
     await until(async () => (await jobTexts(page)).some(t => /Best move saved/.test(t)), "saved after reload", 20000);
-    assert.equal((await apiSaved()).length, 2);
+    assert.equal((await apiSaved()).length, 5);
     await page.click("#active-jobs li button:has-text('Dismiss')");
     // now: start, close the page, let it finish, open again
     await move(page, "c2", "c4");
@@ -279,63 +411,106 @@ try {
     await until(async () => (await jobTexts(page)).some(t => /depth \d+\/46/.test(t)), "running");
     await page.close();
     await sleep(3500);
-    assert.equal((await apiSaved()).length, 2, "nothing can be saved while no page is open");
+    assert.equal((await apiSaved()).length, 5, "nothing can be saved while no page is open");
     page = await newPage();
-    await until(async () => (await apiSaved()).length === 3, "collected and saved after reopening", 20000);
+    await until(async () => (await apiSaved()).length === 6, "collected and saved after reopening", 20000);
     await until(async () => (await jobTexts(page)).some(t => /Best move saved/.test(t)), "shown as complete");
     await page.click("#active-jobs li button:has-text('Dismiss')");
   });
 
-  const afterE4E5 = "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2";
-  await step("a deep Lichess evaluation is saved as verified, from the server's own fetch", async () => {
-    const cloud = { fen: afterE4E5, knodes: 1234, depth: 50, pvs: [{ moves: "g1f3 b8c6 f1b5", cp: 25 }, { moves: "b1c3 g8f6", cp: 20 }] };
+  const afterE4 = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1";
+  await step("Lichess view: its evaluation is saved beside the Stockfish result, from the server's own fetch", async () => {
+    const cloud = { fen: afterE4, knodes: 1234, depth: 50, pvs: [{ moves: "c7c5 g1f3 d7d6", cp: 25 }, { moves: "e7e5 g1f3", cp: 20 }] };
     // The browser is shown a tampered copy; what is saved must be the server's.
-    lichessBrowser = () => ({ status: 200, body: { ...cloud, depth: 99, pvs: [{ moves: "a2a3 a7a6", cp: 900 }] } });
+    lichessBrowser = () => ({ status: 200, body: { ...cloud, depth: 99, pvs: [{ moves: "a7a6 a2a3", cp: 900 }] } });
     lichessAnswer = () => ({ status: 200, body: cloud });
-    await move(page, "e2", "e4"); await move(page, "e7", "e5");
-    const before = lichessServerCalls;
+    await showView(page, "lichess");
+    await move(page, "e2", "e4");   // has a Stockfish result from the first analysis, nothing from Lichess
+    await until(async () => (await text(page, "#analyze")) === "Get Lichess evaluation", "Lichess view");
+    assert.deepEqual([await bestSquares(page), await value(page, "#depth-result")], [[], ""], "the Stockfish result is not shown in the Lichess view");
+    const before = lichessServerCalls, savedBefore = (await apiSaved()).length;
     await page.click("#analyze");
-    await until(async () => (await jobTexts(page)).some(t => /Analysis complete\. Best move saved\./.test(t)), "saved");
+    await until(async () => (await jobTexts(page)).some(t => /Lichess evaluation saved \(depth 50\)\./.test(t)), "saved");
     assert.equal(lichessServerCalls, before + 1);
-    assert.equal(await value(page, "#evaluation"), "Lichess Cloud: +0.25");
-    assert.equal(await value(page, "#depth-result"), "Depth 50 | 1234k nodes");
-    assert.equal(await text(page, "#notation"), "Nf3 Nc6 Bb5");
-    const entry = (await apiSaved()).find(e => e.source === "lichess");
-    assert.deepEqual([entry.verified, entry.depth, entry.move_uci], [true, 50, "g1f3"]);
+    assert.deepEqual([await value(page, "#evaluation"), await value(page, "#depth-result"), await text(page, "#notation")],
+      ["Lichess Cloud: +0.25", "Lichess · Depth 50 | 1234k nodes", "c5 Nf3 d6"]);
+    assert.deepEqual(await bestSquares(page), [square("c7"), square("c5")].sort((a, b) => a - b));
+    const both = (await apiSaved()).filter(e => e.fen === afterE4).map(e => [e.source, e.depth, e.verified, e.move_uci]).sort();
+    assert.deepEqual(both, [["lichess", 50, true, "c7c5"], ["stockfish", 46, false, "e7e5"]], "one entry per engine for the same position");
+    assert.equal((await apiSaved()).length, savedBefore + 1);
+    await page.click("#active-jobs li button:has-text('Dismiss')");
+    // Asking again: the server's own fetch is no deeper than what is saved.
+    await page.click("#analyze");
+    await until(async () => (await jobTexts(page)).some(t => /A Lichess evaluation at depth 50 is already saved for this position/.test(t)), "not replaced");
+    await page.click("#active-jobs li button:has-text('Dismiss')");
+    // The same position in the other views.
+    await showView(page, "stockfish");
+    assert.deepEqual([await value(page, "#evaluation"), await value(page, "#depth-result"), await text(page, "#notation")],
+      ["-0.32", "Stockfish 19 · Depth 46 · unverified", "e5 Nf3 Nc6 Bb5"]);
+    assert.deepEqual(await bestSquares(page), [square("e7"), square("e5")].sort((a, b) => a - b));
+    await showView(page, "combined");
+    assert.equal(await value(page, "#depth-result"), "Lichess · Depth 50 | 1234k nodes", "combined shows the deeper of the two");
+    assert.deepEqual(await bestSquares(page), [square("c7"), square("c5")].sort((a, b) => a - b));
+    assert.equal(await page.locator("#analyze").isVisible(), false);
+    await showView(page, "lichess");
+  });
+
+  await step("Lichess view: an evaluation below depth 21 is shown but not saved; with none it says so", async () => {
+    const shallow = { knodes: 77, depth: 18, pvs: [{ moves: "g8f6 b1c3", cp: 40 }] };
+    lichessBrowser = () => ({ status: 200, body: shallow });
+    lichessAnswer = () => ({ status: 200, body: shallow });
+    await toStart(page);
+    await move(page, "b2", "b3");
+    const before = lichessServerCalls, savedBefore = (await apiSaved()).length;
+    await page.click("#analyze");
+    await until(async () => (await jobTexts(page)).some(t => /Lichess has depth 18 for this position\. It is shown but not saved: the least that is saved is depth 21\./.test(t)), "explained");
+    const now = await shown(page);
+    assert.deepEqual([now.depth, now.evaluation, now.line], ["Lichess · Depth 18 | 77k nodes · not saved", "Lichess Cloud: +0.40", "Nf6 Nc3"]);
+    assert.deepEqual(await bestSquares(page), [square("g8"), square("f6")].sort((a, b) => a - b));
+    assert.equal(lichessServerCalls, before, "the server was not asked to store it");
+    // Sent straight to the server it is refused too.
+    const direct = await fetch(SITE + "/api/saved", { method: "POST", headers: { "Content-Type": "application/json", Origin: SITE },
+      body: JSON.stringify({ fen: "rnbqkbnr/pppppppp/8/8/8/1P6/P1PPPPPP/RNBQKBNR b KQkq - 0 1", source: "lichess" }) });
+    assert.deepEqual([direct.status, (await direct.json()).code], [409, "LICHESS_TOO_SHALLOW"]);
+    assert.equal((await apiSaved()).length, savedBefore);
+    await page.click("#active-jobs li button:has-text('Dismiss')");
+    assert.equal(await value(page, "#depth-result"), "", "dismissed: nothing is left on screen");
+    // A position Lichess knows nothing about.
+    lichessBrowser = () => ({ status: 404, body: "" });
+    lichessAnswer = () => ({ status: 404, body: "" });
+    await toStart(page);
+    await move(page, "c2", "c3");
+    await page.click("#analyze");
+    await until(async () => (await jobTexts(page)).some(t => /Lichess has no evaluation for this position\./.test(t)), "nothing at Lichess");
     await page.click("#active-jobs li button:has-text('Dismiss')");
   });
 
-  await step("Lichess rate limit offers the Stockfish choice without a popup", async () => {
+  await step("Lichess view: a rate limit is reported in the list, without a popup, and remembered", async () => {
     lichessBrowser = () => ({ status: 429, body: "" });
     await toStart(page);
     await move(page, "g1", "f3");
     await page.click("#analyze");
-    await until(async () => (await jobTexts(page)).some(t => /Lichess Cloud rate limit.*Choose whether to continue with Stockfish/.test(t)), "choice");
-    await page.click("#active-jobs li button:has-text('Use Stockfish')");
-    await until(async () => (await jobTexts(page)).some(t => /Best move saved \(unverified\)/.test(t)), "saved", 20000);
+    await until(async () => (await jobTexts(page)).some(t => /Lichess Cloud rate limit/.test(t)), "rate limit shown");
     await page.click("#active-jobs li button:has-text('Dismiss')");
     lichessBrowser = () => ({ status: 404, body: "" });
-    // While Lichess's minute-long back-off lasts, the choice is offered at once.
+    // While Lichess's minute-long back-off lasts, it is not asked again.
     await toStart(page);
     await move(page, "b1", "c3");
     await page.click("#analyze");
-    await until(async () => (await jobTexts(page)).some(t => /Try again in about \d+ seconds.*Choose whether/.test(t)), "back-off remembered");
-    await page.click("#active-jobs li button:has-text('Dismiss')");
-    assert.match((await jobTexts(page)).join(" "), /Lichess Cloud rate limit/, "dismiss keeps the message, starts nothing");
+    await until(async () => (await jobTexts(page)).some(t => /Try again in about \d+ seconds/.test(t)), "back-off remembered");
     await page.click("#active-jobs li button:has-text('Dismiss')");
     await page.reload();   // a fresh page has no back-off
     await page.waitForSelector("#board .square");
+    await showView(page, "stockfish");
   });
 
-  await step("admin login unlocks depth and admin tools; a wrong key does not", async () => {
+  await step("admin login unlocks the admin tools; a wrong key does not", async () => {
     await page.fill("#key-input", "not-the-token");
     await page.click("#key-login");
     await until(async () => /not recognised/.test(await text(page, "#status")), "refusal");
-    assert.equal(await page.locator("#depth").isDisabled(), true);
     await page.fill("#key-input", ADMIN);
     await page.press("#key-input", "Enter");
     await until(async () => (await text(page, "#key-role")) === "Admin", "admin role");
-    assert.equal(await page.locator("#depth").isDisabled(), false);
     await page.click("#advanced-settings summary");
     assert.equal(await page.locator("#admin-tools").isVisible(), true);
     assert.equal(await page.locator("#remove").isVisible(), true);
@@ -344,6 +519,7 @@ try {
   let importedCount = 0, castlingChecked = 0;
   if (savedPositionsFile && existsSync(savedPositionsFile)) {
     await step("the real saved_positions.json imports completely", async () => {
+      await showView(page, "combined");
       const records = JSON.parse(readFileSync(savedPositionsFile, "utf8"));
       importedCount = records.length;
       await page.setInputFiles("#import-file", savedPositionsFile);
@@ -353,24 +529,27 @@ try {
       assert.equal(numbers[0] + numbers[1], records.length, note);
       assert.equal(numbers[2], 0, note);
       const saved = await apiSaved();
-      const byKey = new Map(saved.map(e => [positionKey(e.fen), e]));
-      const start = byKey.get(positionKey(START));
+      // One entry per position and engine; the old file names the engine in its "source".
+      const engineOf = record => /lichess/i.test(record.source) ? "lichess" : "stockfish";
+      const byKey = new Map(saved.map(e => [`${e.source}|${positionKey(e.fen)}`, e]));
+      const stored = record => byKey.get(`${engineOf(record)}|${positionKey(record.fen)}`);
       const original = records.find(r => r.fen === START);
+      const start = stored(original);
       assert.ok(start && original, "start position is in the data");
       assert.deepEqual([start.verified, start.evaluation, start.saved_at], [true, original.evaluation, new Date(original.saved_at).toISOString()]);
       // Castling that the old data spelled as "king takes rook" (e1h1) is
       // stored as the standard king move and highlighted as king + rook.
       const rookSpelled = records.filter(r => /^(e1h1|e1a1|e8h8|e8a8)$/.test(r.move_uci) && /^O-O/.test(r.move_san));
       for (const record of rookSpelled) {
-        const stored = byKey.get(positionKey(record.fen));
         const expected = { e1h1: "e1g1", e1a1: "e1c1", e8h8: "e8g8", e8a8: "e8c8" }[record.move_uci];
-        assert.equal(stored && stored.move_uci, expected, `castling in ${record.fen}`);
+        assert.equal(stored(record)?.move_uci, expected, `castling in ${record.fen}`);
       }
       castlingChecked = rookSpelled.length;
       await toStart(page);
-      await until(async () => (await savedSquares(page)).length >= 2, "start position highlight");
+      await until(async () => (await bestSquares(page)).length >= 2, "start position highlight");
       assert.equal(await value(page, "#evaluation"), original.evaluation);
-      assert.equal(await value(page, "#depth-result"), original.depth);
+      // (The start position also has the Stockfish result of an earlier step; Lichess's is the deeper one.)
+      assert.equal(await value(page, "#depth-result"), `Lichess · ${original.depth}`);
       assert.equal(await text(page, "#notation"), original.pv.join(" "), "line is shown exactly as before");
       // importing the same file again changes nothing
       await page.setInputFiles("#import-file", savedPositionsFile);
@@ -379,26 +558,35 @@ try {
         const record = rookSpelled[0];
         await page.fill("#fen", record.fen);
         await page.click("#load");
-        await until(async () => (await savedSquares(page)).length === 2, "castling highlight");
-        assert.deepEqual(await savedSquares(page), [square(record.move_uci.slice(0, 2)), square(record.move_uci.slice(2, 4))].sort((a, b) => a - b),
+        await until(async () => (await bestSquares(page)).length === 2, "castling highlight");
+        assert.deepEqual(await bestSquares(page), [square(record.move_uci.slice(0, 2)), square(record.move_uci.slice(2, 4))].sort((a, b) => a - b),
           "castling is highlighted on the king and the rook");
         assert.equal(await text(page, "#notation"), record.pv.join(" "));
       }
     });
   }
 
-  await step("remove keeps history and restore brings the entry back", async () => {
-    await toStart(page);
-    await move(page, "e2", "e4"); await move(page, "e7", "e5");
-    await until(async () => (await savedSquares(page)).length === 2, "highlight");
-    const before = [await value(page, "#evaluation"), await value(page, "#depth-result")];
+  await step("remove takes away one engine's entry and keeps the other; restore brings it back", async () => {
+    await showView(page, "combined");
+    // This position has a Stockfish result and a deeper Lichess one (from the
+    // steps above, or from the imported file where that has a deeper one).
+    const label = e => `${e.source === "lichess" ? "Lichess" : "Stockfish 19"} · Depth ${e.depth}${e.knodes ? ` | ${e.knodes}k nodes` : ""}${e.verified ? "" : " · unverified"}`;
+    const entries = (await apiSaved()).filter(e => e.fen === afterE4);
+    const ofLichess = entries.find(e => e.source === "lichess"), ofStockfish = entries.find(e => e.source === "stockfish");
+    assert.ok(entries.length === 2 && ofLichess.depth > ofStockfish.depth, JSON.stringify(entries.map(e => [e.source, e.depth])));
+    await page.fill("#fen", afterE4);
+    await page.click("#load");
+    await until(async () => (await value(page, "#depth-result")) === label(ofLichess), "the deeper one, Lichess's, is shown");
+    const before = [await value(page, "#evaluation"), await value(page, "#depth-result"), await bestSquares(page)];
     await page.click("#remove");
-    await until(async () => (await savedSquares(page)).length === 0, "removed");
+    await until(async () => (await value(page, "#depth-result")) === label(ofStockfish), "Lichess's entry is gone, the Stockfish one stays");
+    assert.match(await text(page, "#status"), /^Lichess move removed/);
     await page.click("#history-button");
-    await until(async () => (await page.locator("#history-list li").count()) >= 1 && /removed/.test(await text(page, "#history-list")), "history list");
-    await page.click("#history-list li button:has-text('Restore')");
-    await until(async () => (await savedSquares(page)).length === 2, "restored");
-    assert.deepEqual([await value(page, "#evaluation"), await value(page, "#depth-result")], before);
+    await until(async () => /^Lichess · \S+ · .* removed/.test(await text(page, "#history-list li >> nth=0")), "history names the engine");
+    await page.click("#history-list li button:has-text('Restore') >> nth=0");
+    await until(async () => (await value(page, "#depth-result")) === before[1], "restored");
+    assert.deepEqual([await value(page, "#evaluation"), await value(page, "#depth-result"), await bestSquares(page)], before);
+    assert.deepEqual((await apiSaved()).filter(e => e.fen === afterE4), entries, "both entries are as they were");
   });
 
   await step("contributor keys: create, use as verified, revoke", async () => {
@@ -406,7 +594,8 @@ try {
     await page.click("#new-key-button");
     await until(async () => /mck_[A-Za-z0-9_-]{32}/.test(await text(page, "#admin-note")), "key shown once");
     const key = /mck_[A-Za-z0-9_-]{32}/.exec(await text(page, "#admin-note"))[0];
-    assert.match(await text(page, "#key-list"), /Tester · 0 saved · active/);
+    // The list is fetched after the key is shown, so it can lag a moment behind the note.
+    await until(async () => /Tester · 0 saved · active/.test(await text(page, "#key-list")), "new key listed");
     const session = await (await fetch(SITE + "/api/session", { headers: { "X-Key": key } })).json();
     assert.equal(session.role, "contributor");
     await page.click("#key-list li button:has-text('Revoke')");
@@ -428,11 +617,11 @@ try {
     await until(async () => /Import finished: 0 stored/.test(await text(page, "#admin-note")), "backup re-import", 60000);
     assert.deepEqual(await apiSaved(), before);
     // Remove one unverified and one verified entry, then restore from the backup.
-    const byFen = list => new Map(list.map(e => [e.fen, e]));
+    const byFen = list => new Map(list.map(e => [`${e.source}|${e.fen}`, e]));
     const lost = [before.find(e => !e.verified), before.find(e => e.verified)];
     for (const entry of lost) {
-      const r = await fetch(SITE + "/api/remove", { method: "POST", headers: { "Content-Type": "application/json", "X-Key": ADMIN, Origin: SITE }, body: JSON.stringify({ fen: entry.fen }) });
-      assert.deepEqual(await r.json(), { removed: true });
+      const r = await fetch(SITE + "/api/remove", { method: "POST", headers: { "Content-Type": "application/json", "X-Key": ADMIN, Origin: SITE }, body: JSON.stringify({ fen: entry.fen, source: entry.source }) });
+      assert.equal((await r.json()).removed, true);
     }
     await page.setInputFiles("#import-file", await download.path());
     await until(async () => /Import finished: 2 stored/.test(await text(page, "#admin-note")), "restore from backup", 60000);
@@ -440,28 +629,36 @@ try {
     // (The stand-in engine's lines are not real chess; import keeps the legal
     // part of a line, which for a real engine is all of it.)
     for (const entry of lost) {
-      assert.deepEqual(restored.get(entry.fen), { ...entry, pv: replayUci(entry.fen, entry.pv).uci }, "restored, verified flag included");
+      assert.deepEqual(restored.get(`${entry.source}|${entry.fen}`), { ...entry, pv: replayUci(entry.fen, entry.pv).uci }, "restored, verified flag and engine included");
     }
-    assert.equal(restored.get(lost[0].fen).verified, false);
-    assert.equal(restored.get(lost[1].fen).verified, true);
+    assert.equal(restored.get(`${lost[0].source}|${lost[0].fen}`).verified, false);
+    assert.equal(restored.get(`${lost[1].source}|${lost[1].fen}`).verified, true);
   });
 
   await step("admin can analyse at a custom depth and the result is verified", async () => {
+    await showView(page, "stockfish");
     await page.fill("#fen", START);   // the previous steps may have loaded another position
     await page.click("#load");
     await move(page, "a2", "a3");
-    await page.fill("#depth", "12");
+    await page.fill("#depth", "22");
     await page.click("#analyze");
     await until(async () => (await jobTexts(page)).some(t => /Analysis complete\. Best move saved\./.test(t)), "saved", 20000);
-    assert.equal(await value(page, "#depth-result"), "Depth 12");
+    assert.equal(await value(page, "#depth-result"), "Stockfish 19 · Depth 22");
+    // The least depth holds for the admin too, typed or sent straight to the server.
+    await page.fill("#depth", "12");
+    await page.press("#depth", "Tab");
+    assert.equal(await value(page, "#depth"), "21");
+    await page.fill("#depth", "22");
+    const refused = await fetch(SITE + "/api/saved", { method: "POST", headers: { "Content-Type": "application/json", "X-Key": ADMIN, Origin: SITE },
+      body: JSON.stringify({ fen: START, source: "stockfish", depth: 20, pv: ["e2e4"], evaluation: "+0.10" }) });
+    assert.deepEqual([refused.status, (await refused.json()).code], [400, "DEPTH_TOO_LOW"]);
     await page.click("#active-jobs li button:has-text('Dismiss')");
     await page.click("#key-login");   // logout
     await until(async () => (await text(page, "#key-role")) === "", "logged out");
-    assert.equal(await value(page, "#depth"), "46");
     assert.equal(await page.locator("#admin-tools").isVisible(), false);
   });
 
-  await step("the depth field starts at 46 on every visit, also for the admin", async () => {
+  await step("the depth field starts at 46 on every visit, whoever is visiting", async () => {
     assert.equal(await page.getAttribute("#depth", "autocomplete"), "off", "the browser must not restore an old value");
     await page.fill("#key-input", ADMIN);
     await page.press("#key-input", "Enter");
@@ -471,9 +668,14 @@ try {
     await page.waitForSelector("#board .square");
     await until(async () => (await text(page, "#key-role")) === "Admin", "still admin after reload");
     assert.equal(await value(page, "#depth"), "46");
-    assert.equal(await page.locator("#depth").isDisabled(), false);
     await page.click("#key-login");   // logout
     await until(async () => (await text(page, "#key-role")) === "", "logged out");
+    await page.click("#advanced-settings summary");
+    await page.fill("#depth", "30");
+    await page.reload();
+    await page.waitForSelector("#board .square");
+    await until(async () => /Stockfish 19 ready/.test(await text(page, "#bridge-status")), "reconnected");
+    assert.equal(await value(page, "#depth"), "46");
   });
 
   const center = async (page, name) => {
@@ -489,6 +691,26 @@ try {
   const annotations = page => page.locator("#annotation-layer > *").count();
   const jobItem = (page, index) => page.locator("#active-jobs li").nth(index);
 
+  await step("a piece drag cancelled with the right button leaves the next right-drag working at the first try", async () => {
+    await toStart(page);
+    const position = await value(page, "#fen");
+    // Whichever button is let go first after the cancel.
+    for (const rightFirst of [true, false]) {
+      await page.mouse.move(...await center(page, "e2"));
+      await page.mouse.down();
+      await page.mouse.move(...await center(page, "e4"), { steps: 4 });
+      await page.mouse.down({ button: "right" });   // cancels the drag
+      if (rightFirst) { await page.mouse.up({ button: "right" }); await page.mouse.up(); }
+      else { await page.mouse.up(); await page.mouse.up({ button: "right" }); }
+      assert.equal(await value(page, "#fen"), position, "the piece went back");
+      assert.equal(await annotations(page), 0, "cancelling draws nothing");
+      await drawArrow(page, "g1", "f3");
+      assert.equal(await annotations(page), 2, `the first right-drag after the cancel draws its arrow (right button released ${rightFirst ? "first" : "last"})`);
+      await drawArrow(page, "g1", "f3");   // the same arrow again takes it away
+      assert.equal(await annotations(page), 0);
+    }
+  });
+
   await step("a fifth analysis waits in the queue and starts by itself; annotations stay with their position", async () => {
     lichessBrowser = () => ({ status: 404, body: "" });
     lichessAnswer = () => ({ status: 404, body: "" });
@@ -499,7 +721,8 @@ try {
       await toStart(page);
       await move(page, a, b); await move(page, c, d);
       await page.click("#analyze");
-      await until(async () => /Analyzing Stockfish\.\.\. depth \d+\/46/.test(await jobItem(page, index).innerText()), `job ${index + 1} running`);
+      // Depth 2 or more on the page: at least depth 1 has been searched to the end.
+      await until(async () => /Analyzing Stockfish\.\.\. depth ([2-9]|\d\d)\/46/.test(await jobItem(page, index).innerText()), `job ${index + 1} running`);
       await jobItem(page, index).locator("button:has-text('Pause')").click();
       await until(async () => /Paused at depth/.test(await jobItem(page, index).innerText()), `job ${index + 1} paused`);
     }
@@ -547,6 +770,8 @@ try {
     await until(async () => /Best move saved \(unverified\)/.test(await jobItem(page, 4).innerText()), "fifth job saved", 20000);
     for (const index of [1, 2, 3]) await jobItem(page, index).locator("button:has-text('Resume')").click();
     await until(async () => (await jobTexts(page)).filter(t => /Best move saved/.test(t)).length === 4, "the paused ones finish too", 30000);
+    // Four ran to the end. The first was stopped a few depths in: below depth 21 nothing is saved.
+    assert.match(await jobItem(page, 0).innerText(), /Analysis stopped at depth \d+\. Nothing was saved: depth \d+ had been finished, and the least that is saved is depth 21\./);
     assert.equal((await apiSaved()).length, before + 4);
     while (await page.locator("#active-jobs li button:has-text('Dismiss')").count()) await page.click("#active-jobs li button:has-text('Dismiss')");
     assert.match(bridge.output, /is waiting for a free slot/);

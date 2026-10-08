@@ -30,7 +30,8 @@
 
   // Optional settings (uncomment to change the defaults):
   // "vars": {
-  //   "MIN_DEPTH": "46",             // lowest depth accepted from non-admins
+  //   "MIN_DEPTH": "21",             // nothing shallower is saved or can be chosen
+  //   "FULL_DEPTH": "46",            // depth shown in full colour; shallower saved moves are paler
   //   "ANON_WRITES_PER_HOUR": "60"   // saves per hour for a visitor without a key
   // },
 

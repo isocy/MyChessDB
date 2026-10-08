@@ -56,27 +56,37 @@ async function call(env, method, path, { body, key, ip = "203.0.113.5", origin =
 const sf = (fen, depth, pv = ["e2e4", "e7e5", "g1f3"], evaluation = "+0.32") =>
   ({ fen, source: "stockfish", depth, pv, evaluation });
 const history = env => env.DB.db.prepare("SELECT position_key, depth, verified, reason FROM saved_history ORDER BY id").all();
-const list = async env => (await call(env, "GET", "/api/saved")).data.entries;
+// Everything saved from the site, straight from the table, in the shape the API gives entries.
+const list = env => env.DB.db.prepare("SELECT * FROM saved_positions ORDER BY saved_at, position_key, source").all().map(row => ({
+  fen: row.fen, move_uci: row.move_uci, pv: row.pv.split(" "), evaluation: row.evaluation, depth: row.depth,
+  knodes: row.knodes, source: row.source, verified: row.verified === 1, saved_at: row.saved_at,
+}));
+// What the page is given for one position: { stockfish?, lichess? }.
+const at = async (env, fen) => (await call(env, "GET", "/api/position?fen=" + encodeURIComponent(fen))).data.entries;
 
 // --- session ------------------------------------------------------------
 {
   const env = makeEnv();
-  eq((await call(env, "GET", "/api/session")).data, { role: null, label: null, min_depth: 46, admin_configured: true });
+  eq((await call(env, "GET", "/api/session")).data, { role: null, label: null, min_depth: 21, full_depth: 46, admin_configured: true });
   eq((await call(env, "GET", "/api/session", { key: ADMIN })).data.role, "admin");
   eq((await call(env, "GET", "/api/session", { key: "wrong" })).data.role, null);
   eq((await call(makeEnv({ ADMIN_TOKEN: "short" }), "GET", "/api/session", { key: "short" })).data,
-    { role: null, label: null, min_depth: 46, admin_configured: false }, "a short admin token is refused");
-  eq((await call(makeEnv({ MIN_DEPTH: "30" }), "GET", "/api/session")).data.min_depth, 30);
+    { role: null, label: null, min_depth: 21, full_depth: 46, admin_configured: false }, "a short admin token is refused");
+  const custom = (await call(makeEnv({ MIN_DEPTH: "12", FULL_DEPTH: "30" }), "GET", "/api/session")).data;
+  eq([custom.min_depth, custom.full_depth], [12, 30]);
   eq((await call(env, "GET", "/index.html")).data, "<html>static</html>", "non-API paths go to static assets");
   eq((await call(env, "GET", "/api/nope")).status, 404);
-  eq((await call(env, "GET", "/api/saved")).data, { entries: [] });
+  eq((await call(env, "GET", "/api/position?fen=" + encodeURIComponent(START))).data, { entries: {} }, "nothing saved yet");
+  eq((await call(env, "GET", "/api/position?fen=nonsense")).status, 400);
+  eq((await call(env, "GET", "/api/position")).status, 400);
+  eq((await call(env, "GET", "/api/saved")).status, 404, "there is no list of everything any more");
 }
 
 // --- input validation ---------------------------------------------------
 {
   const env = makeEnv();
-  eq((await call(env, "POST", "/api/saved", { body: sf(START, 45) })).status, 400, "below minimum depth");
-  eq((await call(env, "POST", "/api/saved", { body: sf(START, 45) })).data.code, "DEPTH_TOO_LOW");
+  eq((await call(env, "POST", "/api/saved", { body: sf(START, 0) })).status, 400, "depth 0 is not an analysis");
+  eq((await call(env, "POST", "/api/saved", { body: sf(START, -3) })).status, 400);
   eq((await call(env, "POST", "/api/saved", { body: sf(START, 46.5) })).status, 400);
   eq((await call(env, "POST", "/api/saved", { body: sf(START, "46") })).status, 400);
   eq((await call(env, "POST", "/api/saved", { body: sf(START, 999) })).status, 400);
@@ -97,6 +107,34 @@ const list = async env => (await call(env, "GET", "/api/saved")).data.entries;
   eq((await call(env, "POST", "/api/saved/extra", { body: {} })).status, 404);
   const put = await worker.fetch(new Request(SITE + "/api/saved", { method: "PUT" }), env);
   eq(put.status, 405);
+}
+
+// --- depth: nothing below 21 is saved; from there on, as far as it got ----
+{
+  const env = makeEnv();
+  const contributor = (await call(env, "POST", "/api/keys", { body: { label: "Sora" }, key: ADMIN })).data.key;
+  // Depth 20 is refused for everyone, the admin included.
+  for (const key of [undefined, contributor, ADMIN]) {
+    const r = await call(env, "POST", "/api/saved", { body: sf(START, 20), key });
+    eq([r.status, r.data.code], [400, "DEPTH_TOO_LOW"], `depth 20, ${key === ADMIN ? "admin" : key ? "contributor" : "no key"}`);
+    ok(/least is depth 21/.test(r.data.error), r.data.error);
+  }
+  eq(await list(env), [], "nothing was stored");
+  // Depth 21 is the first that is kept, also from a visitor without a key.
+  let r = await call(env, "POST", "/api/saved", { body: sf(START, 21, ["e2e4"]) });
+  eq([r.status, r.data.saved, r.data.entry.depth, r.data.entry.verified], [200, true, 21, false]);
+  r = await call(env, "POST", "/api/saved", { body: sf(START, 39, ["d2d4", "d7d5"]) });
+  eq([r.data.saved, r.data.entry.depth, r.data.entry.move_uci], [true, 39, "d2d4"], "a deeper one replaces it");
+  r = await call(env, "POST", "/api/saved", { body: sf(START, 25, ["c2c4"]) });
+  eq([r.data.saved, r.data.entry.depth], [false, 39], "a shallower one does not");
+  ok(/depth 39 is already saved/.test(r.data.reason), r.data.reason);
+  r = await call(env, "POST", "/api/saved", { body: sf(START, 46, ["g1f3"]) });
+  eq([r.data.saved, r.data.entry.depth], [true, 46]);
+  eq(history(env).map(h => [h.depth, h.reason]), [[21, "replaced"], [39, "replaced"]], "the shallow ones are in the history");
+  // The limit follows the setting.
+  const lower = makeEnv({ MIN_DEPTH: "12" });
+  eq((await call(lower, "POST", "/api/saved", { body: sf(START, 11) })).status, 400);
+  eq((await call(lower, "POST", "/api/saved", { body: sf(START, 12) })).data.saved, true);
 }
 
 // --- the write rules ----------------------------------------------------
@@ -130,13 +168,14 @@ const list = async env => (await call(env, "GET", "/api/saved")).data.entries;
   ok(/^mck_[A-Za-z0-9_-]{32}$/.test(created.key), "key format");
   const stored = env.DB.db.prepare("SELECT key_hash FROM contributor_keys").all();
   ok(stored.length === 1 && !JSON.stringify(stored).includes(created.key), "only the hash is stored");
-  eq((await call(env, "GET", "/api/session", { key: created.key })).data, { role: "contributor", label: "Minsu", min_depth: 46, admin_configured: true });
+  eq((await call(env, "GET", "/api/session", { key: created.key })).data, { role: "contributor", label: "Minsu", min_depth: 21, full_depth: 46, admin_configured: true });
 
   // verified depth 46 replaces unverified depth 47
   r = await call(env, "POST", "/api/saved", { body: sf(START, 46, ["g1f3"]), key: created.key });
   eq([r.data.saved, r.data.entry.verified, r.data.entry.move_uci], [true, true, "g1f3"]);
-  // a contributor is still held to the minimum depth
-  eq((await call(env, "POST", "/api/saved", { body: sf(START, 30), key: created.key })).status, 400);
+  // a shallower verified analysis is accepted as a request but does not replace a deeper one
+  r = await call(env, "POST", "/api/saved", { body: sf(START, 30, ["b1c3"]), key: created.key });
+  eq([r.status, r.data.saved, r.data.entry.move_uci, r.data.entry.depth], [200, false, "g1f3", 46]);
   // anonymous "depth 99" can no longer replace it
   r = await call(env, "POST", "/api/saved", { body: sf(START, 99, ["a2a3"]) });
   eq([r.data.saved, r.data.entry.move_uci], [false, "g1f3"]);
@@ -146,18 +185,20 @@ const list = async env => (await call(env, "GET", "/api/saved")).data.entries;
   eq(r.data.saved, false);
   r = await call(env, "POST", "/api/saved", { body: sf(START, 48, ["c2c4"]), key: ADMIN });
   eq([r.data.saved, r.data.entry.move_uci], [true, "c2c4"]);
-  // the admin may save below the minimum depth
-  r = await call(env, "POST", "/api/saved", { body: sf(ITALIAN, 20, ["e1g1"], "#-3"), key: ADMIN });
+  r = await call(env, "POST", "/api/saved", { body: sf(ITALIAN, 21, ["e1g1"], "#-3"), key: ADMIN });
   eq([r.data.saved, r.data.entry.verified, r.data.entry.evaluation], [true, true, "#-3"]);
   eq(history(env).filter(h => h.position_key.startsWith("rnbqkbnr/pppppppp/8/8/8/8")).map(h => [h.depth, h.verified]),
     [[46, 0], [47, 0], [46, 1]], "every replaced entry is in history");
 
   // --- remove / history / restore ---
-  eq((await call(env, "POST", "/api/remove", { body: { fen: START } })).status, 403);
-  eq((await call(env, "POST", "/api/remove", { body: { fen: START }, key: created.key })).status, 403, "contributors cannot remove");
+  const gone = { fen: START, source: "stockfish" };
+  eq((await call(env, "POST", "/api/remove", { body: gone })).status, 403);
+  eq((await call(env, "POST", "/api/remove", { body: gone, key: created.key })).status, 403, "contributors cannot remove");
   eq((await call(env, "GET", "/api/history?fen=" + encodeURIComponent(START))).status, 403);
-  eq((await call(env, "POST", "/api/remove", { body: { fen: START }, key: ADMIN })).data, { removed: true });
-  eq((await call(env, "POST", "/api/remove", { body: { fen: START }, key: ADMIN })).data, { removed: false });
+  eq((await call(env, "POST", "/api/remove", { body: { fen: START }, key: ADMIN })).status, 400, "the engine must be named");
+  eq((await call(env, "POST", "/api/remove", { body: { fen: START, source: "lichess" }, key: ADMIN })).data.removed, false, "no Lichess entry here");
+  eq((await call(env, "POST", "/api/remove", { body: gone, key: ADMIN })).data, { removed: true, entries: {} });
+  eq((await call(env, "POST", "/api/remove", { body: gone, key: ADMIN })).data, { removed: false, entries: {} });
   ok(!(await list(env)).some(e => e.fen === START), "removed from the list");
   let h = (await call(env, "GET", "/api/history?fen=" + encodeURIComponent(START), { key: ADMIN })).data.history;
   eq(h.map(x => [x.depth, x.reason, x.move_uci]), [[48, "removed", "c2c4"], [46, "replaced", "g1f3"], [47, "replaced", "d2d4"], [46, "replaced", "e2e4"]]);
@@ -200,11 +241,20 @@ const list = async env => (await call(env, "GET", "/api/saved")).data.entries;
     depth: 50, knodes: 123456, source: "lichess", verified: true, saved_at: r.data.entry.saved_at }, "castling normalised, server data used");
   ok(lichessCalls[0].endsWith("&multiPv=1") && lichessCalls[0].includes(encodeURIComponent(ITALIAN)), "asked Lichess for this position");
 
+  // Any depth from 21 on is stored, with or without a key.
   lichess = lichessJson({ depth: 40, knodes: 10, pvs: [{ moves: "e2e4", cp: -31 }] });
   r = await call(env, "POST", "/api/saved", { body: { fen: START, source: "lichess" } });
-  eq([r.status, r.data.code, r.data.depth], [409, "LICHESS_TOO_SHALLOW", 40]);
-  r = await call(env, "POST", "/api/saved", { body: { fen: START, source: "lichess" }, key: ADMIN });
-  eq([r.data.saved, r.data.entry.evaluation, r.data.entry.depth], [true, "Lichess Cloud: -0.31", 40], "admin may store shallower");
+  eq([r.data.saved, r.data.entry.evaluation, r.data.entry.depth, r.data.entry.verified], [true, "Lichess Cloud: -0.31", 40, true]);
+  // Below depth 21 a Lichess evaluation is not stored, with a key either.
+  lichess = lichessJson({ depth: 20, knodes: 10, pvs: [{ moves: "e7e5", cp: 15 }] });
+  for (const key of [undefined, ADMIN]) {
+    r = await call(env, "POST", "/api/saved", { body: { fen: AFTER_E4, source: "lichess" }, key });
+    eq([r.status, r.data.code, r.data.depth], [409, "LICHESS_TOO_SHALLOW", 20]);
+    ok(/nothing below depth 21 is saved/.test(r.data.error), r.data.error);
+  }
+  lichess = lichessJson({ depth: 21, knodes: 10, pvs: [{ moves: "e7e5", cp: 15 }] });
+  r = await call(env, "POST", "/api/saved", { body: { fen: AFTER_E4, source: "lichess" } });
+  eq([r.data.saved, r.data.entry.depth], [true, 21]);
 
   lichess = lichessJson({ depth: 60, knodes: 10, pvs: [{ moves: "e7e5", mate: -4 }] });
   r = await call(env, "POST", "/api/saved", { body: { fen: AFTER_E4, source: "lichess" } });
@@ -225,18 +275,85 @@ const list = async env => (await call(env, "GET", "/api/saved")).data.entries;
   lichess = () => { throw new Error("network down"); };
   eq((await call(env, "POST", "/api/saved", { body: { fen: START, source: "lichess" } })).status, 502);
 
-  // Lichess (verified) replaces an anonymous Stockfish entry of any depth
-  const env2 = makeEnv();
-  await call(env2, "POST", "/api/saved", { body: sf(START, 90) });
-  lichess = lichessJson({ depth: 55, knodes: 5, pvs: [{ moves: "e2e4 e7e5", cp: 18 }] });
-  r = await call(env2, "POST", "/api/saved", { body: { fen: START, source: "lichess" } });
-  eq([r.data.saved, r.data.entry.source, r.data.entry.depth], [true, "lichess", 55]);
-  // and a deeper verified Stockfish entry then replaces Lichess
-  r = await call(env2, "POST", "/api/saved", { body: sf(START, 56), key: ADMIN });
-  eq([r.data.saved, r.data.entry.source, r.data.entry.knodes], [true, "stockfish", null]);
-  // but a shallower Lichess entry does not replace that
-  r = await call(env2, "POST", "/api/saved", { body: { fen: START, source: "lichess" } });
-  eq(r.data.saved, false);
+}
+
+// --- results are kept per engine -------------------------------------------
+{
+  const env = makeEnv();
+  // A Stockfish 19 entry and a Lichess entry for the same position, side by side.
+  await call(env, "POST", "/api/saved", { body: sf(START, 90) });
+  lichess = lichessJson({ depth: 55, knodes: 5, pvs: [{ moves: "d2d4 d7d5", cp: 18 }] });
+  let r = await call(env, "POST", "/api/saved", { body: { fen: START, source: "lichess" } });
+  eq([r.data.saved, r.data.entry.source, r.data.entry.depth], [true, "lichess", 55], "an unverified Stockfish entry does not stand in Lichess's way");
+  eq(Object.keys(r.data.entries).sort(), ["lichess", "stockfish"], "the answer carries everything the position has");
+  let both = await at(env, START);
+  eq([both.stockfish.depth, both.stockfish.verified, both.stockfish.move_uci], [90, false, "e2e4"]);
+  eq([both.lichess.depth, both.lichess.verified, both.lichess.move_uci, both.lichess.knodes], [55, true, "d2d4", 5]);
+  eq(history(env), [], "neither replaced the other");
+  // The verified Lichess entry does not stop a Stockfish analysis without a key ...
+  r = await call(env, "POST", "/api/saved", { body: sf(START, 91, ["g1f3"]) });
+  eq([r.data.saved, r.data.entry.depth, r.data.entry.source], [true, 91, "stockfish"]);
+  // ... and within one engine the rules are as before.
+  r = await call(env, "POST", "/api/saved", { body: sf(START, 56), key: ADMIN });
+  eq([r.data.saved, r.data.entry.verified, r.data.entry.depth], [true, true, 56], "verified replaces unverified");
+  lichess = lichessJson({ depth: 50, knodes: 5, pvs: [{ moves: "c2c4", cp: 18 }] });
+  r = await call(env, "POST", "/api/saved", { body: { fen: START, source: "lichess" } });
+  eq([r.data.saved, r.data.entry.depth, r.data.entry.move_uci], [false, 55, "d2d4"]);
+  ok(/A Lichess evaluation at depth 55 is already saved/.test(r.data.reason), r.data.reason);
+  lichess = lichessJson({ depth: 60, knodes: 7, pvs: [{ moves: "c2c4", cp: 20 }] });
+  r = await call(env, "POST", "/api/saved", { body: { fen: START, source: "lichess" } });
+  eq([r.data.saved, r.data.entry.depth, r.data.entry.move_uci], [true, 60, "c2c4"]);
+  both = await at(env, START);
+  eq([both.stockfish.depth, both.lichess.depth], [56, 60]);
+  eq(env.DB.db.prepare("SELECT source, depth, reason FROM saved_history ORDER BY id").all().map(h => [h.source, h.depth, h.reason]),
+    [["stockfish", 90, "replaced"], ["stockfish", 91, "replaced"], ["lichess", 55, "replaced"]], "history says which engine each archived entry is from");
+  // Removing one engine's entry leaves the other; restoring puts it back in its own place.
+  r = await call(env, "POST", "/api/remove", { body: { fen: START, source: "lichess" }, key: ADMIN });
+  eq([r.data.removed, Object.keys(r.data.entries)], [true, ["stockfish"]]);
+  const archived = (await call(env, "GET", "/api/history?fen=" + encodeURIComponent(START), { key: ADMIN })).data.history;
+  eq([archived[0].source, archived[0].depth, archived[0].reason], ["lichess", 60, "removed"]);
+  r = await call(env, "POST", "/api/restore", { body: { id: archived[0].id }, key: ADMIN });
+  eq([r.data.restored, r.data.entries.lichess.depth, r.data.entries.stockfish.depth], [true, 60, 56]);
+  r = await call(env, "POST", "/api/restore", { body: { id: archived.find(h => h.source === "stockfish" && h.depth === 91).id }, key: ADMIN });
+  eq([r.data.entries.stockfish.depth, r.data.entries.lichess.depth], [91, 60], "restoring a Stockfish entry replaces only the Stockfish one");
+  eq((await list(env)).length, 2);
+}
+
+// --- evaluations imported from the Lichess database -------------------------
+{
+  const env = makeEnv();
+  const add = (fen, depth, knodes, cp, mate, pv) => env.DB.db.prepare("INSERT INTO lichess_db VALUES (?, ?, ?, ?, ?, ?)")
+    .run(fen.split(" ").slice(0, 4).join(" "), depth, knodes, cp, mate, pv);
+  add(START, 60, 999, 23, null, "e2e4 e7e5 g1f3");
+  add(AFTER_E4, 48, 77, null, -3, "e7e5");
+  // The page gets it as the position's Lichess entry.
+  eq(await at(env, START), { lichess: {
+    fen: START, move_uci: "e2e4", pv: ["e2e4", "e7e5", "g1f3"], evaluation: "Lichess Cloud: +0.23", depth: 60, knodes: 999,
+    source: "lichess", verified: true, saved_at: null, imported: true } });
+  eq((await at(env, AFTER_E4_EP_ALWAYS)).lichess.evaluation, "Lichess Cloud: mate -3", "found whichever way the FEN is written");
+  eq(await at(env, ITALIAN), {});
+  // A Stockfish entry saved from the site stands beside it.
+  await call(env, "POST", "/api/saved", { body: sf(START, 30) });
+  eq(Object.keys(await at(env, START)).sort(), ["lichess", "stockfish"]);
+  // A Lichess evaluation that is not deeper than the imported one is not stored.
+  lichess = lichessJson({ depth: 60, knodes: 5, pvs: [{ moves: "d2d4", cp: 18 }] });
+  let r = await call(env, "POST", "/api/saved", { body: { fen: START, source: "lichess" } });
+  eq([r.data.saved, r.data.entry.depth, r.data.entry.imported, r.data.entry.move_uci], [false, 60, true, "e2e4"]);
+  ok(/Lichess database already gives depth 60/.test(r.data.reason), r.data.reason);
+  eq((await list(env)).filter(e => e.source === "lichess"), []);
+  // A deeper one is stored and shown in its place.
+  lichess = lichessJson({ depth: 61, knodes: 5, pvs: [{ moves: "d2d4", cp: 18 }] });
+  r = await call(env, "POST", "/api/saved", { body: { fen: START, source: "lichess" } });
+  eq([r.data.saved, r.data.entry.depth, r.data.entry.imported, r.data.entry.move_uci], [true, 61, undefined, "d2d4"]);
+  eq((await at(env, START)).lichess.depth, 61);
+  // Removing the saved one brings the imported one back; that one cannot be removed.
+  r = await call(env, "POST", "/api/remove", { body: { fen: START, source: "lichess" }, key: ADMIN });
+  eq([r.data.removed, r.data.entries.lichess.depth, r.data.entries.lichess.imported], [true, 60, true]);
+  r = await call(env, "POST", "/api/remove", { body: { fen: START, source: "lichess" }, key: ADMIN });
+  eq([r.data.removed, r.data.entries.lichess.depth], [false, 60]);
+  // Imported evaluations are not part of the backup.
+  const backup = (await call(env, "GET", "/api/export", { key: ADMIN })).data;
+  eq(backup.saved.map(e => [e.source, e.depth]), [["stockfish", 30]]);
 }
 
 // --- anonymous write limit ----------------------------------------------
@@ -245,7 +362,7 @@ const list = async env => (await call(env, "GET", "/api/saved")).data.entries;
   const statuses = [];
   for (let i = 0; i < 5; i++) statuses.push((await call(env, "POST", "/api/saved", { body: sf(START, 46 + i) })).status);
   eq(statuses, [200, 200, 200, 429, 429], "fourth anonymous save in an hour is refused");
-  eq((await call(env, "POST", "/api/saved", { body: sf(START, 45) })).status, 429, "rejected attempts count too");
+  eq((await call(env, "POST", "/api/saved", { body: sf(START, 0) })).status, 429, "rejected attempts count too");
   eq((await call(env, "POST", "/api/saved", { body: sf(START, 60), ip: "198.51.100.9" })).status, 200, "another visitor is unaffected");
   eq((await call(env, "POST", "/api/saved", { body: sf(START, 61), key: ADMIN })).status, 200, "keys are not limited");
   ok(!JSON.stringify(env.DB.db.prepare("SELECT * FROM rate_limits").all()).includes("203.0.113.5"), "raw IPs are not stored");
@@ -279,12 +396,22 @@ const list = async env => (await call(env, "GET", "/api/saved")).data.entries;
   // A backup's unverified entries stay unverified, and cannot displace a verified one.
   r = await call(env, "POST", "/api/import", { body: { entries: [
     { fen: ITALIAN, pv: ["e1g1"], evaluation: "+0.30", depth: 46, source: "stockfish", verified: false },
-    { fen: START, pv: ["d2d4"], evaluation: "+0.20", depth: 99, source: "stockfish", verified: false },
+    { fen: AFTER_E4, pv: ["c7c5"], evaluation: "+0.20", depth: 99, source: "stockfish", verified: false },
   ] }, key: ADMIN });
   eq([r.data.stored, r.data.kept_existing], [1, 1]);
-  const after = await list(env);
+  let after = await list(env);
   eq(after.find(e => e.fen === ITALIAN).verified, false, "imported as unverified");
-  eq(after.find(e => e.fen === START).verified, true, "the verified entry was kept");
+  eq(after.find(e => e.fen === AFTER_E4).move_uci, "e7e5", "the verified entry was kept");
+  // Entries are imported per engine: a Stockfish entry for a position that has a Lichess one is added beside it.
+  r = await call(env, "POST", "/api/import", { body: { entries: [
+    { fen: START, pv: ["d2d4"], evaluation: "+0.20", depth: 50, source: "stockfish" }] }, key: ADMIN });
+  eq(r.data.stored, 1);
+  after = await list(env);
+  eq(after.filter(e => e.fen === START).map(e => [e.source, e.depth]).sort(), [["lichess", 60], ["stockfish", 50]]);
+  // A backup is restored as it is, entries below depth 21 included.
+  const shallow = "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3";
+  r = await call(env, "POST", "/api/import", { body: { entries: [{ fen: shallow, pv: ["f1b5"], evaluation: "+0.20", depth: 15, source: "stockfish" }] }, key: ADMIN });
+  eq([r.data.stored, (await list(env)).find(e => e.fen === shallow).depth], [1, 15]);
   eq((await call(env, "POST", "/api/import", { body: { entries: Array(101).fill(entries[0]) }, key: ADMIN })).status, 400);
   eq((await call(env, "POST", "/api/import", { body: { entries: [] }, key: ADMIN })).status, 400);
 }

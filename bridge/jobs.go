@@ -2,7 +2,8 @@ package main
 
 // Analysis jobs: each one is its own Stockfish process searching one position
 // to a fixed depth. Jobs can be paused (process frozen, memory kept), resumed
-// and stopped individually.
+// and stopped individually. While a job runs, the site can read the deepest
+// depth searched to the end so far; a stopped job keeps it.
 
 import (
 	"crypto/rand"
@@ -98,8 +99,11 @@ type analysisResult struct {
 
 // jobView is what the site sees.
 type jobView struct {
-	JobID       string `json:"job_id"`
-	Status      string `json:"status"` // queued | running | paused | complete | stopped | error
+	JobID  string `json:"job_id"`
+	Status string `json:"status"` // queued | running | paused | complete | stopped | error
+	// Depth is the depth being searched right now (the final depth once the
+	// job is complete). The deepest depth already searched to the end is
+	// Best.Depth, normally one less.
 	Depth       int    `json:"depth"`
 	TargetDepth int    `json:"target_depth"`
 	Progress    int    `json:"progress"`
@@ -107,10 +111,15 @@ type jobView struct {
 	Threads     int    `json:"threads"`
 	Hash        int    `json:"hash"`
 	// QueuePosition: 1 for the job that starts next; only set while queued.
-	QueuePosition int             `json:"queue_position,omitempty"`
-	Error         string          `json:"error,omitempty"`
-	Result        *analysisResult `json:"result,omitempty"`
-	Context       json.RawMessage `json:"context,omitempty"`
+	QueuePosition int    `json:"queue_position,omitempty"`
+	Error         string `json:"error,omitempty"`
+	// Best is the deepest depth searched to the end so far: its best move,
+	// line and evaluation. It follows the search while the job runs, and it
+	// is what remains of a job that was stopped before reaching its target.
+	Best *analysisResult `json:"best,omitempty"`
+	// Result is set once the target depth has been reached.
+	Result  *analysisResult `json:"result,omitempty"`
+	Context json.RawMessage `json:"context,omitempty"`
 }
 
 type job struct {
@@ -202,6 +211,10 @@ func (m *jobManager) snapshot(j *job) jobView {
 				view.QueuePosition++
 			}
 		}
+	}
+	if view.Best != nil {
+		best := *view.Best
+		view.Best = &best
 	}
 	if view.Result != nil {
 		result := *view.Result
@@ -354,6 +367,8 @@ func (m *jobManager) finish(j *job, status, message string, result *analysisResu
 	j.view.Result = result
 	if status == "complete" {
 		j.view.Progress = 100
+		j.view.Depth = result.Depth
+		j.view.Best = result
 	}
 	j.finished = time.Now()
 	j.proc = nil
@@ -363,7 +378,12 @@ func (m *jobManager) finish(j *job, status, message string, result *analysisResu
 	case "error":
 		logf("Analysis %s failed: %s", shortID(j), message)
 	default:
-		logf("Analysis %s stopped.", shortID(j))
+		// j.view.Best stays: the site saves the last finished depth.
+		if j.view.Best != nil {
+			logf("Analysis %s stopped while searching depth %d; depth %d was finished.", shortID(j), j.view.Depth, j.view.Best.Depth)
+		} else {
+			logf("Analysis %s stopped.", shortID(j))
+		}
 	}
 	// A slot is free now: let the next waiting analysis begin.
 	m.promoteLocked()
@@ -441,6 +461,13 @@ func (m *jobManager) run(j *job) {
 	_ = proc.send("position fen " + fen)
 	_ = proc.send(fmt.Sprintf("go depth %d", depth))
 
+	// toResult turns an engine line into what the site is shown.
+	toResult := func(info uciInfo) *analysisResult {
+		return &analysisResult{
+			MoveUCI: info.PV[0], PV: info.PV, Evaluation: formatEvaluation(info, blackToMove),
+			Depth: info.Depth, Nodes: info.Nodes, TimeMs: info.TimeMs,
+		}
+	}
 	var best uciInfo
 	haveBest := false
 	for {
@@ -463,11 +490,7 @@ func (m *jobManager) run(j *job) {
 					proc.quit()
 					return
 				}
-				result := &analysisResult{
-					MoveUCI: best.PV[0], PV: best.PV, Evaluation: formatEvaluation(best, blackToMove),
-					Depth: best.Depth, Nodes: best.Nodes, TimeMs: best.TimeMs,
-				}
-				m.finish(j, "complete", "", result)
+				m.finish(j, "complete", "", toResult(best))
 				proc.quit()
 				return
 			}
@@ -475,19 +498,34 @@ func (m *jobManager) run(j *job) {
 			if !isInfo {
 				continue
 			}
-			if info.HasDepth {
-				progress := info.Depth * 100 / depth
-				if progress > 99 {
-					progress = 99
-				}
-				m.update(j, func(view *jobView) {
-					view.Depth = info.Depth
-					view.Progress = progress
-				})
+			if !info.HasDepth {
+				continue
 			}
-			if info.HasScore && !info.Bound && info.MultiPV == 1 && len(info.PV) > 0 && info.HasDepth {
+			// A line with an exact score (no lowerbound / upperbound) and a
+			// move list is what the engine prints when it has searched a
+			// depth to the end. From then on it is working on the next one.
+			finished := info.HasScore && !info.Bound && info.MultiPV == 1 && len(info.PV) > 0
+			searching := info.Depth
+			var latest *analysisResult
+			if finished {
 				best, haveBest = info, true
+				latest = toResult(info)
+				if searching < depth {
+					searching++
+				}
 			}
+			m.update(j, func(view *jobView) {
+				if searching > view.Depth {
+					view.Depth = searching
+				}
+				view.Progress = view.Depth * 100 / depth
+				if view.Progress > 99 {
+					view.Progress = 99
+				}
+				if latest != nil {
+					view.Best = latest
+				}
+			})
 		}
 	}
 }
