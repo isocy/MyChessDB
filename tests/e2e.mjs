@@ -206,10 +206,10 @@ try {
     assert.ok(barBox.x + barBox.width <= board.x && barBox.y === board.y && barBox.height === board.height, "the bar stands left of the board");
     const csp = (await (await fetch(SITE + "/")).headers.get("content-security-policy")) || "";
     assert.ok(csp.includes("script-src 'self';") && csp.includes("frame-ancestors 'none'"), csp);
-    // A first visit shows the combined results, where nothing is analysed.
+    // A first visit shows the combined results.
     assert.equal(await page.getAttribute("#view-switch button[data-view='combined']", "aria-pressed"), "true");
-    assert.equal(await page.locator("#analyze").isVisible(), false, "no analyse button in the combined view");
-    assert.match(await text(page, "#view-note"), /the deeper of the Stockfish 19 and Lichess results/);
+    assert.equal(await text(page, "#analyze"), "Find and save best move", "Combined has the analyse button too");
+    assert.match(await text(page, "#view-note"), /the deeper of the Stockfish 19 and Lichess results\. Its button fetches Lichess's evaluation and runs Stockfish 19 at the same time/);
     await showView(page, "stockfish");
     assert.equal(await page.locator("#analyze").isVisible(), true);
     assert.equal(await text(page, "#analyze"), "Find and save best move");
@@ -459,7 +459,6 @@ try {
     await showView(page, "combined");
     assert.equal(await value(page, "#depth-result"), "Lichess · Depth 50 | 1234k nodes", "combined shows the deeper of the two");
     assert.deepEqual(await bestSquares(page), [square("c7"), square("c5")].sort((a, b) => a - b));
-    assert.equal(await page.locator("#analyze").isVisible(), false);
     await showView(page, "lichess");
   });
 
@@ -826,6 +825,46 @@ try {
     await fresh.click("#flip");
     assert.deepEqual(await sides(), ["White captured +1:1", "Black captured:0"]);
     await fresh.close();
+  });
+
+  await step("Combined: the button fetches Lichess's evaluation and runs Stockfish at the same time", async () => {
+    const play = (p, uci) => move(p, uci.slice(0, 2), uci.slice(2, 4));
+    const keyAfter = uci => positionKey(`${replayUci(START, [uci]).keys[0]} 0 1`);
+    const savedKeys = new Set((await apiSaved()).map(e => positionKey(e.fen)));
+    const fresh = ["c2c3", "f2f3", "a2a3", "h2h3", "b2b3"].find(uci => !savedKeys.has(keyAfter(uci)));
+    const cloud = { knodes: 321, depth: 40, pvs: [{ moves: "d7d5 d2d4", cp: 12 }] };
+    lichessBrowser = () => ({ status: 200, body: cloud });
+    lichessAnswer = () => ({ status: 200, body: cloud });
+    const combined = await newPage();
+    await showView(combined, "combined");
+    await until(async () => /Stockfish 19 ready/.test(await text(combined, "#bridge-status")), "bridge connected");
+    await play(combined, fresh);
+    assert.equal(await text(combined, "#analyze"), "Find and save best move");
+    await combined.click("#analyze");
+    // Both run: one line each in the list, and the button stops them.
+    await until(async () => (await jobTexts(combined)).length === 2, "two analyses listed");
+    await until(async () => (await jobTexts(combined)).some(t => /Lichess evaluation saved \(depth 40\)\./.test(t)), "Lichess saved");
+    await until(async () => (await jobTexts(combined)).some(t => /Analysis complete\. Best move saved/.test(t)), "Stockfish saved", 20000);
+    const entries = (await apiSaved()).filter(e => positionKey(e.fen) === keyAfter(fresh)).map(e => [e.source, e.depth]).sort();
+    assert.deepEqual(entries, [["lichess", 40], ["stockfish", 46]], "each engine's result is saved under its own engine");
+    assert.match(await value(combined, "#depth-result"), /^Stockfish 19 · Depth 46/, "Combined shows the deeper one");
+    // Pressed again while both results are still listed: nothing is run twice.
+    await combined.click("#analyze");
+    assert.match(await text(combined, "#status"), /^Dismiss the finished results before analyzing this position again\.$/);
+    while (await combined.locator("#active-jobs li button:has-text('Dismiss')").count()) await combined.click("#active-jobs li button:has-text('Dismiss')");
+    // Stop while running stops both.
+    await toStart(combined);
+    const another = ["g2g3", "d2d3", "e2e3", "b1a3"].find(uci => !savedKeys.has(keyAfter(uci)) && uci !== fresh);
+    lichessBrowser = () => ({ status: 404, body: "" });
+    lichessAnswer = () => ({ status: 404, body: "" });
+    await play(combined, another);
+    await combined.click("#analyze");
+    await until(async () => (await text(combined, "#analyze")) === "Stop analysis" && (await jobTexts(combined)).some(t => /Analyzing Stockfish/.test(t)), "running");
+    await combined.click("#analyze");
+    await until(async () => (await jobTexts(combined)).some(t => /Analysis stopped/.test(t)), "stopped");
+    assert.equal(await text(combined, "#analyze"), "Find and save best move");
+    while (await combined.locator("#active-jobs li button:has-text('Dismiss')").count()) await combined.click("#active-jobs li button:has-text('Dismiss')");
+    await combined.close();
   });
 
   await step("live analysis: each position is analysed while it is shown; the deeper result is shown, and saved once it is deeper than the saved one", async () => {

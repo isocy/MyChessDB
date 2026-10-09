@@ -187,7 +187,9 @@ function depthLabel(entry) {
 // found so far, once that is deeper than the saved one. While the live
 // analysis is still searching the position it also stays on screen when it
 // is only as deep as the saved one, which is what happens each time it has
-// been saved: it turns to the saved (green) one when the search stops.
+// been saved: it turns to the saved (green) one when the search stops. Seen
+// again later, a saved live analysis is green like any saved analysis, until
+// the new search has gone deeper (see liveState.search).
 function shownAnalysis(fen) {
   const saved=savedMatch(fen);
   let live=liveAnalysisFor(fen);
@@ -198,7 +200,7 @@ function shownAnalysis(fen) {
   }
   if(!live || !saved) return live||saved;
   if(live.depth>saved.depth) return live;
-  return live.depth===saved.depth && live.liveAnalysis && liveSearching(fen) ? live : saved;
+  return live.depth===saved.depth && live.liveAnalysis && live.search===liveState.search && liveSearching(fen) ? live : saved;
 }
 function applyShownAnalysis(fen) {
   const key=positionKey(fen);
@@ -1294,6 +1296,7 @@ const liveState={
   failed:null,       // why the bridge could not search it
   elsewhere:false,   // another tab has taken the live analysis over
   cache:new Map(),   // position key -> the deepest result found
+  search:0,          // counts the searches: a result keeps the one it came from
   saves:new Map(),   // position key -> {depth, at, timer, busy}: what was sent to be saved
   saveNote:null,     // the outcome of the last save, for the button's tooltip
   savePausedUntil:0  // after "too many saves": no saving before then
@@ -1396,6 +1399,7 @@ function syncLiveAnalysis() {
     if(wasSearching) saveLiveAnalysis(liveState.key,true);
     clearTimeout(liveState.timer);
     liveState.key=key; liveState.failed=null; liveState.elsewhere=false;
+    if(key) liveState.search++;
     // One request at a time, so they reach the bridge in order; one that has
     // been overtaken by a newer position before it was sent is left out.
     if(fen) liveState.sending=liveState.sending.then(()=>{
@@ -1454,7 +1458,7 @@ function takeLiveAnalysis(view) {
   const key=positionKey(view.fen), cached=liveState.cache.get(key);
   if(cached && (cached.depth>best.depth || cached.depth===best.depth && cached.pv.join(" ")===best.pv.join(" ") && cached.evaluation===best.evaluation)) return;
   liveState.cache.delete(key);   // re-added at the end: the least recently found go first
-  liveState.cache.set(key,{live:true,liveAnalysis:true,source:"stockfish",fen:view.fen,depth:best.depth,move_uci:best.pv[0],pv:best.pv,evaluation:best.evaluation,knodes:best.nodes?Math.round(best.nodes/1000):null});
+  liveState.cache.set(key,{live:true,liveAnalysis:true,source:"stockfish",search:key===liveState.key?liveState.search:0,fen:view.fen,depth:best.depth,move_uci:best.pv[0],pv:best.pv,evaluation:best.evaluation,knodes:best.nodes?Math.round(best.nodes/1000):null});
   while(liveState.cache.size>LIVE_CACHE_SIZE) liveState.cache.delete(liveState.cache.keys().next().value);
   if(key===positionKey(currentFen())) refreshShownAnalysis();
   // Another tab's search is saved by that tab.
@@ -1489,22 +1493,25 @@ function currentJob() {
   if(state.view!=="combined") return activeJobs.get(jobKey(state.view,fen))||null;
   return activeJobs.get(jobKey("stockfish",fen))||activeJobs.get(jobKey("lichess",fen))||null;
 }
+// The engines the analyse button runs in the chosen view: in Combined both,
+// Lichess's evaluation and Stockfish 19, at the same time.
+function viewSources() { return state.view==="combined"?["lichess","stockfish"]:[state.view]; }
 function setAnalyzeButtonLabel() {
-  const job=currentJob(), busy=job&&!job.finished;
+  const fen=currentFen();
+  const busy=viewSources().some(source=>{ const job=activeJobs.get(jobKey(source,fen)); return job&&!job.finished; });
   document.querySelector("#analyze").textContent=busy?"Stop analysis":state.view==="lichess"?"Get Lichess evaluation":"Find and save best move";
 }
 // The view decides what is shown and what the analyse button does:
 // "stockfish" runs Stockfish 19, "lichess" fetches Lichess's evaluation, and
-// "combined" only shows, for each position, the deeper of the two.
+// "combined" shows, for each position, the deeper of the two and does both.
 function setView(view) {
   state.view=Object.hasOwn(ENGINES,view)?view:"combined";
   try { localStorage.setItem("chessdb_view",state.view); } catch(error) { /* the choice just is not remembered */ }
   for(const button of document.querySelectorAll("#view-switch button"))
     button.setAttribute("aria-pressed",String(button.dataset.view===state.view));
   const combined=state.view==="combined";
-  document.querySelector("#analyze-row").style.display=combined?"none":"";
   document.querySelector("#view-note").textContent=combined
-    ? "Combined shows, for each position, the deeper of the Stockfish 19 and Lichess results. Choose one of them to analyse."
+    ? "Combined shows, for each position, the deeper of the Stockfish 19 and Lichess results. Its button fetches Lichess's evaluation and runs Stockfish 19 at the same time; each result is saved under its own engine."
     : state.view==="lichess"
       ? "Lichess's stored evaluation is fetched as it is; depth is not chosen here."
       : "";
@@ -2006,14 +2013,19 @@ async function cloudEval(fen) {
   }
   return {depth:Number(data.depth)||0,knodes:data.knodes,lines};
 }
+// Runs the analyses of the chosen view for the position on the board: one
+// engine's, or in Combined both at once. Pressed while one of them runs, it
+// stops them.
 document.querySelector("#analyze").onclick=async()=>{
   playMoveSound("ui");
-  if(state.view==="combined") return;   // the button is not shown there
-  const source=state.view, fen=currentFen(), key=jobKey(source,fen);
-  const existing=activeJobs.get(key);
-  if(existing) {
-    if(!existing.finished) await stopAnalysisJob(existing);
-    else status("Dismiss the finished result before analyzing this position again.");
+  const fen=currentFen(), sources=viewSources();
+  const existing=sources.map(source=>activeJobs.get(jobKey(source,fen))).filter(Boolean);
+  const running=existing.filter(job=>!job.finished);
+  if(running.length) { await Promise.all(running.map(stopAnalysisJob)); return; }
+  // An engine whose finished result is still in the list is not run again.
+  const free=sources.filter(source=>!activeJobs.has(jobKey(source,fen)));
+  if(!free.length) {
+    status(`Dismiss the finished result${existing.length>1?"s":""} before analyzing this position again.`);
     return;
   }
   try {
@@ -2023,6 +2035,11 @@ document.querySelector("#analyze").onclick=async()=>{
     return;
   }
   rememberFlipForPosition(fen);
+  await Promise.all(free.map(source=>runAnalysisJob(source,fen)));
+};
+// One engine's analysis of a position, from the list entry to the save.
+async function runAnalysisJob(source, fen) {
+  const key=jobKey(source,fen);
   const target=source==="stockfish"?chosenDepth():0;
   const job={key,source,fen,flipped:state.flipped,cancelled:false,finished:false,completed:false,stockfishJobId:null,depth:0,progress:0,target,statusText:"Queued...",openingMoves:state.openingTracking?[...state.openingMoves]:null,positionHistory:state.history.slice(0,state.historyIndex+1).map(clonePosition)};
   activeJobs.set(key,job);
@@ -2049,7 +2066,7 @@ document.querySelector("#analyze").onclick=async()=>{
     setAnalyzeButtonLabel();
     if(jobMatchesCurrent(job)) syncAnalysisProgressForCurrentPosition();
   }
-};
+}
 // Removes the saved entry that is on screen (one engine's; the other stays).
 document.querySelector("#remove").onclick=async()=>{
   const fen=currentFen(), shown=savedMatch(fen);

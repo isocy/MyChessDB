@@ -27,7 +27,7 @@ the analyse button chooses what is on screen, and what the button does:
 
 | View | Shows | The button |
 |---|---|---|
-| Combined (first visit) | for each position the deeper of the two; Stockfish 19 when they are equally deep | no button: nothing is analysed here |
+| Combined (first visit) | for each position the deeper of the two; Stockfish 19 when they are equally deep | **Find and save best move** does both at the same time: fetches Lichess's evaluation and runs Stockfish through the bridge; each is saved under its own engine, and **Stop analysis** stops both |
 | Stockfish 19 | Stockfish 19 entries only | **Find and save best move** runs Stockfish through the bridge; Lichess is not asked |
 | Lichess | Lichess entries only | **Get Lichess evaluation** fetches the evaluation Lichess has stored and saves it |
 
@@ -115,7 +115,8 @@ shown, its best move is painted purple, not green, and the depth line ends
 in "live analysis". While the search goes on it stays purple also when it is
 only as deep as the saved result, as right after it has been saved ("live
 analysis, saved"); once the search stops (another position, the tab hidden,
-live analysis turned off) that saved result is shown in green.
+live analysis turned off) that saved result is shown in green. Seen again
+later, it is green like any saved analysis until the new search goes deeper.
 
 - **Saving.** Once the live analysis is deeper than the position's saved
   Stockfish 19 analysis (or reaches depth 21 where none is saved), it is
