@@ -106,6 +106,12 @@
     #bridge-bar { display:flex; align-items:center; gap:8px; margin-top:8px; font-size:12px; color:#bbb; }
     #bridge-bar span { flex:1; min-width:0; overflow-wrap:anywhere; }
     #bridge-bar button { padding:3px 8px; flex:0 0 auto; }
+    #browser-engine { margin-top:6px; font-size:12px; color:#bbb; }
+    #browser-engine .row-line { display:flex; align-items:center; gap:8px; }
+    #browser-engine .row-line span { flex:1; min-width:0; overflow-wrap:anywhere; }
+    #browser-engine button { padding:3px 8px; flex:0 0 auto; }
+    #browser-engine small { display:block; margin-top:3px; }
+    #browser-engine a { color:#9bc4ff; }
     #bridge-setup { display:none; background:#1c1c1c; padding:4px 10px 10px; border-radius:4px; margin-top:6px; font-size:12px; }
     #bridge-setup .install-boxes { display:flex; flex-direction:column; gap:10px; }
     #bridge-setup code { display:block; background:#111; padding:6px; border-radius:4px; word-break:break-all; user-select:all; margin:4px 0; }
@@ -187,6 +193,10 @@
     <div class="row" id="analyze-row"><button id="analyze">Find and save best move</button></div>
     <progress id="analysis-progress" max="100" value="0"></progress>
     <div id="bridge-bar"><span id="bridge-status">Engine bridge: not connected</span><button id="bridge-connect">Connect</button><button id="bridge-install" style="display:none">Install Stockfish 19</button></div>
+    <div id="browser-engine" style="display:none">
+      <div class="row-line"><span id="browser-engine-status"></span><button id="browser-engine-toggle">Use browser engine</button></div>
+      <small id="browser-engine-note">A 99 MB download the first time (the browser keeps it), and several times slower than the engine bridge. It only runs live analysis: analysing to a chosen depth needs the bridge. Stockfish is free software under the <a href="/engine/Copying.txt" target="_blank" rel="noopener">GPLv3</a>; this build is <a href="https://github.com/nmrugg/stockfish.js" target="_blank" rel="noopener">stockfish.js 19</a>, from <a href="https://github.com/official-stockfish/Stockfish" target="_blank" rel="noopener">Stockfish</a>.</small>
+    </div>
     <div id="bridge-setup">
       <p>Stockfish runs on your own computer. A small helper program, the engine bridge, starts it for this site and downloads the official Stockfish 19 for you. Nothing is installed system-wide.</p>
       <p>Your browser will ask once whether this site may access other apps and services on this device. Choose <b>Allow</b>: that is how this page reaches the bridge, and the bridge only answers this site.</p>

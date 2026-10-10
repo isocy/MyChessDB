@@ -394,6 +394,21 @@ const at = async (env, fen) => (await call(env, "GET", "/api/position?fen=" + en
   eq((await call(defaults, "POST", "/api/saved", { body: sf(START, 30) })).data.code, "WRITE_RATE_LIMIT", "600 in all by default");
 }
 
+// --- D1's daily write limit ----------------------------------------------
+{
+  const env = makeEnv();
+  const prepare = env.DB.prepare.bind(env.DB);
+  // What D1 throws once the free plan's row writes for the day are used up.
+  env.DB.prepare = sql => {
+    if (/^\s*INSERT/i.test(sql)) throw new Error("D1_ERROR: Your account has exceeded D1's free tier daily row write limit. Upgrade to a paid plan or wait until tomorrow (midnight UTC) to continue.");
+    return prepare(sql);
+  };
+  const r = await call(env, "POST", "/api/saved", { body: sf(START, 30) });
+  eq([r.status, r.data.code], [503, "DAILY_WRITE_LIMIT"], "said plainly, not as an unknown server error");
+  ok(/until \d\d:\d\d UTC/.test(r.data.error) && /T00:00:00\.000Z$/.test(r.data.retry_at), r.data.error);
+  eq((await call(env, "GET", "/api/position?fen=" + encodeURIComponent(START))).status, 200, "reading still works");
+}
+
 // --- a position and the ones a move away ---------------------------------
 {
   const env = makeEnv();

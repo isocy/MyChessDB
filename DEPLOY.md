@@ -124,8 +124,9 @@ later, it is green like any saved analysis until the new search goes deeper.
   without, under the same rules (an unverified result never replaces a
   verified one; the depth line then ends in "not saved"). While the position
   stays on the board it is saved at most every 30 seconds; when the search
-  leaves the position (another move, the tab hidden) its deepest result is
-  saved at once. For visitors without a key, live analysis may save at most
+  leaves the position or stops (another move, the tab hidden, live analysis
+  or the browser engine turned off, the page reloaded or closed) its deepest
+  result is saved at once. For visitors without a key, live analysis may save at most
   500 times an hour (`ANON_LIVE_WRITES_PER_HOUR`) out of the 600 save
   attempts they have in all (`ANON_WRITES_PER_HOUR`), so at least 100 stay
   for analyses run with the button. When either limit is hit, live analysis
@@ -149,6 +150,45 @@ stops searching when the page has not asked for 10 seconds (the tab was
 closed; a hidden tab stops it at once), and ends the process after another
 minute. Only one position is searched at a time: when two tabs are open, the
 one used last has it.
+
+### Browser engine
+
+Without the engine bridge, live analysis can run Stockfish 19 in the browser
+instead, the way the Lichess analysis board does. It is offered under the
+engine bridge's line ("No engine bridge? ... **Use browser engine**") and only
+starts when asked, because the first time it downloads 99 MB (the browser
+keeps the file afterwards). The offer says so, and that it is several times
+slower than the bridge.
+
+- It is live analysis exactly as described above: shown in purple, saved
+  once deeper than the saved Stockfish 19 analysis, under the same limits.
+  It is the same engine with the same networks as the bridge's
+  ([stockfish.js](https://github.com/nmrugg/stockfish.js) 19.0.0, Stockfish 19
+  built for WebAssembly), so its results are Stockfish 19 results.
+- Analysing to a chosen depth (the analyse button) still needs the bridge.
+- When the bridge is running, it does the live analysis and the browser
+  engine rests; when the bridge goes away, the browser engine takes over.
+  The browser engine closes after a minute without searching, giving its
+  memory back.
+- Threads: the site is cross-origin isolated (`Cross-Origin-Opener-Policy`
+  and `Cross-Origin-Embedder-Policy: credentialless` in `web/_headers`), so
+  in Chrome, Edge and Firefox it uses all processor cores but one (at most
+  16). Where that is not possible (Safari, and browsers that cannot start a
+  worker from a worker, which the page tests first) it uses one thread.
+- The page checks the SHA-256 of what it downloaded against the values in
+  `web/browserengine.js` and does not run anything else.
+
+The two engine loaders (`web/engine/*.js`, 20-30 KB) are part of the site. The
+two WebAssembly files, one for several threads and one for a single thread,
+are 99 MB each, more than Cloudflare serves as static files (25 MB), so the
+page takes them from the same npm package on unpkg
+(`https://unpkg.com/stockfish@19.0.0/bin/`). unpkg answers from a nearby
+Cloudflare cache (Seoul, for visitors in Korea: about 5 MB/s, some 20 seconds
+for the whole file), while this site on `workers.dev` is answered from abroad
+for them; serving the files from an R2 bucket through the Worker was tried
+and gave about 0.2 MB/s in a browser. Nothing has to be set up for it; if
+unpkg cannot be reached, the browser engine reports that it could not
+download, and the engine bridge still works.
 
 ### The Lichess evaluation database
 
@@ -441,6 +481,11 @@ Checked by hand on the live site, Windows 11 with Firefox:
 
 Not yet run anywhere:
 
+- the browser engine with several threads: the browser built into the
+  Claude desktop app, where it was tested (download, check, live analysis,
+  saving, handing over to the bridge and back), cannot start a worker from a
+  worker, so there it ran with one thread. Several threads need a check in
+  Chrome, Edge or Firefox.
 - the Windows-only parts of the bridge added in 1.0.3: reading free memory,
   and marking Stockfish's memory as the first to give up when memory runs
   short
@@ -460,5 +505,9 @@ Not yet run anywhere:
 ## Credits
 
 Opening names: [lichess-org/chess-openings](https://github.com/lichess-org/chess-openings), CC0.
-Engine: [Stockfish](https://stockfishchess.org), GPLv3, downloaded by each
-user from the official release; it is not redistributed by this site.
+Engine: [Stockfish](https://stockfishchess.org), GPLv3. The engine bridge
+downloads the official release on each user's computer. The browser engine is
+[stockfish.js](https://github.com/nmrugg/stockfish.js) 19.0.0 (GPLv3): its
+loaders are served by this site and its WebAssembly files from the npm package
+on unpkg; its license is in `web/engine/Copying.txt` (linked from the page)
+and its source at the links above.

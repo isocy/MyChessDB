@@ -6,6 +6,7 @@
 // browser. Lichess is asked directly. Stockfish runs on the user's own
 // computer through the engine bridge at http://127.0.0.1:8765.
 import * as chess from "./chesslib.js";
+import { BrowserEngine, browserEngineSupported, ENGINE_SIZE_MB } from "./browserengine.js";
 
 const BRIDGE_URL = "http://127.0.0.1:8765";
 const BRIDGE_MIN_VERSION = "1.0.6";
@@ -956,7 +957,9 @@ async function api(path, options={}) {
     response=await fetch(path,{
       method:options.method||(options.body!==undefined?"POST":"GET"),
       headers,
-      body:options.body!==undefined?JSON.stringify(options.body):undefined
+      body:options.body!==undefined?JSON.stringify(options.body):undefined,
+      // keepalive: the request is completed even if the page is closed or reloaded meanwhile.
+      keepalive:!!options.keepalive
     });
   } catch(error) {
     throw Error("Could not reach the My Chess DB server. Check your internet connection.");
@@ -1210,10 +1213,12 @@ async function checkBridge() {
   scheduleBridgeCheck();
   if(bridgeState.connected && !wasConnected) {
     void restoreActiveAnalyses().catch(error=>status(error.message));
-    liveLost();   // whatever the bridge was told before, tell it again
+    if(liveState.backend==="bridge") liveLost();   // whatever the bridge was told before, tell it again
   }
-  if(!bridgeState.connected) liveLost();
+  if(!bridgeState.connected && liveState.backend==="bridge") liveLost();
+  // The bridge took over from the browser engine, or the other way round.
   syncLiveAnalysis();
+  renderBrowserEngine();
   return bridgeState.connected;
 }
 function showBridgeSetup(show=true) {
@@ -1265,10 +1270,12 @@ document.querySelector("#engine").addEventListener("change",async()=>{
 async function requireEngine() {
   if(!await checkBridge()) {
     showBridgeSetup(true);
-    throw Error("Stockfish runs on your own computer through the engine bridge, which is not running. See \"Engine bridge\" below.");
+    throw Error("Stockfish runs on your own computer through the engine bridge, which is not running. See \"Engine bridge\" below."
+      +(browserEngineWanted?" (The browser engine only runs live analysis.)":""));
   }
   const info=bridgeState.status;
   if(info.engine.ready) return;
+  if(browserEngineWanted) throw Error("The browser engine only runs live analysis. Analysing to a chosen depth needs the engine bridge with Stockfish 19 installed.");
   if(INSTALL_BUSY.includes(info.install.state)) throw Error("The engine bridge is still downloading Stockfish 19. Try again when it is ready.");
   throw Error("Stockfish 19 is not installed in the engine bridge yet. Use \"Install Stockfish 19\" below.");
 }
@@ -1277,7 +1284,9 @@ async function requireEngine() {
 // ===========================================================================
 // Live analysis: the position on the board is analysed while it is there, the
 // way the Lichess analysis board does it. The engine bridge searches it
-// without a depth limit and moves on with every move. The page shows whichever
+// without a depth limit and moves on with every move; without the bridge,
+// Stockfish 19 can do the same in the browser (browserengine.js), if the
+// visitor asks for it. The page shows whichever
 // is deeper, the live analysis or the saved one, and once the live analysis is
 // deeper than the saved Stockfish 19 analysis it is saved like any other
 // Stockfish result (see saveLiveAnalysis). What was found is also kept for as
@@ -1290,7 +1299,8 @@ const LIVE_POLL_MS=250, LIVE_CACHE_SIZE=2000;
 const LIVE_SAVE_EVERY_MS=30000;
 const liveState={
   enabled:true,
-  key:null,          // the position the bridge is searching for this page
+  key:null,          // the position the engine is searching for this page
+  backend:null,      // and which engine: "bridge" or "browser"
   timer:null,
   sending:Promise.resolve(),   // the request to the bridge last sent
   failed:null,       // why the bridge could not search it
@@ -1314,7 +1324,7 @@ function liveAnalysisFor(fen) {
 // Why a live result would not be saved now, or null when it would be.
 function liveSaveBlocked(entry) {
   if(entry.depth<state.minDepth) return `it is saved from depth ${state.minDepth} on`;
-  if(Date.now()<liveState.savePausedUntil) return "too many saves in the last hour";
+  if(Date.now()<liveState.savePausedUntil) return "saving is paused for now (see the last save under this button's tooltip)";
   if(!state.positions.has(positionKey(entry.fen))) return "what is saved for this position is not known yet";
   return blockedByExisting(entry.fen,"stockfish",!!state.role,entry.depth,false);
 }
@@ -1322,14 +1332,17 @@ function liveSaveBlocked(entry) {
 // Stockfish 19 analysis, the same way an analysis from the button is saved
 // (verified with a key, unverified without). To stay well within the site's
 // limits it is saved at most every LIVE_SAVE_EVERY_MS while the position stays
-// on the board; `now` (the search is leaving the position) saves at once.
+// on the board; `now` (the search stops or leaves the position, live analysis
+// is turned off, the page is closed or reloaded) saves at once. What was found
+// is saved even when live analysis has been turned off since.
 function saveLiveAnalysis(key, now=false) {
   const entry=liveState.cache.get(key);
-  if(!entry || !liveState.enabled) return;
+  if(!entry) return;
   let record=liveState.saves.get(key);
-  if(!record) liveState.saves.set(key,record={depth:0,at:0,timer:null,busy:false});
-  // busy: looked at again when the request in flight returns.
-  if(record.busy || entry.depth<=record.depth || liveSaveBlocked(entry)) return;
+  if(!record) liveState.saves.set(key,record={depth:0,at:0,timer:null,busy:false,flush:false});
+  // busy: looked at again when the request in flight returns, at once if asked to.
+  if(record.busy) { record.flush||=now; return; }
+  if(entry.depth<=record.depth || liveSaveBlocked(entry)) return;
   const wait=record.at+LIVE_SAVE_EVERY_MS-Date.now();
   if(!now && wait>0) {
     record.timer||=setTimeout(()=>{ record.timer=null; saveLiveAnalysis(key,true); },wait);
@@ -1338,7 +1351,7 @@ function saveLiveAnalysis(key, now=false) {
   clearTimeout(record.timer); record.timer=null;
   record.busy=true; record.depth=entry.depth; record.at=Date.now();
   // live: counted against the live analysis's own share of the hourly limit.
-  api("/api/saved",{body:{fen:entry.fen,source:"stockfish",depth:entry.depth,pv:entry.pv,evaluation:entry.evaluation,live:true}})
+  api("/api/saved",{body:{fen:entry.fen,source:"stockfish",depth:entry.depth,pv:entry.pv,evaluation:entry.evaluation,live:true},keepalive:now})
     .then(outcome=>{
       setPosition(entry.fen,outcome.entries);
       liveState.saveNote=outcome.saved
@@ -1346,21 +1359,39 @@ function saveLiveAnalysis(key, now=false) {
         : `Depth ${entry.depth} was not saved: ${outcome.reason}`;
     },error=>{
       if(error.code==="WRITE_RATE_LIMIT"||error.code==="LIVE_WRITE_RATE_LIMIT") liveState.savePausedUntil=Math.ceil(Date.now()/3600000)*3600000;
+      // The database takes no writes until its daily limit resets.
+      if(error.code==="DAILY_WRITE_LIMIT") liveState.savePausedUntil=Date.parse(error.data?.retry_at)||Date.now()+3600000;
       liveState.saveNote=`Depth ${entry.depth} was not saved: ${error.message}`;
     })
     .finally(()=>{
-      record.busy=false;
+      const flush=record.flush;
+      record.busy=false; record.flush=false;
       renderLiveToggle();
-      saveLiveAnalysis(key);   // it may have gone deeper meanwhile
+      saveLiveAnalysis(key,flush);   // it may have gone deeper meanwhile
     });
 }
 // Is the live analysis searching this position for this page right now?
 function liveSearching(fen) {
   return liveState.key===positionKey(fen) && !liveState.elsewhere && !liveState.failed;
 }
-function liveAvailable() {
+// The engine bridge can run live analysis.
+function bridgeLive() {
   return bridgeState.connected && !!bridgeState.status?.live && !!bridgeState.status.engine.ready;
 }
+// The browser engine: only once the visitor has asked for it, since it is a
+// large download, and only while the bridge cannot do it.
+let browserEngine=null, browserEngineWanted=false;
+try { browserEngineWanted=localStorage.getItem("chessdb_browser_engine")==="on"; } catch(error) { /* off */ }
+function getBrowserEngine() {
+  return browserEngine||=new BrowserEngine(()=>{ renderBrowserEngine(); renderLiveToggle(); });
+}
+// Which engine live analysis uses: the bridge when it can, or else the browser engine.
+function liveBackend() {
+  if(bridgeLive()) return "bridge";
+  if(browserEngineWanted && browserEngineSupported()) return "browser";
+  return null;
+}
+function liveAvailable() { return liveBackend()!==null; }
 // The position the bridge should be searching now, or null for none.
 function liveTarget() {
   if(!liveState.enabled || state.view==="lichess" || document.hidden || !liveAvailable()) return null;
@@ -1379,12 +1410,15 @@ function renderLiveToggle() {
   let note;
   if(!liveState.enabled) note="Live analysis is off. Click to analyse each position while it is on the board.";
   else if(state.view==="lichess") note="Live analysis is not used in the Lichess view.";
-  else if(!bridgeState.connected) note="Live analysis runs Stockfish on this computer through the engine bridge, which is not connected (see \"Engine bridge\" below the analyse button).";
-  else if(!bridgeState.status?.live) note="This engine bridge is too old for live analysis: run the install command again (Update).";
-  else if(!bridgeState.status.engine.ready) note="Live analysis starts once Stockfish 19 is ready in the engine bridge.";
+  else if(!liveAvailable()) {
+    if(bridgeState.connected && !bridgeState.status?.live) note="This engine bridge is too old for live analysis: run the install command again (Update).";
+    else if(bridgeState.connected && !bridgeState.status.engine.ready) note="Live analysis starts once Stockfish 19 is ready in the engine bridge.";
+    else note="Live analysis needs an engine: start the engine bridge, or turn on the browser engine (both below the analyse button).";
+  }
+  else if(liveState.backend==="browser" && browserEngine?.state.loading) note=`Live analysis is waiting for the browser engine: downloading Stockfish 19... ${browserEngine.state.loading.percent}%`;
   else if(liveState.failed) note=`Live analysis failed: ${liveState.failed}`;
   else if(liveState.elsewhere) note="Live analysis is following another tab of this site. Click this page to bring it back.";
-  else if(liveState.key) note="Live analysis is running for this position. It is shown in purple while it is deeper than the saved analysis, and saved once it is deeper than the saved Stockfish 19 analysis.";
+  else if(liveState.key) note=`Live analysis is running for this position${liveState.backend==="browser"?" in this browser":""}. It is shown in purple while it is deeper than the saved analysis, and saved once it is deeper than the saved Stockfish 19 analysis.`;
   else note="Live analysis is on: each position is analysed while it is on the board. Click to turn it off.";
   if(liveState.enabled && liveState.saveNote) note+=`\nLast save: ${liveState.saveNote}`;
   button.title=note;
@@ -1392,47 +1426,64 @@ function renderLiveToggle() {
 // Points the bridge at the position that should be searched, or stops it.
 // Safe to call whenever anything changes: it only acts on a change.
 function syncLiveAnalysis() {
-  const fen=liveTarget(), key=fen?positionKey(fen):null;
-  if(key!==liveState.key) {
-    const wasSearching=liveState.key!==null;
+  const fen=liveTarget(), key=fen?positionKey(fen):null, backend=key?liveBackend():null;
+  if(key!==liveState.key || backend!==liveState.backend) {
+    const was={key:liveState.key,backend:liveState.backend};
     // Leaving a position: save the deepest it got to without waiting.
-    if(wasSearching) saveLiveAnalysis(liveState.key,true);
+    if(was.key) saveLiveAnalysis(was.key,true);
     clearTimeout(liveState.timer);
-    liveState.key=key; liveState.failed=null; liveState.elsewhere=false;
+    liveState.key=key; liveState.backend=backend; liveState.failed=null; liveState.elsewhere=false;
     if(key) liveState.search++;
-    // One request at a time, so they reach the bridge in order; one that has
-    // been overtaken by a newer position before it was sent is left out.
-    if(fen) liveState.sending=liveState.sending.then(()=>{
-      if(liveState.key!==key) return;
-      return bridge("/api/live",{body:{fen}}).then(
-        ()=>{ if(liveState.key===key) pollLiveAnalysis(key); },
-        error=>{ if(liveState.key===key){ liveState.failed=error.message; syncLiveAnalysis(); } });
-    });
-    else if(wasSearching && bridgeState.connected) liveState.sending=liveState.sending.then(()=>{
-      if(liveState.key!==null) return;
-      return bridge("/api/live/stop",{method:"POST"}).catch(()=>{});
-    });
+    // The engine that searched before stops, unless it goes on with the next position.
+    if(was.key && was.backend!==backend) stopLiveBackend(was.backend);
+    if(backend==="browser") {
+      getBrowserEngine().set(fen);
+      pollLiveAnalysis(key);
+    } else if(backend==="bridge") {
+      // One request at a time, so they reach the bridge in order; one that has
+      // been overtaken by a newer position before it was sent is left out.
+      liveState.sending=liveState.sending.then(()=>{
+        if(liveState.key!==key) return;
+        return bridge("/api/live",{body:{fen}}).then(
+          ()=>{ if(liveState.key===key) pollLiveAnalysis(key); },
+          error=>{ if(liveState.key===key){ liveState.failed=error.message; syncLiveAnalysis(); } });
+      });
+    }
   }
   renderLiveToggle();
   // The search started, stopped or failed: a result as deep as the saved one
   // turns purple or back to green.
   if(shownAnalysis(currentFen())!==state.shown) refreshShownAnalysis();
 }
-// Forgets which position the bridge was given, so the next sync gives it again.
+function stopLiveBackend(backend) {
+  if(backend==="browser") browserEngine?.stop();
+  else if(backend==="bridge" && bridgeState.connected) liveState.sending=liveState.sending.then(()=>{
+    if(liveState.backend==="bridge" && liveState.key!==null) return;   // in use again
+    return bridge("/api/live/stop",{method:"POST"}).catch(()=>{});
+  });
+}
+// Forgets which position the engine was given, so the next sync gives it again.
 function liveLost() {
   clearTimeout(liveState.timer);
-  liveState.key=null; liveState.failed=null; liveState.elsewhere=false;
+  // What it found is saved now, as when it moves on to another position.
+  if(liveState.key) saveLiveAnalysis(liveState.key,true);
+  if(liveState.key && liveState.backend==="browser") browserEngine?.stop();
+  liveState.key=null; liveState.backend=null; liveState.failed=null; liveState.elsewhere=false;
 }
 async function pollLiveAnalysis(key) {
+  const backend=liveState.backend;
   let view;
-  try { view=await bridge("/api/live"); }
-  catch(error) {
-    // The bridge has gone; checkBridge picks it up again when it is back.
-    if(liveState.key===key){ liveLost(); renderBridge(); syncLiveAnalysis(); }
-    return;
+  if(backend==="browser") view=browserEngine.get();
+  else {
+    try { view=await bridge("/api/live"); }
+    catch(error) {
+      // The bridge has gone; checkBridge picks it up again when it is back.
+      if(liveState.key===key){ liveLost(); renderBridge(); syncLiveAnalysis(); }
+      return;
+    }
   }
   takeLiveAnalysis(view);
-  if(liveState.key!==key) return;   // moved on: the new position has its own loop
+  if(liveState.key!==key || liveState.backend!==backend) return;   // moved on: the new position has its own loop
   if(!view.fen || positionKey(view.fen)!==key) {
     // Another tab gave the bridge its own position. Leave it to that tab
     // until this page is used again, so that two tabs do not take turns.
@@ -1464,6 +1515,38 @@ function takeLiveAnalysis(view) {
   // Another tab's search is saved by that tab.
   if(key===liveState.key) saveLiveAnalysis(key);
 }
+// The line under the engine bridge's that offers the browser engine. Hidden
+// while the bridge runs live analysis.
+function renderBrowserEngine() {
+  const bar=document.querySelector("#browser-engine"), text=document.querySelector("#browser-engine-status");
+  const button=document.querySelector("#browser-engine-toggle"), note=document.querySelector("#browser-engine-note");
+  const shown=browserEngineSupported() && (!bridgeLive() || browserEngine?.worker);
+  bar.style.display=shown?"":"none";
+  if(!shown) return;
+  button.textContent=browserEngineWanted?"Turn off":"Use browser engine";
+  note.style.display=browserEngineWanted?"none":"";
+  const engine=browserEngine;
+  let message;
+  if(!browserEngineWanted) message="No engine bridge? Live analysis can run Stockfish 19 in this browser instead.";
+  else if(bridgeLive()) message="Browser engine: not used while the engine bridge runs live analysis.";
+  else if(engine?.state.loading) message=`Browser engine: downloading Stockfish 19... ${engine.state.loading.percent}% (${ENGINE_SIZE_MB} MB, once)`;
+  else if(engine?.state.error) message=`Browser engine: ${engine.state.error}`;
+  else if(engine?.state.ready) message=`Browser engine: Stockfish 19 · ${engine.threads} thread${engine.threads===1?"":"s"}${engine.flavour==="single"?" (this browser allows only one)":""}`;
+  else message="Browser engine: on; it starts with live analysis.";
+  text.textContent=message;
+}
+document.querySelector("#browser-engine-toggle").onclick=()=>{
+  playMoveSound("ui");
+  browserEngineWanted=!browserEngineWanted;
+  try { localStorage.setItem("chessdb_browser_engine",browserEngineWanted?"on":"off"); } catch(error) { /* just not remembered */ }
+  if(browserEngineWanted && !liveState.enabled) document.querySelector("#live-toggle").click();
+  if(!browserEngineWanted) {
+    if(liveState.backend==="browser") liveLost();
+    browserEngine?.close();
+  }
+  syncLiveAnalysis();
+  renderBrowserEngine();
+};
 document.querySelector("#live-toggle").onclick=()=>{
   playMoveSound("ui");
   liveState.enabled=!liveState.enabled;
@@ -1471,11 +1554,13 @@ document.querySelector("#live-toggle").onclick=()=>{
   applyShownAnalysis(currentFen());
   render();
   if(!liveState.enabled) status("Live analysis is off");
-  else if(!liveAvailable()) status("Live analysis is on. It runs Stockfish through the engine bridge: see \"Engine bridge\" below the analyse button.");
+  else if(!liveAvailable()) status("Live analysis is on. It needs an engine: the engine bridge, or the browser engine (below the analyse button).");
   else status("Live analysis is on");
 };
 // A hidden tab does not keep the engine busy, and coming back starts it
 // again. Using a tab after another one had taken the analysis over takes it back.
+// Closing or reloading the page: what the search found so far is saved.
+window.addEventListener("pagehide",()=>{ if(liveState.key) saveLiveAnalysis(liveState.key,true); });
 document.addEventListener("visibilitychange",()=>{
   if(!document.hidden && liveState.elsewhere) liveLost();
   syncLiveAnalysis();
@@ -2217,6 +2302,7 @@ document.querySelector("#history-button").onclick=async()=>{
   try { view=localStorage.getItem("chessdb_view")||view; } catch(error) { /* start with the combined view */ }
   parseFen(chess.START_FEN);
   setView(view);
+  renderBrowserEngine();
   try {
     await loadSession();
   } catch(e) { status(e.message); }

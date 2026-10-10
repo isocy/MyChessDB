@@ -204,8 +204,13 @@ try {
     assert.deepEqual([bar.empty, bar.white, bar.label], [true, 50, ""], "the evaluation bar is neutral without an analysis");
     const board = await page.locator("#board-wrap").boundingBox(), barBox = await page.locator("#eval-bar").boundingBox();
     assert.ok(barBox.x + barBox.width <= board.x && barBox.y === board.y && barBox.height === board.height, "the bar stands left of the board");
-    const csp = (await (await fetch(SITE + "/")).headers.get("content-security-policy")) || "";
-    assert.ok(csp.includes("script-src 'self';") && csp.includes("frame-ancestors 'none'"), csp);
+    const home = await fetch(SITE + "/"), csp = home.headers.get("content-security-policy") || "";
+    assert.ok(csp.includes("script-src 'self' 'wasm-unsafe-eval';") && csp.includes("frame-ancestors 'none'"), csp);
+    // Cross-origin isolated, so the browser engine can use several threads.
+    assert.deepEqual([home.headers.get("cross-origin-opener-policy"), home.headers.get("cross-origin-embedder-policy")], ["same-origin", "credentialless"]);
+    assert.equal(await page.evaluate(() => crossOriginIsolated), true);
+    assert.equal(await page.locator("#browser-engine").isVisible(), true, "the browser engine is offered without the bridge");
+    assert.equal(await text(page, "#browser-engine-toggle"), "Use browser engine", "but not started without asking");
     // A first visit shows the combined results.
     assert.equal(await page.getAttribute("#view-switch button[data-view='combined']", "aria-pressed"), "true");
     assert.equal(await text(page, "#analyze"), "Find and save best move", "Combined has the analyse button too");

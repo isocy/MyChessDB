@@ -644,6 +644,15 @@ export default {
     } catch (error) {
       if (error instanceof HttpError) return json(error.status, { error: error.message, ...error.extra });
       console.error(error);
+      // D1's free plan allows a fixed number of row writes a day (UTC); past
+      // it every save fails until midnight UTC, whoever sends it.
+      if (/daily row write limit/i.test(String(error?.message))) {
+        const reset = new Date(); reset.setUTCHours(24, 0, 0, 0);
+        return json(503, {
+          error: `The database has used up today's writes (Cloudflare's free plan). Nothing can be saved until ${reset.toISOString().slice(11, 16)} UTC.`,
+          code: "DAILY_WRITE_LIMIT", retry_at: reset.toISOString(),
+        });
+      }
       return json(500, { error: "Something went wrong on the server." });
     }
   },
