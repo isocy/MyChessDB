@@ -376,7 +376,7 @@ function showHistoryPosition(index) {
   state.captured=position.captured
     ? {w:[...position.captured.w],b:[...position.captured.b]}
     : {w:[],b:[]};
-  if(typeof position.flipped==="boolean") state.flipped=position.flipped;
+  // The board keeps the side it is seen from while moving through the history.
   state.openingTracking=position.openingTracking;
   state.openingMoves=position.openingMoves.slice();
   state.selected=null;
