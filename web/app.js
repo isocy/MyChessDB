@@ -74,25 +74,37 @@ function nextPositionKeys(fen) {
     return chess.legalMoves(position).map(move=>positionKey(chess.toFen(chess.makeMove(position,move))));
   } catch(error) { return []; }
 }
-// Fetches a position and the positions one move away, in one request.
+// When the server says this visitor has looked up many positions at once
+// lately (`limited`), only single positions are asked for a while.
+const LOOKAHEAD_PAUSE_MS=30000;
+let lookaheadPausedUntil=0;
+const lookaheadPaused=()=>Date.now()<lookaheadPausedUntil;
+function noteLimited(data) {
+  if(data?.limited) lookaheadPausedUntil=Date.now()+LOOKAHEAD_PAUSE_MS;
+}
+// Fetches a position and the positions one move away, in one request (only
+// the position itself while the look-ahead is paused).
 function expandPosition(fen) {
   const key=positionKey(fen);
   if(expansions.has(key)) return expansions.get(key);
-  const sentAt=positionWrites, epoch=positionsEpoch, covered=[key,...nextPositionKeys(fen)];
+  const ahead=!lookaheadPaused();
+  const sentAt=positionWrites, epoch=positionsEpoch, covered=ahead?[key,...nextPositionKeys(fen)]:[key];
   const take=(at,entries)=>{
     if(entries && !((positionWrittenAt.get(at)||0)>sentAt)) state.positions.set(at,entries);
   };
-  const request=api(`/api/position?next=1&fen=${encodeURIComponent(fen)}`)
+  const request=api(`/api/position?${ahead?"next=1&":""}fen=${encodeURIComponent(fen)}`)
     .catch(error=>{
       // A board that is not a legal position has nothing saved for it.
       if(error.status===400) return {entries:{},next:{}};
       throw error;
     })
     .then(data=>{
+      noteLimited(data);
       if(epoch!==positionsEpoch) return;   // everything was reloaded meanwhile
       take(key,data.entries||{});
       for(const [at,entries] of Object.entries(data.next||{})) take(at,entries);
-      expandedPositions.add(key);
+      // Without the positions one move away, they are asked for again later.
+      if(data.next) expandedPositions.add(key);
     })
     .finally(()=>{
       if(expansions.get(key)===request) expansions.delete(key);
@@ -106,6 +118,7 @@ function expandPosition(fen) {
 // moves before a position loaded with its history, so that going back through
 // them shows their results at once. One request per 100 positions.
 function prefetchPositions(fens) {
+  if(lookaheadPaused()) return;   // they are fetched one by one when shown
   const wanted=new Map();
   for(const fen of fens) {
     const key=positionKey(fen);
@@ -117,6 +130,7 @@ function prefetchPositions(fens) {
     const query=chunk.slice(1).map(([,fen])=>`&also=${encodeURIComponent(fen)}`).join("");
     const request=api(`/api/position?fen=${encodeURIComponent(chunk[0][1])}${query}`)
       .then(data=>{
+        noteLimited(data);
         if(epoch!==positionsEpoch) return;
         const answers=[[chunk[0][0],data.entries],...Object.entries(data.also||{})];
         for(const [key,entries] of answers)
@@ -203,16 +217,40 @@ function shownAnalysis(fen) {
   if(live.depth>saved.depth) return live;
   return live.depth===saved.depth && live.liveAnalysis && live.search===liveState.search && liveSearching(fen) ? live : saved;
 }
-function applyShownAnalysis(fen) {
+// While the board changes quickly (the mouse wheel through a game), what is
+// saved is only fetched where it stops for BOARD_FETCH_QUIET_MS, not for
+// every position on the way. A change after a quiet moment is fetched at once.
+const BOARD_FETCH_QUIET_MS=200;
+const boardFetch={key:null,changedAt:0,timer:null};
+function fetchForBoard(fen) {
+  const key=positionKey(fen), now=Date.now();
+  if(key!==boardFetch.key) {
+    const quiet=now-boardFetch.changedAt>=BOARD_FETCH_QUIET_MS;
+    boardFetch.key=key; boardFetch.changedAt=now;
+    clearTimeout(boardFetch.timer); boardFetch.timer=null;
+    if(!quiet) {
+      boardFetch.timer=setTimeout(()=>{
+        boardFetch.timer=null;
+        if(key===positionKey(currentFen())) fetchForBoardNow(currentFen());
+      },BOARD_FETCH_QUIET_MS);
+      return;
+    }
+  } else if(boardFetch.timer) return;   // still waiting for the board to settle
+  fetchForBoardNow(fen);
+}
+function fetchForBoardNow(fen) {
   const key=positionKey(fen);
   if(!state.positions.has(key)) {
     // Not fetched yet: show it as soon as it is here, if this is still the position on the board.
     loadPosition(fen).then(()=>{ if(key===positionKey(currentFen())) refreshShownAnalysis(); },error=>status(error.message));
-  } else if(!expandedPositions.has(key) && !expansions.has(key)) {
+  } else if(!expandedPositions.has(key) && !expansions.has(key) && !lookaheadPaused()) {
     // Known already (fetched with the position before): look one move further
     // ahead now, and show what is newest for this one when it comes.
     expandPosition(fen).then(()=>{ if(key===positionKey(currentFen())) refreshShownAnalysis(); },()=>{});
   }
+}
+function applyShownAnalysis(fen) {
+  fetchForBoard(fen);
   const shown=shownAnalysis(fen);
   state.shown=shown;
   state.shownMove=shown?.move_uci||null;
@@ -976,6 +1014,7 @@ async function api(path, options={}) {
 function setRoleUI() {
   const admin=state.role==="admin";
   document.querySelector("#remove").style.display=admin?"":"none";
+  document.querySelector("#purge").style.display=admin?"":"none";
   document.querySelector("#admin-tools").style.display=admin?"":"none";
   document.querySelector("#key-input").style.display=state.role?"none":"";
   document.querySelector("#key-login").textContent=state.role?"🔓 Logout":"Login";
@@ -2161,6 +2200,18 @@ document.querySelector("#remove").onclick=async()=>{
     const result=await api("/api/remove",{body:{fen,source:shown.source}});
     setPosition(fen,result.entries);
     status(result.removed?`${ENGINES[shown.source]} move removed (it stays in the history and can be restored)`:"There is no saved move for this position");
+  } catch(e) { status(e.message); }
+};
+// Removes every unverified entry saved by the visitor who saved the one on screen.
+document.querySelector("#purge").onclick=async()=>{
+  const fen=currentFen(), shown=savedMatch(fen);
+  if(!shown || shown.imported || shown.verified) { status("Only an unverified entry saved without a key can be traced to its visitor"); return; }
+  if(!confirm("Remove every unverified entry this visitor saved? Where they replaced someone else's entry, that one is put back. What is removed stays in the history.")) return;
+  try {
+    const result=await api("/api/purge",{body:{fen,source:shown.source}});
+    reloadPositions();
+    status(`${result.purged} unverified ${result.purged===1?"entry":"entries"} from this visitor removed, `
+      +`${result.restored} earlier ${result.restored===1?"entry":"entries"} put back (what was removed stays in the history)`);
   } catch(e) { status(e.message); }
 };
 

@@ -55,7 +55,12 @@ There are no accounts. Trust comes from where an entry came from:
 Among the entries of one engine, a verified one is never replaced by an
 unverified one, and within the same tier only a strictly deeper analysis
 replaces the stored one. Whatever gets replaced or removed is copied to a
-history table first and can be restored from the admin tools.
+history table first and can be restored from the admin tools, with two
+exceptions that keep the history small: an entry replaced by a deeper one
+from the same saver (the same key, or the same network without a key, as live
+analysis does every 30 seconds) is not kept, since it is never the one to go
+back to; and per position and engine only the newest 50 unverified entries
+are kept (verified ones always are).
 
 ### Depth
 
@@ -361,6 +366,14 @@ Log in with the admin token, then open **Position and engine settings**:
 - **Remove saved move**: removes the entry that is on screen for the position
   on the board (one engine's; the other engine's stays). It stays in the
   history.
+- **Remove all from this visitor**: when the entry on screen is unverified
+  (saved without a key), removes every unverified entry the same visitor
+  saved, for when someone fills the database with bad moves. Entries saved
+  without a key carry a salted hash of the visitor's network (an IPv6 /64
+  counts as one network), never the address itself. Where that visitor had
+  replaced someone else's entry, that entry is put back (the newest one from
+  someone else in the history, unless the admin had removed it or restored
+  another over it). What is removed stays in the history.
 - **History of this position**: every replaced or removed entry, each with a
   **Restore** button.
 - **Contributor keys**: create a key for someone you trust; it is shown once.
@@ -381,12 +394,28 @@ of those may come from live analysis, which saves by itself; the rest stay
 for analyses run with the button). At about three rows written per save,
 600 an hour lets one visitor without a key use some 15% of the free plan's
 daily row writes in eight busy hours; lower it if many such visitors come.
+IPv6 visitors are counted per /64, the block one connection normally has.
+
+Twenty wrong keys in an hour from one network stop keys from being checked
+for that network until the hour is over (the right one included), so the
+admin token cannot be guessed at speed. Use a long random admin token all the
+same.
 
 ## Free plan limits to know about
 
 - 100,000 API requests per day; static files do not count.
 - D1: 5 million rows read and 100,000 rows written per day, 500 MB per
   database. Showing a position reads its own rows only (three at most).
+  Looking up the positions one move away, or the moves before a loaded
+  position, reads up to three rows for each of them. Such lookups are counted
+  per visitor's network by the rate limiting binding `HEAVY_READS` in
+  `wrangler.jsonc` (one unit per 40 positions, 120 units a minute); past it,
+  only the position itself is answered for a while, and the page carries on
+  with one position per request. The count is kept per Cloudflare location
+  and is approximate. Remove the `ratelimits` block to turn it off.
+- The page only fetches a position where the board stops: scrolling quickly
+  through a game sends a request for the first and last position, not for
+  each one on the way.
 - When a daily limit is hit, the API returns errors until 00:00 UTC.
 
 ## Development

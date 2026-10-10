@@ -123,14 +123,16 @@ const at = async (env, fen) => (await call(env, "GET", "/api/position?fen=" + en
   // Depth 21 is the first that is kept, also from a visitor without a key.
   let r = await call(env, "POST", "/api/saved", { body: sf(START, 21, ["e2e4"]) });
   eq([r.status, r.data.saved, r.data.entry.depth, r.data.entry.verified], [200, true, 21, false]);
-  r = await call(env, "POST", "/api/saved", { body: sf(START, 39, ["d2d4", "d7d5"]) });
+  const second = "198.51.100.40";
+  r = await call(env, "POST", "/api/saved", { body: sf(START, 39, ["d2d4", "d7d5"]), ip: second });
   eq([r.data.saved, r.data.entry.depth, r.data.entry.move_uci], [true, 39, "d2d4"], "a deeper one replaces it");
   r = await call(env, "POST", "/api/saved", { body: sf(START, 25, ["c2c4"]) });
   eq([r.data.saved, r.data.entry.depth], [false, 39], "a shallower one does not");
   ok(/depth 39 is already saved/.test(r.data.reason), r.data.reason);
-  r = await call(env, "POST", "/api/saved", { body: sf(START, 46, ["g1f3"]) });
+  r = await call(env, "POST", "/api/saved", { body: sf(START, 46, ["g1f3"]), ip: second });
   eq([r.data.saved, r.data.entry.depth], [true, 46]);
-  eq(history(env).map(h => [h.depth, h.reason]), [[21, "replaced"], [39, "replaced"]], "the shallow ones are in the history");
+  eq(history(env).map(h => [h.depth, h.reason]), [[21, "replaced"]],
+    "what another visitor replaced is in the history; what a visitor replaced of their own is not");
   // The limit follows the setting.
   const lower = makeEnv({ MIN_DEPTH: "12" });
   eq((await call(lower, "POST", "/api/saved", { body: sf(START, 11) })).status, 400);
@@ -152,8 +154,8 @@ const at = async (env, fen) => (await call(env, "GET", "/api/position?fen=" + en
   r = await call(env, "POST", "/api/saved", { body: sf(START, 46, ["d2d4"]) });
   eq([r.status, r.data.saved, r.data.entry.move_uci], [200, false, "e2e4"]);
   ok(/depth 46 is already saved/.test(r.data.reason), r.data.reason);
-  // deeper anonymous -> replaces, old one archived
-  r = await call(env, "POST", "/api/saved", { body: sf(START, 47, ["d2d4", "d7d5"]) });
+  // deeper, from another visitor without a key -> replaces, old one archived
+  r = await call(env, "POST", "/api/saved", { body: sf(START, 47, ["d2d4", "d7d5"]), ip: "198.51.100.41" });
   eq([r.data.saved, r.data.entry.move_uci, r.data.entry.depth], [true, "d2d4", 47]);
   eq(history(env).map(h => [h.depth, h.verified, h.reason]), [[46, 0, "replaced"]]);
   // the en passant square written "always" is the same position
@@ -291,7 +293,9 @@ const at = async (env, fen) => (await call(env, "GET", "/api/position?fen=" + en
   eq([both.lichess.depth, both.lichess.verified, both.lichess.move_uci, both.lichess.knodes], [55, true, "d2d4", 5]);
   eq(history(env), [], "neither replaced the other");
   // The verified Lichess entry does not stop a Stockfish analysis without a key ...
-  r = await call(env, "POST", "/api/saved", { body: sf(START, 91, ["g1f3"]) });
+  // (from another visitor: one's own deeper analysis would leave no history)
+  const other = "198.51.100.42";
+  r = await call(env, "POST", "/api/saved", { body: sf(START, 91, ["g1f3"]), ip: other });
   eq([r.data.saved, r.data.entry.depth, r.data.entry.source], [true, 91, "stockfish"]);
   // ... and within one engine the rules are as before.
   r = await call(env, "POST", "/api/saved", { body: sf(START, 56), key: ADMIN });
@@ -301,7 +305,7 @@ const at = async (env, fen) => (await call(env, "GET", "/api/position?fen=" + en
   eq([r.data.saved, r.data.entry.depth, r.data.entry.move_uci], [false, 55, "d2d4"]);
   ok(/A Lichess evaluation at depth 55 is already saved/.test(r.data.reason), r.data.reason);
   lichess = lichessJson({ depth: 60, knodes: 7, pvs: [{ moves: "c2c4", cp: 20 }] });
-  r = await call(env, "POST", "/api/saved", { body: { fen: START, source: "lichess" } });
+  r = await call(env, "POST", "/api/saved", { body: { fen: START, source: "lichess" }, ip: other });
   eq([r.data.saved, r.data.entry.depth, r.data.entry.move_uci], [true, 60, "c2c4"]);
   both = await at(env, START);
   eq([both.stockfish.depth, both.lichess.depth], [56, 60]);
@@ -482,6 +486,141 @@ const at = async (env, fen) => (await call(env, "GET", "/api/position?fen=" + en
   eq([r.data.stored, (await list(env)).find(e => e.fen === shallow).depth], [1, 15]);
   eq((await call(env, "POST", "/api/import", { body: { entries: Array(101).fill(entries[0]) }, key: ADMIN })).status, 400);
   eq((await call(env, "POST", "/api/import", { body: { entries: [] }, key: ADMIN })).status, 400);
+}
+
+// --- IPv6 visitors are counted per /64 ------------------------------------
+{
+  const env = makeEnv({ ANON_WRITES_PER_HOUR: "2" });
+  const save = (ip, depth) => call(env, "POST", "/api/saved", { body: sf(START, depth), ip });
+  eq((await save("2001:db8:1:2::1", 30)).status, 200);
+  eq((await save("2001:0db8:0001:0002:ffff:0:0:9", 31)).status, 200, "same /64, written another way");
+  eq((await save("2001:db8:1:2:abcd::5", 32)).data.code, "WRITE_RATE_LIMIT", "a new address in the same /64 has no fresh limit");
+  eq((await save("2001:db8:1:3::1", 33)).status, 200, "the next /64 is another visitor");
+  eq((await save("::ffff:192.0.2.7", 34)).status, 200, "an IPv4-mapped address counts as its IPv4 address");
+}
+
+// --- wrong keys are limited per network -----------------------------------
+{
+  const env = makeEnv();
+  for (let i = 0; i < 20; i++) eq((await call(env, "GET", "/api/session", { key: `guess-${i}` })).data.role, null);
+  let r = await call(env, "GET", "/api/session", { key: "guess-20" });
+  eq([r.status, r.data.code], [429, "KEY_RATE_LIMIT"], "the 21st wrong key in an hour is refused");
+  r = await call(env, "GET", "/api/session", { key: ADMIN });
+  eq(r.status, 429, "from that network no key is checked any more, the right one included");
+  eq((await call(env, "GET", "/api/session", { key: ADMIN, ip: "198.51.100.9" })).data.role, "admin", "other networks are unaffected");
+  eq((await call(env, "GET", "/api/session")).status, 200, "visitors without a key are unaffected");
+  for (let i = 0; i < 25; i++) eq((await call(env, "GET", "/api/session", { key: ADMIN, ip: "198.51.100.10" })).data.role, "admin");
+  ok(true, "a right key is never counted as a wrong one");
+}
+
+// --- the admin takes back everything one visitor saved -------------------
+{
+  const env = makeEnv();
+  const vandal = "203.0.113.66", other = "198.51.100.20";
+  eq((await call(env, "POST", "/api/saved", { body: sf(START, 245, ["a2a3"]), ip: vandal })).data.saved, true);
+  eq((await call(env, "POST", "/api/saved", { body: sf(AFTER_E4, 245, ["g8h6"]), ip: vandal })).data.saved, true);
+  eq((await call(env, "POST", "/api/saved", { body: sf(ITALIAN, 40, ["e1g1"]), ip: other })).data.saved, true);
+  ok(env.DB.db.prepare("SELECT saved_by FROM saved_positions").all().every(row => /^anon:[0-9a-f]{32}$/.test(row.saved_by)),
+    "entries without a key carry the visitor's hashed network");
+  ok(!JSON.stringify(env.DB.db.prepare("SELECT * FROM saved_positions").all()).includes(vandal), "raw IPs are not stored");
+  const target = { fen: START, source: "stockfish" };
+  eq((await call(env, "POST", "/api/purge", { body: target })).status, 403, "admin only");
+  let r = await call(env, "POST", "/api/purge", { body: target, key: ADMIN });
+  eq([r.status, r.data.purged, r.data.entries], [200, 2, {}], "both of the visitor's entries are gone");
+  eq((await list(env)).map(e => e.fen), [ITALIAN], "another visitor's entry stays");
+  eq(history(env).map(h => [h.depth, h.reason]), [[245, "purged"], [245, "purged"]], "and they are in the history");
+  eq((await call(env, "POST", "/api/purge", { body: target, key: ADMIN })).status, 404, "nothing left to trace");
+  eq((await call(env, "POST", "/api/saved", { body: sf(START, 46), key: ADMIN })).data.saved, true);
+  r = await call(env, "POST", "/api/purge", { body: target, key: ADMIN });
+  eq(r.status, 400, "a verified entry is not traced to a visitor");
+  eq((await call(env, "POST", "/api/purge", { body: { fen: START }, key: ADMIN })).status, 400, "the engine must be named");
+}
+
+// --- a purge puts back what the visitor replaced ---------------------------
+{
+  const env = makeEnv();
+  const [honest, vandal, second] = ["198.51.100.50", "203.0.113.70", "203.0.113.71"];
+  const save = (fen, depth, pv, ip) => call(env, "POST", "/api/saved", { body: sf(fen, depth, pv), ip });
+  const purge = fen => call(env, "POST", "/api/purge", { body: { fen, source: "stockfish" }, key: ADMIN });
+  // START: an honest analysis, replaced by the vandal (who then goes deeper still).
+  await save(START, 40, ["d2d4"], honest);
+  await save(START, 200, ["a2a3"], vandal);
+  await save(START, 245, ["a2a3"], vandal);
+  // AFTER_E4: nothing was there before the vandal.
+  await save(AFTER_E4, 245, ["g8h6"], vandal);
+  // ITALIAN: the admin had removed the entry before the vandal saved one.
+  await save(ITALIAN, 30, ["e1g1"], honest);
+  await call(env, "POST", "/api/remove", { body: { fen: ITALIAN, source: "stockfish" }, key: ADMIN });
+  await save(ITALIAN, 245, ["b1a3"], vandal);
+  let r = await purge(START);
+  eq([r.data.purged, r.data.restored], [3, 1]);
+  eq([r.data.entries.stockfish.depth, r.data.entries.stockfish.move_uci, r.data.entries.stockfish.verified], [40, "d2d4", false],
+    "the honest analysis the vandal replaced is back");
+  eq(await at(env, AFTER_E4), {}, "where there was nothing, there is nothing");
+  eq(await at(env, ITALIAN), {}, "what the admin removed stays removed");
+
+  // Two vandals in turn, purged one after the other: the honest one comes back in the end.
+  await save(START, 210, ["h2h3"], second);     // replaces the honest one again
+  await save(START, 245, ["a2a4"], vandal);     // and the vandal replaces the second
+  r = await purge(START);
+  eq([r.data.restored, r.data.entries.stockfish.move_uci], [1, "h2h3"], "the entry before the vandal's is the second one's");
+  r = await purge(START);
+  eq([r.data.purged, r.data.restored, r.data.entries.stockfish.move_uci], [1, 1, "d2d4"],
+    "purging that one too brings back the honest one, past the earlier purge");
+}
+
+// --- the history keeps the newest 50 unverified entries per position ------
+{
+  const env = makeEnv();
+  const contributor = (await call(env, "POST", "/api/keys", { body: { label: "Kim" }, key: ADMIN })).data.key;
+  // Two verified entries in the history first ...
+  await call(env, "POST", "/api/saved", { body: sf(START, 22), key: contributor });
+  await call(env, "POST", "/api/saved", { body: sf(START, 23), key: ADMIN });
+  await call(env, "POST", "/api/remove", { body: { fen: START, source: "stockfish" }, key: ADMIN });
+  // ... then 60 visitors in turn, each deeper than the last.
+  for (let i = 0; i < 60; i++) {
+    eq((await call(env, "POST", "/api/saved", { body: sf(START, 30 + i), ip: `192.0.2.${i + 1}` })).data.saved, true);
+  }
+  const kept = env.DB.db.prepare("SELECT depth, verified FROM saved_history WHERE source = 'stockfish' ORDER BY id").all();
+  const unverified = kept.filter(h => h.verified === 0).map(h => h.depth);
+  eq([unverified.length, unverified[0], unverified.at(-1)], [50, 39, 88], "the newest 50 unverified ones are kept");
+  eq(kept.filter(h => h.verified === 1).map(h => h.depth), [22, 23], "verified ones are always kept");
+  // The import does not trim, so a backup is restored whole.
+  eq((await call(env, "POST", "/api/import", { body: { entries: [{ fen: START, pv: ["e2e4"], evaluation: "+0.30", depth: 200, source: "stockfish", verified: false }] }, key: ADMIN })).data.stored, 1);
+}
+
+// --- looking up many positions at once is limited per network ------------
+{
+  const calls = [];
+  let allowed = 3;
+  const env = makeEnv({ HEAVY_READS: { limit: async ({ key }) => { calls.push(key); return { success: allowed-- > 0 }; } } });
+  await call(env, "POST", "/api/saved", { body: sf(START, 30), key: ADMIN });
+  const position = query => call(env, "GET", `/api/position?fen=${encodeURIComponent(START)}${query}`);
+  eq((await position("")).data.entries.stockfish.depth, 30);
+  eq(calls.length, 0, "a single position is not counted");
+  let r = await position("&next=1");
+  eq([Object.keys(r.data.next).length, r.data.limited], [20, undefined]);
+  eq(calls.length, 1, "21 positions are one unit");
+  ok(/^[0-9a-f]{32}$/.test(calls[0]), "counted by the hashed network, not the address");
+  const MANY = "R6R/3Q4/1Q4Q1/4Q3/2Q4Q/Q4Q2/pp1Q4/kBNN1KB1 w - - 0 1";
+  r = await call(env, "GET", `/api/position?next=1&fen=${encodeURIComponent(MANY)}`);
+  eq([r.data.limited, r.data.next, r.data.entries], [true, undefined, {}], "past the limit only the position itself is answered");
+  eq(calls.length, 4, "219 positions are six units; it stops at the first one refused (the third)");
+  r = await position(`&also=${encodeURIComponent(AFTER_E4)}`);
+  eq([r.status, r.data.limited, r.data.also, r.data.entries.stockfish.depth], [200, true, undefined, 30]);
+  // A binding that fails does not stop anyone.
+  const broken = makeEnv({ HEAVY_READS: { limit: async () => { throw new Error("unavailable"); } } });
+  const realError = console.error;
+  console.error = () => {};
+  r = await call(broken, "GET", `/api/position?next=1&fen=${encodeURIComponent(START)}`);
+  console.error = realError;
+  eq([Object.keys(r.data.next).length, r.data.limited], [20, undefined]);
+}
+
+// --- API answers are never sniffed as another type -------------------------
+{
+  const r = await call(makeEnv(), "GET", "/api/session");
+  eq(r.headers.get("X-Content-Type-Options"), "nosniff");
 }
 
 // --- configuration problems are reported, not thrown --------------------

@@ -171,7 +171,7 @@
       <div id="engine-status" class="status"></div>
       <label for="depth" id="depth-label">Stockfish analysis depth</label>
       <input id="depth" type="number" min="21" max="245" value="46" autocomplete="off">
-      <div class="row"><button id="remove" style="display:none">Remove saved move</button></div>
+      <div class="row"><button id="remove" style="display:none">Remove saved move</button><button id="purge" style="display:none" title="Removes every unverified entry saved by the visitor who saved this one (without a key), and puts back the entries they replaced. What is removed stays in the history.">Remove all from this visitor</button></div>
       <div id="admin-tools" style="display:none">
         <label>Admin tools</label>
         <div class="row"><button id="import-button">Import saved_positions.json or backup</button><button id="export-button">Download backup</button></div>

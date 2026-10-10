@@ -346,7 +346,35 @@ def write_saved(items: list[dict]) -> None:
     temporary.replace(STORE)
 
 
+HOST, PORT = "127.0.0.1", 8765
+# Only this page may use the API. Any other web page open in the browser can
+# also send requests to 127.0.0.1, and one that makes its own domain resolve
+# to 127.0.0.1 ("DNS rebinding") arrives with that domain in Host.
+ALLOWED_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
+ALLOWED_ORIGINS = {f"http://{host}" for host in ALLOWED_HOSTS}
+MAX_BODY_BYTES = 1024 * 1024
+
+
 class Handler(BaseHTTPRequestHandler):
+    def _request_allowed(self, post: bool) -> bool:
+        """Refuse requests that did not come from this app's own page."""
+        if self.headers.get("Host", "") not in ALLOWED_HOSTS:
+            self._json(403, {"error": "Unexpected Host header"})
+            return False
+        if not post:
+            return True
+        origin = self.headers.get("Origin")
+        if origin is not None and origin not in ALLOWED_ORIGINS:
+            self._json(403, {"error": "Cross-site requests are not allowed"})
+            return False
+        # A cross-site page can only send JSON after a CORS preflight, which
+        # this server never approves; plain form or text bodies are refused.
+        has_body = self.headers.get("Content-Length", "0").strip() not in ("", "0")
+        if has_body and not self.headers.get("Content-Type", "").lower().startswith("application/json"):
+            self._json(415, {"error": "Send JSON (Content-Type: application/json)"})
+            return False
+        return True
+
     def _is_admin(self) -> bool:
         token = self.headers.get("X-Admin-Token", "")
         return bool(token) and hmac.compare_digest(token, ADMIN_TOKEN)
@@ -374,9 +402,16 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         if length == 0:
             return {}
-        return json.loads(self.rfile.read(length))
+        if length < 0 or length > MAX_BODY_BYTES:
+            raise ValueError("Request is too large")
+        body = json.loads(self.rfile.read(length))
+        if not isinstance(body, dict):
+            raise ValueError("Request body must be a JSON object")
+        return body
 
     def do_GET(self) -> None:
+        if not self._request_allowed(post=False):
+            return
         path = urlparse(self.path).path
         if path == "/":
             data = INDEX.read_bytes()
@@ -421,6 +456,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "Not found"})
 
     def do_POST(self) -> None:
+        if not self._request_allowed(post=True):
+            return
         path = urlparse(self.path).path
         try:
             payload = self._body()
@@ -868,8 +905,8 @@ def opening_index() -> dict[str, dict[str, str]]:
 
 
 def main() -> None:
-    server = ThreadingHTTPServer(("127.0.0.1", 8765), Handler)
-    print("My Chess DB: http://127.0.0.1:8765")
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f"My Chess DB: http://{HOST}:{PORT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -28,6 +28,20 @@
     }
   ],
 
+  // Lookups of many positions at once (the positions one move away, the
+  // moves before a loaded position) per visitor's network: one unit per 40
+  // positions, 120 units a minute. Past it, only the position itself is
+  // answered. Counted per Cloudflare location and roughly; see
+  // HEAVY_READS in worker/index.js. Without this block nothing is limited.
+  // namespace_id only has to be unique within the Cloudflare account.
+  "ratelimits": [
+    {
+      "name": "HEAVY_READS",
+      "namespace_id": "26101",
+      "simple": { "limit": 120, "period": 60 }
+    }
+  ],
+
   // Optional settings (uncomment to change the defaults):
   // "vars": {
   //   "MIN_DEPTH": "21",             // nothing shallower is saved or can be chosen

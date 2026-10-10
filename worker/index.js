@@ -21,6 +21,9 @@
 //                          with the analyse button.
 //   LICHESS_API_BASE       optional, default https://lichess.org (tests point
 //                          this at a local stand-in).
+//   HEAVY_READS            optional rate limiting binding (wrangler.jsonc)
+//                          for lookups of many positions at once; see
+//                          heavyReadAllowed.
 //
 // Results are kept per engine ("source"): a position can have a Stockfish 19
 // entry and a Lichess entry, and neither replaces the other. The page shows
@@ -37,6 +40,9 @@
 //   * Nothing below MIN_DEPTH is saved. From there on, an analysis stopped
 //     early is saved as far as it got, and a deeper one replaces it later.
 //   * Whatever is replaced or removed is copied to saved_history first.
+//   * Entries saved without a key carry the visitor's hashed network
+//     ("anon:<id>"), so the admin can take back all of one visitor's
+//     unverified entries at once (/api/purge).
 //
 // Besides what visitors save, the lichess_db table can hold evaluations
 // taken over in bulk from the Lichess evaluation database
@@ -54,12 +60,30 @@ const SOURCES = ["stockfish", "lichess"];
 const COLUMNS = "position_key, fen, move_uci, pv, evaluation, depth, knodes, source, verified, saved_by, saved_at";
 
 // Copies the stored row of the same engine to history when the incoming
-// entry is allowed to replace it. Binds: archived_at, reason, position_key,
-// source, force, verified, verified, depth.
+// entry is allowed to replace it. Not when it is the same saver's own entry
+// that a deeper one of theirs replaces (live analysis does that every 30
+// seconds): that one is worth nothing to restore, since either the deeper one
+// is better or, from someone who saves bad moves, everything of theirs goes
+// at once (handlePurge). Imports are not one saver, so they are always kept.
+// Binds: archived_at, reason, position_key, source, force, verified,
+// verified, depth, saved_by.
 const ARCHIVE_IF_REPLACEABLE = `
   INSERT INTO saved_history (${COLUMNS}, archived_at, reason)
   SELECT ${COLUMNS}, ?, ? FROM saved_positions
-  WHERE position_key = ? AND source = ? AND (? = 1 OR ? > verified OR (? = verified AND ? > depth))`;
+  WHERE position_key = ? AND source = ? AND (? = 1 OR ? > verified OR (? = verified AND ? > depth))
+    AND NOT (saved_by = ? AND saved_by <> 'import')`;
+
+// The history keeps at most this many unverified entries per position and
+// engine, the newest; verified ones are always kept. More than this only
+// comes from many visitors in turn saving ever deeper analyses of one
+// position, and the admin's list shows the newest 50 anyway.
+const HISTORY_PER_POSITION = 50;
+// Binds: position_key, source, position_key, source.
+const TRIM_HISTORY = `
+  DELETE FROM saved_history
+  WHERE position_key = ? AND source = ? AND verified = 0 AND id < (
+    SELECT id FROM saved_history WHERE position_key = ? AND source = ? AND verified = 0
+    ORDER BY id DESC LIMIT 1 OFFSET ${HISTORY_PER_POSITION - 1})`;
 
 // Inserts, or replaces under the same rule. Binds: the 11 columns, force.
 const UPSERT_IF_ALLOWED = `
@@ -84,7 +108,10 @@ class HttpError extends Error {
 function json(status, body, headers) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", ...headers },
+    headers: {
+      "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff", ...headers,
+    },
   });
 }
 
@@ -105,10 +132,55 @@ function adminConfigured(env) {
   return typeof env.ADMIN_TOKEN === "string" && env.ADMIN_TOKEN.length >= 16;
 }
 
+// The network a visitor writes from. An IPv6 user normally holds a whole /64
+// and can pick any address in it, so IPv6 addresses count per /64; otherwise
+// one visitor could get a fresh limit with every request.
+function visitorNetwork(ip) {
+  if (!ip.includes(":")) return ip;
+  const lower = ip.toLowerCase();
+  const last = lower.slice(lower.lastIndexOf(":") + 1);
+  if (last.includes(".")) return last;   // IPv4-mapped (::ffff:192.0.2.1)
+  const [head, tail] = lower.split("::");
+  const left = head ? head.split(":") : [];
+  const right = tail ? tail.split(":") : [];
+  const groups = tail === undefined ? left : [...left, ...Array(Math.max(0, 8 - left.length - right.length)).fill("0"), ...right];
+  return `${groups.slice(0, 4).map(group => group.replace(/^0+(?=.)/, "")).join(":")}::/64`;
+}
+
+// A salted hash of the visitor's network: the raw IP is never stored.
+async function visitorId(request, env) {
+  const network = visitorNetwork(request.headers.get("CF-Connecting-IP") || "unknown");
+  return (await sha256Hex(`${env.ADMIN_TOKEN || "mychessdb"}|${network}`)).slice(0, 32);
+}
+
+// Adds one to a visitor's counter for this hour and returns the new count.
+async function countThisHour(env, bucket, hour) {
+  return (await env.DB.prepare(
+    `INSERT INTO rate_limits (bucket, hour, count) VALUES (?, ?, 1)
+     ON CONFLICT(bucket) DO UPDATE SET count = count + 1 RETURNING count`,
+  ).bind(bucket, hour).first()).count;
+}
+
+// Wrong keys allowed per hour from one network before keys from it are no
+// longer checked at all, so the admin token cannot be guessed at speed.
+const BAD_KEYS_PER_HOUR = 20;
+
 /** Who is asking? { role: "admin" | "contributor" | null, ... } */
 async function identify(request, env) {
   const key = (request.headers.get("X-Key") || "").trim();
   if (!key) return { role: null, sentKey: false };
+  const hour = Math.floor(Date.now() / 3600000);
+  const badKeys = `${await visitorId(request, env)}:badkey:${hour}`;
+  const failures = await env.DB.prepare("SELECT count FROM rate_limits WHERE bucket = ?").bind(badKeys).first();
+  if (failures && failures.count >= BAD_KEYS_PER_HOUR) {
+    throw new HttpError(429, "Too many wrong keys from this network in the last hour. Try again later.", { code: "KEY_RATE_LIMIT" });
+  }
+  const who = await matchKey(env, key);
+  if (!who.role) await countThisHour(env, badKeys, hour);
+  return who;
+}
+
+async function matchKey(env, key) {
   if (key.length > 200) return { role: null, sentKey: true };
   const hash = await sha256Hex(key);
   // Comparing digests instead of the secrets keeps the comparison time
@@ -244,18 +316,14 @@ function parsePosition(fen) {
 // Counts a save attempt by a visitor without a key against the hourly
 // limits. Saves from the live analysis (`live`) are also counted on their
 // own and have a lower limit, so that live analysis cannot use up the hour
-// and leave nothing for an analysis that was run on purpose.
+// and leave nothing for an analysis that was run on purpose. Returns the
+// visitor's id, which the saved entry carries (see handlePurge).
 async function countAnonymousWrite(request, env, live) {
   const limit = intSetting(env.ANON_WRITES_PER_HOUR, 600);
   const liveLimit = Math.min(limit, intSetting(env.ANON_LIVE_WRITES_PER_HOUR, 500));
   const hour = Math.floor(Date.now() / 3600000);
-  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
-  // The address is salted and hashed; the raw IP is never stored.
-  const visitor = (await sha256Hex(`${env.ADMIN_TOKEN || "mychessdb"}|${ip}`)).slice(0, 32);
-  const count = async bucket => (await env.DB.prepare(
-    `INSERT INTO rate_limits (bucket, hour, count) VALUES (?, ?, 1)
-     ON CONFLICT(bucket) DO UPDATE SET count = count + 1 RETURNING count`,
-  ).bind(bucket, hour).first()).count;
+  const visitor = await visitorId(request, env);
+  const count = bucket => countThisHour(env, bucket, hour);
   if (live && await count(`${visitor}:live:${hour}`) > liveLimit) {
     throw new HttpError(429, `Live analysis has saved ${liveLimit} times from this network in the last hour, its share of the limit. `
       + "It goes on analysing without saving until the next hour; analyses run with the button can still be saved.",
@@ -269,6 +337,7 @@ async function countAnonymousWrite(request, env, live) {
     throw new HttpError(429, `Too many saves from this network in the last hour (limit ${limit}). Try again later.`,
       { code: "WRITE_RATE_LIMIT" });
   }
+  return visitor;
 }
 
 // ------------------------------------------------------------- Lichess -----
@@ -319,14 +388,23 @@ async function fetchLichessEval(env, fen) {
 
 // --------------------------------------------------------------- saving ----
 
-async function storeEntry(env, entry, force) {
-  const now = new Date().toISOString();
-  const results = await env.DB.batch([
+// The two statements that store an entry: archive what it replaces, then
+// insert or replace. The second one returns a row when the entry was stored.
+function storeStatements(env, entry, force, now) {
+  return [
     env.DB.prepare(ARCHIVE_IF_REPLACEABLE).bind(
-      now, "replaced", entry.position_key, entry.source, force ? 1 : 0, entry.verified, entry.verified, entry.depth),
+      now, "replaced", entry.position_key, entry.source, force ? 1 : 0, entry.verified, entry.verified, entry.depth,
+      entry.saved_by),
     env.DB.prepare(UPSERT_IF_ALLOWED).bind(
       entry.position_key, entry.fen, entry.move_uci, entry.pv, entry.evaluation, entry.depth,
       entry.knodes, entry.source, entry.verified, entry.saved_by, entry.saved_at, force ? 1 : 0),
+  ];
+}
+
+async function storeEntry(env, entry, force) {
+  const results = await env.DB.batch([
+    ...storeStatements(env, entry, force, new Date().toISOString()),
+    env.DB.prepare(TRIM_HISTORY).bind(entry.position_key, entry.source, entry.position_key, entry.source),
   ]);
   return (results[1].results || []).length === 1;
 }
@@ -335,14 +413,16 @@ async function handleSave(request, env) {
   const body = await readJson(request, 16 * 1024);
   const who = await identify(request, env);
   if (who.sentKey && !who.role) throw new HttpError(401, "That key is not recognised. Log out or enter a valid key.");
-  if (!who.role) await countAnonymousWrite(request, env, body.live === true);
+  const visitor = who.role ? null : await countAnonymousWrite(request, env, body.live === true);
 
   const { position, fen, key } = parsePosition(body.fen);
   if (!legalMoves(position).length) throw new HttpError(400, "The game is already over in this position.");
 
   const entry = {
     position_key: key, fen, knodes: null,
-    saved_by: who.savedBy || "anon",
+    // Entries without a key carry the visitor's hashed network, so that the
+    // admin can take back everything one visitor saved (handlePurge).
+    saved_by: who.savedBy || `anon:${visitor}`,
     saved_at: new Date().toISOString(),
   };
 
@@ -410,7 +490,28 @@ async function handleSave(request, env) {
 // moves leading to a position the page loads, so that going back through them
 // shows their results at once. One that is not a position is left out.
 const MAX_ALSO_POSITIONS = 100;
-async function handlePosition(env, url) {
+
+// Looking up many positions at once (next, also) reads many rows, and the
+// free plan allows 5 million rows read a day. The optional rate limiting
+// binding HEAVY_READS (wrangler.jsonc) counts such lookups per visitor's
+// network, one unit per POSITIONS_PER_UNIT positions. Past the limit only the
+// position itself is answered, with `limited`, so the page goes on working.
+// Without the binding, or if it fails, nothing is limited.
+const POSITIONS_PER_UNIT = 40;
+async function heavyReadAllowed(request, env, positions) {
+  if (!env.HEAVY_READS) return true;
+  try {
+    const key = await visitorId(request, env);
+    for (let unit = 0; unit < Math.ceil(positions / POSITIONS_PER_UNIT); unit++) {
+      if (!(await env.HEAVY_READS.limit({ key })).success) return false;
+    }
+  } catch (error) {
+    console.error(error);
+  }
+  return true;
+}
+
+async function handlePosition(request, env, url) {
   const { position, key } = parsePosition(url.searchParams.get("fen"));
   const withNext = url.searchParams.get("next") === "1";
   const alsoKeys = [];
@@ -419,6 +520,9 @@ async function handlePosition(env, url) {
   }
   if (!withNext && !alsoKeys.length) return json(200, { entries: await positionEntries(env, key) });
   const nextKeys = withNext ? legalMoves(position).map(move => positionKey(toFen(makeMove(position, move)))) : [];
+  if (!await heavyReadAllowed(request, env, 1 + nextKeys.length + alsoKeys.length)) {
+    return json(200, { entries: await positionEntries(env, key), limited: true });
+  }
   const found = await entriesFor(env, [key, ...nextKeys, ...alsoKeys]);
   const answer = { entries: found.get(key) };
   if (withNext) {
@@ -446,6 +550,52 @@ async function handleRemove(request, env) {
     env.DB.prepare("DELETE FROM saved_positions WHERE position_key = ? AND source = ? RETURNING position_key").bind(key, body.source),
   ]);
   return json(200, { removed: (results[1].results || []).length === 1, entries: await positionEntries(env, key) });
+}
+
+// Puts back, for every position and engine where the purge just removed the
+// visitor's entry, the entry that visitor replaced: the newest one in the
+// history from someone else, leaving out what earlier purges took back. It is
+// put back only if it was replaced; if the admin removed it, or restored
+// another over it, the place stays empty. Binds: saved_by, archived_at.
+const RESTORE_AFTER_PURGE = `
+  INSERT OR IGNORE INTO saved_positions (${COLUMNS})
+  SELECT ${COLUMNS} FROM saved_history WHERE reason = 'replaced' AND id IN (
+    SELECT MAX(h.id) FROM saved_history h
+    JOIN (SELECT DISTINCT position_key, source FROM saved_history
+          WHERE saved_by = ?1 AND reason = 'purged' AND archived_at = ?2) p
+      ON h.position_key = p.position_key AND h.source = p.source
+    WHERE h.saved_by <> ?1 AND h.reason <> 'purged'
+    GROUP BY h.position_key, h.source)
+  RETURNING position_key`;
+
+// Removes every unverified entry saved by the same visitor (without a key) as
+// the entry named by fen and source, for when someone fills the database with
+// bad moves, and puts back what they replaced. Everything removed stays in
+// the history.
+async function handlePurge(request, env) {
+  await requireAdmin(request, env);
+  const body = await readJson(request, 4096);
+  if (!SOURCES.includes(body.source)) throw new HttpError(400, "source must be \"stockfish\" or \"lichess\"");
+  const key = positionKey(String(body.fen || ""));
+  const row = await env.DB.prepare("SELECT saved_by, verified FROM saved_positions WHERE position_key = ? AND source = ?")
+    .bind(key, body.source).first();
+  if (!row) throw new HttpError(404, "There is no saved entry for this position.");
+  if (row.verified !== 0 || !row.saved_by.startsWith("anon:")) {
+    throw new HttpError(400, "Only unverified entries saved without a key can be removed by visitor.");
+  }
+  const now = new Date().toISOString();
+  const results = await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO saved_history (${COLUMNS}, archived_at, reason)
+       SELECT ${COLUMNS}, ?, 'purged' FROM saved_positions WHERE saved_by = ? AND verified = 0`).bind(now, row.saved_by),
+    env.DB.prepare("DELETE FROM saved_positions WHERE saved_by = ? AND verified = 0 RETURNING position_key").bind(row.saved_by),
+    env.DB.prepare(RESTORE_AFTER_PURGE).bind(row.saved_by, now),
+  ]);
+  return json(200, {
+    purged: (results[1].results || []).length,
+    restored: (results[2].results || []).length,
+    entries: await positionEntries(env, key),
+  });
 }
 
 async function handleHistory(request, env, url) {
@@ -568,13 +718,7 @@ async function handleImport(request, env) {
       invalid.push({ index, fen: typeof raw?.fen === "string" ? raw.fen.slice(0, 100) : null, error: error.message });
       return;
     }
-    statements.push(
-      env.DB.prepare(ARCHIVE_IF_REPLACEABLE).bind(
-        now, "replaced", entry.position_key, entry.source, force ? 1 : 0, entry.verified, entry.verified, entry.depth),
-      env.DB.prepare(UPSERT_IF_ALLOWED).bind(
-        entry.position_key, entry.fen, entry.move_uci, entry.pv, entry.evaluation, entry.depth,
-        entry.knodes, entry.source, entry.verified, entry.saved_by, entry.saved_at, force ? 1 : 0),
-    );
+    statements.push(...storeStatements(env, entry, force, now));
   });
   let stored = 0;
   if (statements.length) {
@@ -625,9 +769,10 @@ async function route(request, env) {
       min_depth: minDepth(env), full_depth: fullDepth(env), admin_configured: adminConfigured(env),
     });
   }
-  if (path === "/api/position" && method === "GET") return handlePosition(env, url);
+  if (path === "/api/position" && method === "GET") return handlePosition(request, env, url);
   if (path === "/api/saved" && method === "POST") return handleSave(request, env);
   if (path === "/api/remove" && method === "POST") return handleRemove(request, env);
+  if (path === "/api/purge" && method === "POST") return handlePurge(request, env);
   if (path === "/api/history" && method === "GET") return handleHistory(request, env, url);
   if (path === "/api/restore" && method === "POST") return handleRestore(request, env);
   if (path === "/api/keys") return handleKeys(request, env);
