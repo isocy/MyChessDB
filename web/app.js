@@ -10,6 +10,15 @@ import { BrowserEngine, browserEngineSupported, ENGINE_SIZE_MB } from "./browser
 
 const BRIDGE_URL = "http://127.0.0.1:8765";
 const BRIDGE_MIN_VERSION = "1.0.6";
+// Phones and tablets cannot run the engine bridge, so on them it is neither
+// offered nor looked for (looking would ask for local network access for
+// nothing). iPads say they are Macs, but Macs have no touch screen.
+const MOBILE = !!navigator.userAgentData?.mobile || navigator.userAgentData?.platform==="Android"
+  || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+  || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints>1);
+document.documentElement.classList.toggle("mobile",MOBILE);
+const MOBILE_DEPTH_NOTE="On a phone or tablet, Stockfish 19 runs as live analysis in the browser engine (below the analyse button). "
+  +"Analysing to a chosen depth needs the engine bridge on a computer.";
 
 const symbols = {K:"♔",Q:"♕",R:"♖",B:"♗",N:"♘",P:"♙",k:"♚",q:"♛",r:"♜",b:"♝",n:"♞",p:"♟"};
 const boardEl = document.querySelector("#board"), annotationLayer = document.querySelector("#annotation-layer"), fenEl = document.querySelector("#fen");
@@ -454,6 +463,9 @@ function createDragPreview(piece) {
   const preview=document.createElement("img");
   preview.className="drag-preview";
   preview.src=pieceImageUrl(piece);
+  // As large as a piece on the board, whose size follows the screen.
+  const square=boardEl.firstElementChild?.getBoundingClientRect().width;
+  if(square) preview.style.width=preview.style.height=`${square*62/70}px`;
   document.body.appendChild(preview);
   return preview;
 }
@@ -1160,6 +1172,7 @@ const INSTALL_BUSY=["checking","downloading","unpacking","verifying"];
 async function bridge(path, options={}) {
   let response;
   try {
+    if(MOBILE) throw Error("no engine bridge on a phone or tablet");
     response=await fetch(BRIDGE_URL+path,{
       method:options.method||(options.body!==undefined?"POST":"GET"),
       headers:options.body!==undefined?{"Content-Type":"application/json"}:{},
@@ -1307,6 +1320,7 @@ document.querySelector("#engine").addEventListener("change",async()=>{
 });
 // Makes sure Stockfish can run here; explains what to do when it cannot.
 async function requireEngine() {
+  if(MOBILE) throw Error(MOBILE_DEPTH_NOTE);
   if(!await checkBridge()) {
     showBridgeSetup(true);
     throw Error("Stockfish runs on your own computer through the engine bridge, which is not running. See \"Engine bridge\" below."
@@ -1445,14 +1459,19 @@ function renderLiveToggle() {
   const button=document.querySelector("#live-toggle");
   button.setAttribute("aria-pressed",String(liveState.enabled));
   button.classList.toggle("unavailable",!liveAvailable() || state.view==="lichess");
-  button.textContent=liveState.enabled?"Live analysis: on":"Live analysis: off";
+  // "Live analysis: on", or "Live: on" above a small board (see .tool-short).
+  const full=document.createElement("span"), short=document.createElement("span");
+  full.className="tool-full"; full.textContent="Live analysis";
+  short.className="tool-short"; short.textContent="Live";
+  button.replaceChildren(full,short,`: ${liveState.enabled?"on":"off"}`);
   let note;
   if(!liveState.enabled) note="Live analysis is off. Click to analyse each position while it is on the board.";
   else if(state.view==="lichess") note="Live analysis is not used in the Lichess view.";
   else if(!liveAvailable()) {
     if(bridgeState.connected && !bridgeState.status?.live) note="This engine bridge is too old for live analysis: run the install command again (Update).";
     else if(bridgeState.connected && !bridgeState.status.engine.ready) note="Live analysis starts once Stockfish 19 is ready in the engine bridge.";
-    else note="Live analysis needs an engine: start the engine bridge, or turn on the browser engine (both below the analyse button).";
+    else note=MOBILE?"Live analysis needs the browser engine: turn it on below the analyse button."
+      :"Live analysis needs an engine: start the engine bridge, or turn on the browser engine (both below the analyse button).";
   }
   else if(liveState.backend==="browser" && browserEngine?.state.loading) note=`Live analysis is waiting for the browser engine: downloading Stockfish 19... ${browserEngine.state.loading.percent}%`;
   else if(liveState.failed) note=`Live analysis failed: ${liveState.failed}`;
@@ -1564,9 +1583,10 @@ function renderBrowserEngine() {
   if(!shown) return;
   button.textContent=browserEngineWanted?"Turn off":"Use browser engine";
   note.style.display=browserEngineWanted?"none":"";
+  if(MOBILE) document.querySelector("#browser-engine-intro").textContent="A 99 MB download the first time (the browser keeps it). It runs live analysis only, while this page is on the screen.";
   const engine=browserEngine;
   let message;
-  if(!browserEngineWanted) message="No engine bridge? Live analysis can run Stockfish 19 in this browser instead.";
+  if(!browserEngineWanted) message=MOBILE?"Live analysis can run Stockfish 19 in this browser.":"No engine bridge? Live analysis can run Stockfish 19 in this browser instead.";
   else if(bridgeLive()) message="Browser engine: not used while the engine bridge runs live analysis.";
   else if(engine?.state.loading) message=`Browser engine: downloading Stockfish 19... ${engine.state.loading.percent}% (${ENGINE_SIZE_MB} MB, once)`;
   else if(engine?.state.error) message=`Browser engine: ${engine.state.error}`;
@@ -1593,7 +1613,8 @@ document.querySelector("#live-toggle").onclick=()=>{
   applyShownAnalysis(currentFen());
   render();
   if(!liveState.enabled) status("Live analysis is off");
-  else if(!liveAvailable()) status("Live analysis is on. It needs an engine: the engine bridge, or the browser engine (below the analyse button).");
+  else if(!liveAvailable()) status(MOBILE?"Live analysis is on. It needs the browser engine (below the analyse button)."
+    :"Live analysis is on. It needs an engine: the engine bridge, or the browser engine (below the analyse button).");
   else status("Live analysis is on");
 };
 // A hidden tab does not keep the engine busy, and coming back starts it
@@ -1620,10 +1641,16 @@ function currentJob() {
 // The engines the analyse button runs in the chosen view: in Combined both,
 // Lichess's evaluation and Stockfish 19, at the same time.
 function viewSources() { return state.view==="combined"?["lichess","stockfish"]:[state.view]; }
+// What the analyse button runs: the view's engines, but not Stockfish on a
+// phone or tablet, where it would need the engine bridge.
+function buttonSources() { return viewSources().filter(source=>!MOBILE || source!=="stockfish"); }
 function setAnalyzeButtonLabel() {
-  const fen=currentFen();
+  const fen=currentFen(), button=document.querySelector("#analyze");
   const busy=viewSources().some(source=>{ const job=activeJobs.get(jobKey(source,fen)); return job&&!job.finished; });
-  document.querySelector("#analyze").textContent=busy?"Stop analysis":state.view==="lichess"?"Get Lichess evaluation":"Find and save best move";
+  const sources=buttonSources();
+  button.disabled=!busy && !sources.length;
+  button.title=button.disabled?MOBILE_DEPTH_NOTE:"";
+  button.textContent=busy?"Stop analysis":sources.length===1&&sources[0]==="lichess"?"Get Lichess evaluation":"Find and save best move";
 }
 // The view decides what is shown and what the analyse button does:
 // "stockfish" runs Stockfish 19, "lichess" fetches Lichess's evaluation, and
@@ -1635,10 +1662,12 @@ function setView(view) {
     button.setAttribute("aria-pressed",String(button.dataset.view===state.view));
   const combined=state.view==="combined";
   document.querySelector("#view-note").textContent=combined
-    ? "Combined shows, for each position, the deeper of the Stockfish 19 and Lichess results. Its button fetches Lichess's evaluation and runs Stockfish 19 at the same time; each result is saved under its own engine."
+    ? (MOBILE
+      ? "Combined shows, for each position, the deeper of the Stockfish 19 and Lichess results. Its button fetches Lichess's evaluation; Stockfish 19 runs as live analysis in the browser engine."
+      : "Combined shows, for each position, the deeper of the Stockfish 19 and Lichess results. Its button fetches Lichess's evaluation and runs Stockfish 19 at the same time; each result is saved under its own engine.")
     : state.view==="lichess"
       ? "Lichess's stored evaluation is fetched as it is; depth is not chosen here."
-      : "";
+      : MOBILE ? MOBILE_DEPTH_NOTE : "";
   applyShownAnalysis(currentFen());
   render();
 }
@@ -2142,7 +2171,7 @@ async function cloudEval(fen) {
 // stops them.
 document.querySelector("#analyze").onclick=async()=>{
   playMoveSound("ui");
-  const fen=currentFen(), sources=viewSources();
+  const fen=currentFen(), sources=buttonSources();
   const existing=sources.map(source=>activeJobs.get(jobKey(source,fen))).filter(Boolean);
   const running=existing.filter(job=>!job.finished);
   if(running.length) { await Promise.all(running.map(stopAnalysisJob)); return; }
@@ -2358,5 +2387,5 @@ document.querySelector("#history-button").onclick=async()=>{
     await loadSession();
   } catch(e) { status(e.message); }
   // Only look for the bridge by ourselves if this browser has used it before.
-  if(localStorage.getItem("chessdb_bridge_used")) await checkBridge();
+  if(!MOBILE && localStorage.getItem("chessdb_bridge_used")) await checkBridge();
 })();

@@ -2,45 +2,92 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>My Chess DB</title>
   <link rel="icon" href="data:,">
   <style>
     :root { color-scheme: dark; --bg:#171717; --panel:#242424; --light:#f0d9b5; --dark:#b58863; --live-light:#c7aee3; --live-dark:#a383c4; }
     * { box-sizing:border-box; }
     body { margin:0; font:14px Segoe UI, sans-serif; background:var(--bg); color:#eee; }
-    /* align-items: the panel on the right is as tall as its content, not as the board column. */
-    main { display:flex; align-items:flex-start; gap:18px; padding:18px; max-width:1194px; margin:auto; }
-    #board { display:grid; grid-template-columns:repeat(8,70px); grid-template-rows:repeat(8,70px); width:560px; height:560px; }
-    #board-wrap { position:relative; width:560px; height:560px; }
+    /* The layout follows the screen. Upright (a phone held upright): the
+       board as wide as the screen, the panel below it. Sideways: the panel
+       beside the board, which is as tall as the screen allows and at most
+       560px; on a low screen it fills the height, and the row above it is
+       scrolled to. The panel keeps at least 280px, so on a nearly square
+       screen the board stays smaller instead.
+       --board is the board's size, and what is around the board is sized
+       from it. It is worked out from main's width (100cqw: the page without
+       the scrollbar) and the screen's height, and is registered so that it
+       is computed once, on the board column, in px. */
+    @property --board { syntax:"<length>"; inherits:true; initial-value:560px; }
+    :root { --pad:18px; --gap:18px; --tools-h:44px; }
+    @media (max-width: 600px), (max-height: 500px) {
+      :root { --pad:8px; --gap:12px; }
+    }
+    main { container-type:inline-size; display:flex; flex-direction:column; align-items:center; gap:var(--gap); padding:var(--pad); margin:auto; }
+    main > section {
+      container:board / inline-size;
+      /* The evaluation bar and its gap are about 6% of the board (26px + 8px at most). */
+      --eval-w:clamp(10px, calc(var(--board) * .046), 26px);
+      --eval-gap:clamp(4px, calc(var(--board) * .0143), 8px);
+      --side:calc(var(--eval-w) + var(--eval-gap));
+      --board:min(720px, max((100cqw - 2px) / 1.0603, 100cqw - 34px));
+      width:calc(var(--board) + var(--side));
+    }
+    aside { width:min(100%, 754px); }
+    @media (orientation: landscape) and (min-width: 640px) {
+      /* align-items: the panel is as tall as its content, not as the board column. */
+      main { flex-direction:row; align-items:flex-start; justify-content:center; max-width:1194px; }
+      main > section {
+        flex:0 0 auto;
+        --board:min(560px, 100svh - 2 * var(--pad) - var(--tools-h),
+          max((100cqw - var(--gap) - 282px) / 1.0603, 100cqw - var(--gap) - 314px));
+      }
+      aside { flex:1 1 300px; min-width:280px; max-width:460px; width:auto; }
+    }
+    @media (orientation: landscape) and (min-width: 640px) and (max-height: 599px) {
+      :root { --tools-h:0px; }
+    }
+    #board { display:grid; grid-template-columns:repeat(8,1fr); grid-template-rows:repeat(8,1fr); width:100%; height:100%; }
+    #board-wrap { position:relative; flex:1 1 auto; min-width:0; aspect-ratio:1; }
     #annotation-layer { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
-    /* The evaluation bar stands left of the board; everything else in the
-       column lines up with the board. */
-    #board-row { display:flex; gap:8px; }
-    .board-tools, #captured-bottom, .history-controls, #opening-status, .board-hints { margin-left:34px; }
+    /* The evaluation bar stands left of the board, as tall as it; everything
+       else in the column lines up with the board. */
+    #board-row { display:flex; gap:var(--eval-gap); }
+    .board-tools, #captured-bottom, .history-controls, #opening-status, .board-hints { margin-left:var(--side); }
     /* The guide stays as wide as the board and starts folded. */
-    .board-hints { width:560px; margin-top:8px; color:#aaa; font-size:12px; }
+    .board-hints { margin-top:8px; color:#aaa; font-size:12px; }
     .board-hints summary { cursor:pointer; user-select:none; }
     .board-hints ul { margin:6px 0 0; padding-left:18px; }
     .board-hints li { margin:3px 0; }
-    #eval-bar { position:relative; flex:0 0 26px; height:560px; background:#262626; border:1px solid #555; border-radius:4px; overflow:hidden; }
+    #eval-bar { position:relative; flex:0 0 var(--eval-w); background:#262626; border:1px solid #555; border-radius:4px; overflow:hidden; }
     #eval-bar-white { position:absolute; left:0; right:0; bottom:0; height:50%; background:#ededed; transition:height .35s ease; }
     #eval-bar::after { content:""; position:absolute; left:0; right:0; top:50%; height:2px; margin-top:-1px; background:#d0803c; }
-    #eval-bar-label { position:absolute; left:0; right:0; z-index:1; text-align:center; font:700 10px/1 Segoe UI,sans-serif; font-variant-numeric:tabular-nums; }
+    #eval-bar-label { position:absolute; left:0; right:0; z-index:1; text-align:center; font:700 clamp(7px, calc(var(--board) * .018), 10px)/1 Segoe UI,sans-serif; font-variant-numeric:tabular-nums; }
     #eval-bar-label.for-white { bottom:5px; color:#262626; }
     #eval-bar-label.for-black { top:5px; color:#ededed; }
     #eval-bar.flipped #eval-bar-white { bottom:auto; top:0; }
     #eval-bar.flipped #eval-bar-label.for-white { bottom:auto; top:5px; }
     #eval-bar.flipped #eval-bar-label.for-black { top:auto; bottom:5px; }
     #eval-bar.empty { opacity:.4; }
-    .board-tools { width:560px; display:flex; align-items:center; gap:8px; margin-bottom:6px; }
-    .board-tools button { padding:5px 10px; flex:0 0 auto; }
+    .board-tools { display:flex; align-items:center; gap:8px; margin-bottom:6px; }
+    .board-tools button { padding:5px 10px; flex:0 0 auto; white-space:nowrap; }
+    .tool-short { display:none; }
+    /* A small board keeps the row above it on one line: shorter buttons, and
+       the captured pieces without their label. */
+    @container board (max-width: 510px) {
+      .board-tools { gap:6px; }
+      .board-tools button { padding:4px 8px; font-size:13px; }
+      .tool-full, .captured-label { display:none; }
+      .tool-short { display:inline; }
+    }
     #live-toggle[aria-pressed="true"] { background:#4a3a63; border-color:#a383c4; }
     #live-toggle[aria-pressed="true"].unavailable { background:#363636; border-style:dashed; }
-    #opening-status { display:none; width:560px; margin-top:8px; padding:8px 10px; background:var(--panel); border-radius:4px; color:#c8d8ff; overflow-wrap:anywhere; }
-    .history-controls { width:560px; display:flex; gap:6px; margin-top:8px; }
-    .history-controls button { flex:1; font-size:20px; line-height:1; padding:6px; }
-    .square { border:0; cursor:pointer; display:flex; align-items:center; justify-content:center; line-height:1; user-select:none; touch-action:none; }
-    .piece-image { width:100%; height:100%; object-fit:contain; transform:scale(1.14); pointer-events:none; }
+    #opening-status { display:none; margin-top:8px; padding:8px 10px; background:var(--panel); border-radius:4px; color:#c8d8ff; overflow-wrap:anywhere; }
+    .history-controls { display:flex; gap:6px; margin-top:8px; }
+    .history-controls button { flex:1; font-size:clamp(12px, calc(var(--board) * .036), 20px); line-height:1; padding:clamp(3px, calc(var(--board) * .011), 6px); }
+    .square { border:0; padding:0; cursor:pointer; display:flex; align-items:center; justify-content:center; line-height:1; user-select:none; touch-action:none; }
+    .piece-image { width:88%; height:88%; object-fit:contain; pointer-events:none; }
     .drag-preview { position:fixed; width:62px; height:62px; pointer-events:none; z-index:10; transform:translate(-50%,-50%) scale(1.14); }
     .light { background:var(--light); } .dark { background:var(--dark); }
     .last { background:#c9e6ff !important; }
@@ -53,22 +100,30 @@
     .dark.live-best { background:var(--live-dark) !important; }
     .selected { background:#f6f669 !important; }
     .best.selected, .live-best.selected { background:#f6f669 !important; }
-    .coordinate { position:absolute; z-index:2; font:700 11px/1 Segoe UI,sans-serif; pointer-events:none; }
-    .coordinate.rank { top:3px; left:4px; }
-    .coordinate.file { right:4px; bottom:3px; }
+    .coordinate { position:absolute; z-index:2; font:700 clamp(7px, calc(var(--board) * .0196), 11px)/1 Segoe UI,sans-serif; pointer-events:none; }
+    .coordinate.rank { top:calc(var(--board) * .0054); left:calc(var(--board) * .007); }
+    .coordinate.file { right:calc(var(--board) * .007); bottom:calc(var(--board) * .0054); }
     .square.dark .coordinate { color:#f0d9b5; }
     .square.light .coordinate { color:#b58863; }
-    .legal-move { box-shadow:inset 0 0 0 5px rgba(55,170,75,.78); }
-    .legal-capture { box-shadow:inset 0 0 0 5px rgba(55,170,75,.9); }
-    .legal-move::after { content:""; width:16px; height:16px; border-radius:50%; background:rgba(55,170,75,.78); }
-    .legal-capture::after { content:""; position:absolute; inset:5px; border:5px solid rgba(55,170,75,.82); border-radius:50%; }
-    .legal-castle { box-shadow:inset 0 0 0 5px rgba(55,170,75,.78); }
-    .legal-castle::after { content:""; width:16px; height:16px; border-radius:50%; background:rgba(55,170,75,.78); }
+    /* Sizes on the board follow the board: 5px and 16px on a 560px board. */
+    .legal-move { box-shadow:inset 0 0 0 calc(var(--board) * .009) rgba(55,170,75,.78); }
+    .legal-capture { box-shadow:inset 0 0 0 calc(var(--board) * .009) rgba(55,170,75,.9); }
+    .legal-move::after { content:""; width:calc(var(--board) * .0286); height:calc(var(--board) * .0286); border-radius:50%; background:rgba(55,170,75,.78); }
+    .legal-capture::after { content:""; position:absolute; inset:calc(var(--board) * .009); border:calc(var(--board) * .009) solid rgba(55,170,75,.82); border-radius:50%; }
+    .legal-castle { box-shadow:inset 0 0 0 calc(var(--board) * .009) rgba(55,170,75,.78); }
+    .legal-castle::after { content:""; width:calc(var(--board) * .0286); height:calc(var(--board) * .0286); border-radius:50%; background:rgba(55,170,75,.78); }
     .square { position:relative; }
-    aside { width:460px; background:var(--panel); padding:16px; border-radius:6px; }
+    aside { background:var(--panel); padding:16px; border-radius:6px; }
+    /* Phones zoom into a text field whose text is smaller than 16px. */
+    @media (pointer: coarse) { input { font-size:16px; } }
+    /* Phones and tablets cannot run the engine bridge (app.js marks them). */
+    .mobile .bridge-only { display:none !important; }
     input, button { font:inherit; padding:8px; border-radius:4px; border:1px solid #555; }
     input { width:100%; background:#151515; color:#eee; } button { cursor:pointer; background:#363636; color:#fff; }
-    button:hover { background:#4b4b4b; } .row { display:flex; gap:8px; margin:7px 0; } .row button { flex:1; }
+    /* Only where there is a mouse: a touch screen keeps :hover on what was
+       tapped last, which would leave a board square grey. */
+    @media (hover: hover) { button:hover { background:#4b4b4b; } }
+    .row { display:flex; gap:8px; margin:7px 0; } .row button { flex:1; }
     label { display:block; margin-top:10px; color:#bbb; } .status { color:#9bd49b; min-height:20px; margin-top:10px; }
     #active-jobs-label { display:none; margin-top:14px; }
     #active-jobs { display:none; list-style:none; padding:0; margin:0; }
@@ -79,9 +134,9 @@
     #active-jobs li .job-actions { display:flex; gap:4px; flex:0 0 auto; }
     /* Each side's captures sit next to that side of the board: White's
        below and Black's above, the other way round when the board is flipped. */
-    .material-status { box-sizing:border-box; width:560px; padding:4px 10px; background:var(--panel); border-radius:4px; }
+    .material-status { box-sizing:border-box; padding:4px 10px; background:var(--panel); border-radius:4px; }
     #captured-bottom { margin-top:6px; }
-    .board-tools #captured-top { width:auto; flex:1; min-width:0; }
+    .board-tools #captured-top { flex:1 1 0; min-width:0; overflow:hidden; }
     .captured-row { display:flex; align-items:center; gap:0; min-height:24px; }
     .captured-label { width:112px; color:#bbb; flex:0 0 auto; }
     .captured-pieces { display:flex; align-items:center; flex:1; min-width:0; }
@@ -93,10 +148,6 @@
     .material-advantage { margin-left:5px; color:#d9d9d9; font-variant-numeric:tabular-nums; }
     .annotation-arrow { fill:none; stroke-width:9; stroke-linecap:butt; stroke-linejoin:round; opacity:.78; filter:drop-shadow(0 1px 1px rgba(0,0,0,.4)); }
     .annotation-circle { stroke-width:3; opacity:.88; }
-    @media (max-width: 1120px) {
-      main { flex-direction:column; align-items:center; }
-      aside { width:min(100%,560px); }
-    }
     .notation { min-height:40px; padding:8px; background:#151515; color:#eee; word-break:break-word; }
     #analysis-progress { width:100%; height:18px; display:none; }
     small { color:#aaa; }
@@ -127,7 +178,7 @@
 <body>
 <main>
   <section>
-    <div class="board-tools"><div id="captured-top" class="material-status" aria-live="polite"></div><button id="live-toggle" aria-pressed="true">Live analysis</button><button id="flip">↻ Flip board</button></div>
+    <div class="board-tools"><div id="captured-top" class="material-status" aria-live="polite"></div><button id="live-toggle" aria-pressed="true">Live analysis</button><button id="flip">↻ Flip<span class="tool-full"> board</span></button></div>
     <div id="board-row">
       <div id="eval-bar" class="empty" role="img" aria-label="No evaluation for this position"><div id="eval-bar-white"></div><span id="eval-bar-label" class="for-white"></span></div>
       <div id="board-wrap">
@@ -146,11 +197,10 @@
     <details class="board-hints">
       <summary>Board guide</summary>
       <ul>
-        <li>If the page does not fit your screen, zoom the browser until the board and the panel sit comfortably side by side: Ctrl + − / Ctrl + + (⌘ on a Mac), Ctrl + 0 to reset.</li>
         <li>Scroll over the board to move through the current history.</li>
         <li>Right-click a square or drag to annotate; hold Ctrl for red annotations.</li>
         <li id="best-move-hint">Green squares show the best move: full colour from depth 46, paler the shallower the analysis.</li>
-        <li>Purple squares show live analysis, shown while it is deeper than the saved result and saved once it is deeper than the saved Stockfish 19 analysis. It needs the engine bridge; turn it on or off with the button above the board.</li>
+        <li>Purple squares show live analysis, shown while it is deeper than the saved result and saved once it is deeper than the saved Stockfish 19 analysis. It needs the engine bridge or the browser engine; turn it on or off with the button above the board.</li>
         <li>The bar left of the board shows the evaluation, also while an analysis is running.</li>
       </ul>
     </details>
@@ -166,11 +216,11 @@
       <label for="fen">FEN</label>
       <input id="fen" autocomplete="off">
       <div class="row"><button id="load">Load position</button><button id="copy-fen">Copy FEN</button></div>
-      <label for="engine">Stockfish 19 executable (optional: only to use a copy you already have)</label>
-      <input id="engine" placeholder="Leave empty: the engine bridge downloads Stockfish 19 for you" autocomplete="off" disabled>
-      <div id="engine-status" class="status"></div>
-      <label for="depth" id="depth-label">Stockfish analysis depth</label>
-      <input id="depth" type="number" min="21" max="245" value="46" autocomplete="off">
+      <label for="engine" class="bridge-only">Stockfish 19 executable (optional: only to use a copy you already have)</label>
+      <input id="engine" class="bridge-only" placeholder="Leave empty: the engine bridge downloads Stockfish 19 for you" autocomplete="off" disabled>
+      <div id="engine-status" class="status bridge-only"></div>
+      <label for="depth" id="depth-label" class="bridge-only">Stockfish analysis depth</label>
+      <input id="depth" class="bridge-only" type="number" min="21" max="245" value="46" autocomplete="off">
       <div class="row"><button id="remove" style="display:none">Remove saved move</button><button id="purge" style="display:none" title="Removes every unverified entry saved by the visitor who saved this one (without a key), and puts back the entries they replaced. What is removed stays in the history.">Remove all from this visitor</button></div>
       <div id="admin-tools" style="display:none">
         <label>Admin tools</label>
@@ -192,12 +242,12 @@
     <small id="view-note"></small>
     <div class="row" id="analyze-row"><button id="analyze">Find and save best move</button></div>
     <progress id="analysis-progress" max="100" value="0"></progress>
-    <div id="bridge-bar"><span id="bridge-status">Engine bridge: not connected</span><button id="bridge-connect">Connect</button><button id="bridge-install" style="display:none">Install Stockfish 19</button></div>
+    <div id="bridge-bar" class="bridge-only"><span id="bridge-status">Engine bridge: not connected</span><button id="bridge-connect">Connect</button><button id="bridge-install" style="display:none">Install Stockfish 19</button></div>
     <div id="browser-engine" style="display:none">
       <div class="row-line"><span id="browser-engine-status"></span><button id="browser-engine-toggle">Use browser engine</button></div>
-      <small id="browser-engine-note">A 99 MB download the first time (the browser keeps it), and several times slower than the engine bridge. It only runs live analysis: analysing to a chosen depth needs the bridge. Stockfish is free software under the <a href="/engine/Copying.txt" target="_blank" rel="noopener">GPLv3</a>; this build is <a href="https://github.com/nmrugg/stockfish.js" target="_blank" rel="noopener">stockfish.js 19</a>, from <a href="https://github.com/official-stockfish/Stockfish" target="_blank" rel="noopener">Stockfish</a>.</small>
+      <small id="browser-engine-note"><span id="browser-engine-intro">A 99 MB download the first time (the browser keeps it), and several times slower than the engine bridge. It only runs live analysis: analysing to a chosen depth needs the bridge.</span> Stockfish is free software under the <a href="/engine/Copying.txt" target="_blank" rel="noopener">GPLv3</a>; this build is <a href="https://github.com/nmrugg/stockfish.js" target="_blank" rel="noopener">stockfish.js 19</a>, from <a href="https://github.com/official-stockfish/Stockfish" target="_blank" rel="noopener">Stockfish</a>.</small>
     </div>
-    <div id="bridge-setup">
+    <div id="bridge-setup" class="bridge-only">
       <p>Stockfish runs on your own computer. A small helper program, the engine bridge, starts it for this site and downloads the official Stockfish 19 for you. Nothing is installed system-wide.</p>
       <p>Your browser will ask once whether this site may access other apps and services on this device. Choose <b>Allow</b>: that is how this page reaches the bridge, and the bridge only answers this site.</p>
       <p>The first command installs and starts the bridge. Later, start it from the "My Chess DB Bridge" launcher it adds (the Start menu on Windows), or with the second command. This panel closes by itself once the bridge is running.</p>

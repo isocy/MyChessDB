@@ -327,6 +327,15 @@ run the install command again from the new address.
    "Stockfish 19 ready". The browser asks once whether the site may access
    other apps and services on the device; they choose Allow.
 
+Phones and tablets cannot run the bridge, so there the page neither offers
+nor looks for it (no local network prompt). They see saved moves, fetch
+Lichess's evaluation (in Combined the button does only that), and run live
+analysis with the browser engine; the Stockfish 19 view's button, which
+analyses to a chosen depth, is disabled. The layout follows the screen: held
+upright, the board is as wide as the screen and the panel is below it; held
+sideways (and on computers), the board fits the height and the panel is
+beside it.
+
 The installer adds a "My Chess DB Bridge" launcher (Start menu shortcut on
 Windows, Applications entry on macOS and Linux) for next time; the site also
 shows a short start command. The bridge's window has to stay open while
