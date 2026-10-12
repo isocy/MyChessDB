@@ -397,6 +397,7 @@ function showHistoryPosition(index) {
   if(state.dragPreview){state.dragPreview.remove();state.dragPreview=null;}
   fenEl.value=currentFen();
   applyShownAnalysis(fenEl.value);
+  animateNextRender=true;
   render();
   updateHistoryControls();
   playMoveSound(index>previousIndex?position.lastSound||"move":previousPosition?.lastSound||"move");
@@ -569,7 +570,54 @@ function renderMaterialStatus() {
     ((color==="w")!==state.flipped?bottom:top).appendChild(row);
   }
 }
+// Pieces that move by themselves slide to their new square instead of
+// jumping there: a move made by clicking its destination, and the history
+// buttons and mouse wheel. (A dragged piece is already where it goes.) The
+// board drawn last is compared with the new one, so going back, castling,
+// en passant and jumps over several moves all slide what changed.
+const MOVE_ANIMATION_MS=180;
+let renderedBoard=null, renderedFlipped=false, animateNextRender=false;
+function animatePieces(before, after) {
+  if(window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+  const gone=[], came=[];
+  for(let i=0;i<64;i++) {
+    if(before[i]===after[i]) continue;
+    if(before[i]) gone.push({i,piece:before[i]});
+    if(after[i]) came.push({i,piece:after[i]});
+  }
+  const distance=(a,b)=>Math.hypot(Math.floor(a/8)-Math.floor(b/8),a%8-b%8);
+  const white=piece=>piece===piece.toUpperCase();
+  // The nearest piece that disappeared and fits: the same piece, or else (a
+  // promotion, or one taken back) a pawn of the same colour.
+  const take=(arrived,fits)=>{
+    let best=null;
+    for(const left of gone) if(!left.used && fits(left.piece,arrived.piece) && (!best || distance(left.i,arrived.i)<distance(best.i,arrived.i))) best=left;
+    if(best) best.used=true;
+    return best;
+  };
+  const moves=[], unmatched=[];
+  for(const arrived of came) {
+    const left=take(arrived,(a,b)=>a===b);
+    if(left) moves.push([left.i,arrived.i]); else unmatched.push(arrived);
+  }
+  for(const arrived of unmatched) {
+    const left=take(arrived,(a,b)=>white(a)===white(b) && (a.toLowerCase()==="p" || b.toLowerCase()==="p"));
+    if(left) moves.push([left.i,arrived.i]);
+  }
+  const squares=new Map([...boardEl.children].map(square=>[Number(square.dataset.index),square]));
+  for(const [from,to] of moves) {
+    const square=squares.get(to), image=square?.querySelector(".piece-image");
+    if(!image || !squares.has(from)) continue;
+    const start=squares.get(from).getBoundingClientRect(), end=square.getBoundingClientRect();
+    square.style.zIndex="3";   // above the squares it passes
+    image.animate([{transform:`translate(${start.left-end.left}px,${start.top-end.top}px)`},{transform:"none"}],
+      {duration:MOVE_ANIMATION_MS,easing:"ease-out"})
+      .finished.then(()=>{ square.style.zIndex=""; },()=>{ /* the board was drawn again meanwhile */ });
+  }
+}
 function render() {
+  const animate=animateNextRender && renderedBoard!==null && renderedFlipped===state.flipped, before=renderedBoard;
+  animateNextRender=false;
   boardEl.innerHTML=""; const best=bestMoveSquares(state.shownMove), last=moveSquares(state.last);
   applyBestMoveColour();
   const legalMoves=state.selected===null ? [] : getLegalDestinations(state.selected);
@@ -609,6 +657,8 @@ function render() {
     b.onpointermove=e=>pointerMoveSquare(e,i); b.onpointerup=e=>pointerUpSquare(e,i);
     b.onpointercancel=cancelPieceDrag; boardEl.appendChild(b);
   }
+  renderedBoard=state.board.flat(); renderedFlipped=state.flipped;
+  if(animate) animatePieces(before,renderedBoard);
   renderAnnotations();
   renderMaterialStatus();
   renderEvalBar();
@@ -792,7 +842,7 @@ function pointerUpSquare(e,i) {
   const to=target ? Number(target.dataset.index) : from;
   state.pointerStart=null; state.pointerCurrent=null; state.dragging=false;
   if(state.dragPreview){state.dragPreview.remove();state.dragPreview=null;}
-  if(clickTarget!==undefined) movePiece(from,clickTarget);
+  if(clickTarget!==undefined) movePiece(from,clickTarget,true);
   else if(wasDragging && Number.isInteger(to)) movePiece(from,to);
   else if(!wasDragging && wasSelected) {
     state.selected=null;
@@ -806,7 +856,7 @@ function handleSquareClick(i) {
   state.annotations=[];
   const piece=state.board[Math.floor(i/8)][i%8];
   if(state.selected!==null && getLegalDestinations(state.selected).includes(i)) {
-    movePiece(state.selected,i);
+    movePiece(state.selected,i,true);
     return;
   }
   if(piece && isCurrentTurnPiece(piece)) state.selected=state.selected===i ? null : i;
@@ -894,7 +944,8 @@ document.addEventListener("auxclick",e=>{
     e.stopImmediatePropagation();
   }
 }, true);
-function movePiece(from,to) {
+// animate: the piece was not dragged there, so it slides (see animatePieces).
+function movePiece(from,to,animate=false) {
   const fr=Math.floor(from/8), ff=from%8, tr=Math.floor(to/8), tf=to%8, piece=state.board[fr][ff];
   if(!piece || !getLegalDestinations(from).includes(to)){state.selected=null;render();return;}
   state.history=state.history.slice(0,state.historyIndex+1);
@@ -920,7 +971,8 @@ function movePiece(from,to) {
   playMoveSound(state.lastSound);
   state.history.push(positionSnapshot());
   state.historyIndex=state.history.length-1;
-  fenEl.value=currentFen(); applyShownAnalysis(fenEl.value); state.selected=null; render(); updateHistoryControls(); void updateOpeningDisplay();
+  fenEl.value=currentFen(); applyShownAnalysis(fenEl.value); state.selected=null;
+  animateNextRender=animate; render(); updateHistoryControls(); void updateOpeningDisplay();
 }
 function undoMove() {
   if(state.historyIndex<=0){status("Already at the first position");return;}
@@ -1032,7 +1084,7 @@ function setRoleUI() {
   document.querySelector("#key-login").textContent=state.role?"🔓 Logout":"Login";
   document.querySelector("#key-role").textContent=admin?"Admin":state.role==="contributor"?`Contributor: ${state.roleLabel||""}`:"";
   document.querySelector("#depth").min=state.minDepth;
-  document.querySelector("#depth-label").textContent=`Stockfish analysis depth (${state.minDepth} or more; ${state.fullDepth} is the full depth)`;
+  document.querySelector("#depth-label").textContent=`Stockfish analysis depth (${state.minDepth} or more)`;
   document.querySelector("#best-move-hint").textContent=`Green squares show the best move: full colour from depth ${state.fullDepth}, paler the shallower the analysis.`;
 }
 async function loadSession() {
@@ -2347,7 +2399,14 @@ document.querySelector("#new-key-button").onclick=async()=>{
     await renderKeys();
   } catch(error) { adminNote(error.message); }
 };
-document.querySelector("#history-button").onclick=async()=>{
+// What was replaced or removed for the position on the board. The button
+// shows the list, and hides it again.
+document.querySelector("#history-button").onclick=()=>{
+  const list=document.querySelector("#history-list");
+  if(list.childElementCount) { list.replaceChildren(); return; }
+  void renderHistory();
+};
+async function renderHistory() {
   const list=document.querySelector("#history-list");
   try {
     const fen=currentFen();
@@ -2368,14 +2427,14 @@ document.querySelector("#history-button").onclick=async()=>{
           const result=await api("/api/restore",{body:{id:item.id}});
           setPosition(fen,result.entries);
           adminNote(`Restored ${san} (${ENGINES[item.source]||item.source}, depth ${item.depth}) for this position.`);
-          document.querySelector("#history-button").click();
+          await renderHistory();
         } catch(error) { adminNote(error.message); }
       };
       li.append(label,button);
       list.appendChild(li);
     }
   } catch(error) { adminNote(error.message); }
-};
+}
 
 (async()=>{
   let view="combined";
