@@ -27,7 +27,7 @@ const SITES = { chesscom: "chess.com", lichess: "Lichess" };
 const ACCOUNTS_KEY = "chessdb_puzzles_accounts", EFFORT_KEY = "chessdb_puzzles_effort";
 const OPPONENT_DELAY_MS = 400, REPLY_DELAY_MS = 450, WRONG_SHOWN_MS = 700, SOLUTION_STEP_MS = 650;
 // The engine bridge that finds puzzles (bridge/puzzles.go).
-const PUZZLES_MIN_VERSION = "1.0.7";
+const PUZZLES_MIN_VERSION = "1.0.8";
 // How hard the bridge's engine works (bridge/puzzlegen.go, puzzleEfforts).
 const EFFORTS = { lichess: "As Lichess (1,000,000 nodes per position)", quick: "Quicker (300,000 nodes per position)" };
 const FOLLOW_MS = 1500, RECONNECT_MS = 15000;
@@ -346,7 +346,8 @@ function renderRemote() {
       lines.push(`${name}: fetching ${task.step === "older" ? "older " : ""}games: ${task.read || 0} read, ${task.kept || 0} rated rapid`);
     } else if (task?.step === "analyse") {
       const step = task.phase === "scan" ? `position ${task.done} of ${task.total}` : `looking for puzzles, move ${Math.ceil(task.done / 2)}`;
-      lines.push(`${name}: analysing the game against ${task.opponent} (${dateText(task.played_at)}), ${step} · ${view.pending - 1} more waiting`);
+      const threads = task.threads ? ` with ${plural(task.threads, "thread")}` : "";
+      lines.push(`${name}: analysing the game against ${task.opponent} (${dateText(task.played_at)})${threads}, ${step} · ${view.pending - 1} more waiting`);
     } else if (view.running) {
       lines.push(`${name}: ${view.pending} game${view.pending === 1 ? "" : "s"} waiting`);
     }

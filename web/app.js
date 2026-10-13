@@ -10,7 +10,7 @@ import { BrowserEngine, browserEngineSupported, ENGINE_SIZE_MB } from "./browser
 import { playMoveSound } from "./sounds.js";
 
 const BRIDGE_URL = "http://127.0.0.1:8765";
-const BRIDGE_MIN_VERSION = "1.0.7";
+const BRIDGE_MIN_VERSION = "1.0.8";
 // Phones and tablets cannot run the engine bridge, so on them it is neither
 // offered nor looked for (looking would ask for local network access for
 // nothing). iPads say they are Macs, but Macs have no touch screen.

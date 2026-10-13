@@ -28,7 +28,7 @@ import (
 
 const (
 	appName     = "mychessdb-bridge"
-	version     = "1.0.7"
+	version     = "1.0.8"
 	defaultPort = 8765
 	maxBody     = 4 << 20
 )
@@ -376,7 +376,7 @@ func (s *server) connectEngines(maxJobs int) {
 	s.live = newLiveEngine(s.currentEngine, func() int { return s.jobs.runningCount() + s.search.load() })
 	s.search = newSearcher(s.currentEngine, func() int { return s.jobs.runningCount() + s.live.load() })
 	s.jobs.liveLoad = func() int { return s.live.load() + s.search.load() }
-	s.puzzles = newPuzzleManager(filepath.Dir(s.store.path), s.search.search, s.currentEngine)
+	s.puzzles = newPuzzleManager(filepath.Dir(s.store.path), s.search, s.currentEngine)
 }
 
 // alreadyRunning reports whether another copy of the bridge owns the port.

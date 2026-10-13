@@ -16,6 +16,11 @@ package main
 //   POST /api/puzzles/collected  {profile, games: [id]}: the site has stored these
 //   POST /api/puzzles/stop       {profile}: stop (the next update carries on)
 //   POST /api/puzzles/forget     {profile}: forget the account
+//
+// Finding puzzles comes first: its engine always searches with as many
+// threads as the bridge may use (all cores but one), whatever else runs; an
+// analysis started meanwhile counts it as one more analysis when it takes
+// its share. When no update is left, the engine is closed.
 
 import (
 	"context"
@@ -105,6 +110,7 @@ func (p *puzzleProfile) pending() []string {
 type puzzleTaskView struct {
 	Step     string `json:"step"` // "rating", "games", "older" or "analyse"
 	GameID   string `json:"game_id,omitempty"`
+	Threads  int    `json:"threads,omitempty"` // analyse: the engine's threads
 	Opponent string `json:"opponent,omitempty"`
 	PlayedAt int64  `json:"played_at,omitempty"`
 	Phase    string `json:"phase,omitempty"` // analyse: "scan" or "puzzles"
@@ -133,9 +139,9 @@ type puzzleView struct {
 }
 
 type puzzleManager struct {
-	path   string
-	search engineSearch
-	engine func() (string, error)
+	path     string
+	searcher *searcher
+	engine   func() (string, error)
 
 	mu       sync.Mutex
 	profiles map[string]*puzzleProfile
@@ -152,9 +158,9 @@ type puzzleManager struct {
 	exited chan struct{}
 }
 
-func newPuzzleManager(dir string, search engineSearch, engine func() (string, error)) *puzzleManager {
+func newPuzzleManager(dir string, searcher *searcher, engine func() (string, error)) *puzzleManager {
 	m := &puzzleManager{
-		path: filepath.Join(dir, "puzzles.json"), search: search, engine: engine, profiles: map[string]*puzzleProfile{},
+		path: filepath.Join(dir, "puzzles.json"), searcher: searcher, engine: engine, profiles: map[string]*puzzleProfile{},
 		wake: make(chan struct{}, 1), done: make(chan struct{}), exited: make(chan struct{}),
 	}
 	if raw, err := os.ReadFile(m.path); err == nil {
@@ -313,7 +319,8 @@ func (m *puzzleManager) collected(profile string, ids []string) puzzleView {
 }
 
 // stop ends the update for an account; what was done is kept (forget: the
-// account goes altogether).
+// account goes altogether). With no update left, the engine is closed, so
+// that the next one starts with its share of the processor worked out again.
 func (m *puzzleManager) stop(profile string, forget bool) puzzleView {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -327,7 +334,25 @@ func (m *puzzleManager) stop(profile string, forget bool) puzzleView {
 	if m.running == profile && m.cancel != nil {
 		m.cancel()
 	}
+	if !m.anyWantedLocked() {
+		go m.searcher.close()
+	}
 	return m.viewLocked(profile)
+}
+
+func (m *puzzleManager) anyWantedLocked() bool {
+	for _, entry := range m.profiles {
+		if entry.Wanted {
+			return true
+		}
+	}
+	return false
+}
+
+// threadsForGame: as many as the bridge may use, whatever else runs.
+func (m *puzzleManager) threadsForGame() int {
+	threads, _ := resourceBudget()
+	return threads
 }
 
 // next decides what to do, over the accounts with an update under way:
@@ -528,10 +553,19 @@ func (m *puzzleManager) analyse(ctx context.Context, profile, gameID string) boo
 	left := len(entry.pending()) - 1
 	m.task.GameID, m.task.Opponent, m.task.PlayedAt, m.task.Phase = game.ID, game.Opponent, game.PlayedAt, "scan"
 	m.mu.Unlock()
-	logf("Puzzles: analysing %s (%d more waiting).", game.ID, left)
+	threads := m.threadsForGame()
+	m.setTask(func(task *puzzleTaskView) { task.Threads = threads })
+	logf("Puzzles: analysing %s with %d threads (%d more waiting).", game.ID, threads, left)
+	// The game's first search sets the engine's threads for it.
+	search := func(ctx context.Context, request searchRequest) (searchResult, error) {
+		if request.NewGame {
+			request.Threads = threads
+		}
+		return m.searcher.search(ctx, request)
+	}
 	started := time.Now()
 	result, err := analyseGame(ctx, gameInput{Color: game.Color, Moves: game.Moves, Evals: game.Evals},
-		m.search, puzzleEfforts[effortName],
+		search, puzzleEfforts[effortName],
 		func(phase string, done, total int) {
 			m.setTask(func(task *puzzleTaskView) { task.Phase, task.Done, task.Total = phase, done, total })
 		}, nil)

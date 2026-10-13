@@ -44,6 +44,9 @@ type searchRequest struct {
 	// NewGame: the search is the first of another game; the engine forgets
 	// what it found ("ucinewgame").
 	NewGame bool `json:"new_game"`
+	// Threads: how many threads to search with from now on; 0 keeps them
+	// (a new engine then gets a share like one more analysis).
+	Threads int `json:"threads"`
 }
 
 // searchScore is from the side to move: {"cp": 32} or {"mate": -3}.
@@ -96,6 +99,8 @@ func (r *searchRequest) validate() error {
 		return &httpError{400, fmt.Sprintf("movetime must be from 1 to %d milliseconds", searchMaxTimeMs)}
 	case r.Nodes == 0 && r.Depth == 0 && r.Movetime == 0:
 		return &httpError{400, "give a limit: nodes, depth or movetime"}
+	case r.Threads < 0 || r.Threads > maxTotalThreads:
+		return &httpError{400, fmt.Sprintf("threads must be from 1 to %d", maxTotalThreads)}
 	}
 	return nil
 }
@@ -137,7 +142,7 @@ func (s *searcher) endProcessLocked() {
 	s.proc = nil
 }
 
-func (s *searcher) startLocked() error {
+func (s *searcher) startLocked(threads int) error {
 	path, err := s.engine()
 	if err != nil {
 		return &httpError{400, "Stockfish is not ready: " + err.Error()}
@@ -151,7 +156,10 @@ func (s *searcher) startLocked() error {
 		s.endProcessLocked()
 		return err
 	}
-	threads, hash := perJobResources(s.running() + 1)
+	share, hash := perJobResources(s.running() + 1)
+	if threads <= 0 {
+		threads = share
+	}
 	if hash > searchMaxHashMB {
 		hash = searchMaxHashMB
 	}
@@ -194,9 +202,20 @@ func (s *searcher) search(ctx context.Context, request searchRequest) (searchRes
 	}
 	defer s.scheduleQuitLocked()
 	if s.proc == nil {
-		if err := s.startLocked(); err != nil {
+		if err := s.startLocked(request.Threads); err != nil {
 			return searchResult{}, err
 		}
+	} else if request.Threads > 0 && request.Threads != s.threads {
+		// Changing it makes Stockfish set up its threads and hash table
+		// again, so it is only asked for between games.
+		s.setOptionLocked("Threads", request.Threads)
+		_ = s.proc.send("isready")
+		if err := s.proc.waitFor("readyok", time.Minute, nil); err != nil {
+			s.endProcessLocked()
+			return searchResult{}, err
+		}
+		logf("Puzzle search engine: %d threads now (was %d).", request.Threads, s.threads)
+		s.threads = request.Threads
 	}
 	proc := s.proc
 	if request.MultiPV != s.multipv {
@@ -297,6 +316,22 @@ func (s *searcher) scheduleQuitLocked() {
 			logf("Puzzle search engine closed (not used for a while).")
 		}
 	})
+}
+
+// close ends the process (after the search that is running, if any): the
+// next search starts a new one, with its share of the processor worked out
+// again.
+func (s *searcher) close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.idle != nil {
+		s.idle.Stop()
+	}
+	if s.proc != nil {
+		s.proc.quit()
+		s.proc = nil
+		logf("Puzzle search engine closed.")
+	}
 }
 
 // shutdown ends the process; called when the bridge exits. A search that is

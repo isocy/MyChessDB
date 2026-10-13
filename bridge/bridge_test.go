@@ -1394,7 +1394,7 @@ func TestPuzzleUpdateStopAndRestart(t *testing.T) {
 	h.puzzlesWhen("lichess:slow", analysing)
 	h.srv.puzzles.shutdown()
 	t.Setenv("MOCK_DELAY_MS", "1")
-	again := newPuzzleManager(h.dir, h.srv.search.search, h.srv.currentEngine)
+	again := newPuzzleManager(h.dir, h.srv.search, h.srv.currentEngine)
 	t.Cleanup(again.shutdown)
 	deadline := time.Now().Add(20 * time.Second)
 	for {
@@ -1428,4 +1428,42 @@ func TestPuzzleTwoAccounts(t *testing.T) {
 	if analysedAt(lichess, 2) > analysedAt(chesscom, 3) {
 		t.Fatal("the accounts take turns: Lichess's three games are done before chess.com's fourth")
 	}
+}
+
+// Finding puzzles comes first: its engine gets all the threads the bridge may
+// use, also while an analysis runs; Stop closes it.
+func TestPuzzleThreads(t *testing.T) {
+	t.Setenv("MOCK_DELAY_MS", "20")
+	engineLog := filepath.Join(t.TempDir(), "engine.log")
+	t.Setenv("MOCK_LOG", engineLog)
+	var requests []string
+	fakeSites(t, 4, &requests)
+	h := newHarness(t, 4)
+	total := int(h.do("GET", "/api/status", nil, nil).body["threads"].(float64))
+	job := h.start(startFEN, 200) // an analysis that runs all along
+	h.waitStatus(job, "running")
+	h.do("POST", "/api/puzzles/update", map[string]any{"profile": "lichess:slow", "site": "lichess", "username": "slow", "effort": "lichess"}, nil)
+	h.puzzlesWhen("lichess:slow", func(view map[string]any) bool {
+		task, _ := view["task"].(map[string]any)
+		return task != nil && task["step"] == "analyse" && task["threads"] != nil && int(task["threads"].(float64)) == total
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for countLines(t, engineLog, fmt.Sprintf("setoption name Threads value %d", total)) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the puzzle engine was not given all %d threads", total)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Stop: nothing else to do, so the engine is closed.
+	quits := countLines(t, engineLog, "quit")
+	h.do("POST", "/api/puzzles/stop", map[string]any{"profile": "lichess:slow"}, nil)
+	deadline = time.Now().Add(5 * time.Second)
+	for countLines(t, engineLog, "quit") == quits {
+		if time.Now().After(deadline) {
+			t.Fatal("the engine was not closed after Stop")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	h.do("POST", "/api/analyze/"+job+"/stop", nil, nil)
 }

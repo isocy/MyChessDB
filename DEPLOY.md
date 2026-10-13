@@ -145,7 +145,7 @@ later, it is green like any saved analysis until the new search goes deeper.
   use it.
 - **Live analysis: on/off** above the board, next to Flip board, turns it on and off.
   It is on until turned off; the choice is remembered in the browser. It needs
-  the engine bridge 1.0.6 or newer (the site now asks for 1.0.7, which the
+  the engine bridge 1.0.6 or newer (the site now asks for 1.0.8, which the
   puzzles need); without it the button's tooltip says why
   nothing happens. The tooltip also tells how the last save went.
 
@@ -202,7 +202,7 @@ The second view of the page, **Puzzles from your games** (linked at the top
 of the panel; the address ends in `#puzzles`), makes puzzles from a player's
 own games: positions where one move was clearly better than every other and
 the player missed it. It needs nothing from this site's server: the engine
-bridge (1.0.7 or newer) fetches the games from chess.com's and Lichess's
+bridge (1.0.8 or newer) fetches the games from chess.com's and Lichess's
 public APIs, analyses them with Stockfish 19 and finds the puzzles on the
 player's computer, and the puzzles and how they were solved are kept in the
 browser (IndexedDB). **Export** and **Import** under *Settings and data* move
@@ -289,6 +289,11 @@ Live analysis only runs while the best moves are shown.
   1 GB, and ends after a minute without searches. The view says when the
   bridge is missing or too old, with a button to the setup (or update)
   instructions.
+- **Puzzles come first**: their engine always searches with all the threads
+  the bridge may use (all cores but one), also while analyses of positions
+  run; an analysis started meanwhile counts it as one more analysis when it
+  takes its share, so the puzzles keep the larger part of the processor.
+  **Stop** with no other update left closes the engine.
 - The bridge's API for it: `POST /api/puzzles/update` (`{profile, site,
   username, effort}`), `GET /api/puzzles?profile=` (the rating, how many
   games are fetched, count and are analysed, what it is doing, and what it
@@ -581,7 +586,7 @@ kept in the repository).
 plus `SHA256SUMS`. To rebuild after changing `bridge/*.go`, install Go and run
 `scripts\build_bridge.ps1` (Windows) or `sh scripts/build_bridge.sh`, then
 deploy. Builds are reproducible: the same Go version gives byte-identical
-files. The current ones (1.0.7) were built with Go 1.24.7.
+files. The current ones (1.0.8) were built with Go 1.24.7.
 
 The site names the bridge version it expects (`BRIDGE_MIN_VERSION` in
 `web/app.js`). An older bridge keeps working, and the site shows an **Update**
@@ -589,7 +594,8 @@ button with the install command. Bridges before 1.0.4 do not report the search
 as it goes, so with them the page is not updated during an analysis and Stop
 saves nothing. Bridges before 1.0.5 cannot hold an analysis that is waiting in
 the queue; with them its Pause button stays disabled. Bridges before 1.0.6 have
-no live analysis, and bridges before 1.0.7 cannot find puzzles.
+no live analysis, and bridges before 1.0.8 cannot find puzzles (1.0.7, the
+first with puzzles, gave them only a share of the processor).
 
 If you deploy from another copy of the repository, make sure `web/bridge/` is
 there (commit it, or build it), otherwise the install command has nothing to
@@ -661,7 +667,7 @@ Puzzles, checked by hand on Windows 11:
   games of a 1365-rated player: 10 puzzles from the first version (in the
   page), 8 from the bridge's (mostly the same positions; Stockfish on
   several threads does not find exactly the same lines twice), checked by eye
-- bridge 1.0.7 with the real Stockfish 19, chess.com and Lichess, and the
+- bridge 1.0.7 and 1.0.8 with the real Stockfish 19, chess.com and Lichess, and the
   page in the browser built into the Claude desktop app (Chromium): a
   chess.com and a Lichess account updated together (232 chess.com months
   fetched by the bridge, the accounts taking turns, their puzzles in one
@@ -679,7 +685,7 @@ Puzzles, checked by hand on Windows 11:
 
 Not yet run anywhere:
 
-- bridge 1.0.7 on macOS and Linux, and its install over 1.0.6 with the
+- bridge 1.0.8 on macOS and Linux, and its install over 1.0.6 with the
   install command (on Windows it was run from a build, not installed)
 - the puzzle animations seen on screen (the desktop app's browser was hidden
   while it was tested, so the animations were checked to start, not watched)

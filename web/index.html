@@ -221,7 +221,8 @@
     .puzzle-info a, #puzzle-view small a { color:#9bc4ff; }
     #puzzle-view details { margin-top:12px; }
     #puzzle-view summary { cursor:pointer; user-select:none; color:#ddd; }
-    #pz-pool-list { list-style:none; padding:0; margin:6px 0; max-height:320px; overflow:auto; }
+    /* Room on the right for a scroll bar drawn over the list (Firefox, macOS). */
+    #pz-pool-list { list-style:none; padding:0 14px 0 0; margin:6px 0; max-height:320px; overflow:auto; scrollbar-gutter:stable; }
     #pz-pool-list li { display:flex; align-items:center; gap:6px; background:#1c1c1c; padding:5px 8px; border-radius:4px; margin:3px 0; font-size:12px; }
     #pz-pool-list li.current { outline:1px solid #6bbf7b; }
     #pz-pool-list .pool-text { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; text-align:left; background:none; border:0; padding:2px 0; color:#ddd; }
@@ -399,7 +400,7 @@
       <ul>
         <li>Give your chess.com and/or Lichess username: the puzzles of both are shown together, each marked with its site.</li>
         <li>Update asks the engine bridge on your computer to fetch your rated rapid games and analyse the ones in which your rating was at least 80% of your current rapid rating (for each site its own rating), newest first, until all of them are done. It goes on by itself while the bridge runs, also with this tab closed; the puzzles it found show up here the next time. When your rating changes, Update re-checks the games already fetched and analyses the ones that now count.</li>
-        <li>Each game is analysed by Stockfish 19 the way Lichess's computer analysis does it (1,000,000 nodes per position). A Lichess game that Lichess has already analysed uses Lichess's own evaluations.</li>
+        <li>Each game is analysed by Stockfish 19 the way Lichess's computer analysis does it (1,000,000 nodes per position), with all the threads the bridge may use (all cores but one), also while it analyses positions. A Lichess game that Lichess has already analysed uses Lichess's own evaluations.</li>
         <li>Puzzles are found the way Lichess finds its puzzles: where your opponent's move gave you a winning chance or a mate, and the winning line is one where each of your moves is clearly the only good one.</li>
         <li>Lichess only makes puzzles where the opponent has just blundered. So where your move was a mistake or a blunder, the position is also a puzzle when its best move was the only good one: every other move would have been a blunder too.</li>
         <li>A puzzle is kept only if you missed it in the game.</li>
