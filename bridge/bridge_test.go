@@ -12,6 +12,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -76,9 +77,7 @@ func newHarness(t *testing.T, maxJobs int) *harness {
 		store: store, verifier: verifier,
 		installer: &installer{dir: dir, store: store, verifier: verifier, status: installStatus{State: "idle"}},
 	}
-	srv.jobs = newJobManager(maxJobs, srv.currentEngine)
-	srv.live = newLiveEngine(srv.currentEngine, srv.jobs.runningCount)
-	srv.jobs.liveLoad = srv.live.load
+	srv.connectEngines(maxJobs)
 	ts := httptest.NewServer(srv)
 	fmt.Sscanf(ts.URL[strings.LastIndex(ts.URL, ":")+1:], "%d", &srv.port)
 	h := &harness{t: t, srv: srv, http: ts, dir: dir, origin: site}
@@ -131,7 +130,6 @@ func (h *harness) do(method, path string, body any, headers map[string]string) r
 	return out
 }
 
-const startFEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 const blackFEN = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1"
 
 func (h *harness) start(fen string, depth int) string {
@@ -1185,5 +1183,249 @@ func TestExtractFromZip(t *testing.T) {
 	os.WriteFile(archive, []byte("not a zip"), 0o644)
 	if _, _, err := extractEngine(archive, dir); err == nil {
 		t.Fatal("garbage accepted as a zip")
+	}
+}
+
+// The puzzle finder's searches: one limited search at a time, several lines,
+// answered when Stockfish has finished; the same engine for one search after
+// another.
+func TestSearch(t *testing.T) {
+	t.Setenv("MOCK_DELAY_MS", "5")
+	engineLog := filepath.Join(t.TempDir(), "engine.log")
+	t.Setenv("MOCK_LOG", engineLog)
+	h := newHarness(t, 4)
+	search := func(request searchRequest) (searchResult, error) {
+		return h.srv.search.search(context.Background(), request)
+	}
+
+	for _, request := range []searchRequest{
+		{Fen: "8/8/8 w - -\nquit", Depth: 5},
+		{Fen: startFEN, Moves: []string{"e2e4\nquit"}, Depth: 5},
+		{Fen: startFEN, Moves: []string{"e2e4"}},
+		{Fen: startFEN, Depth: 5, MultiPV: searchMaxMultiPV + 1},
+		{Fen: startFEN, Nodes: -1},
+		{Fen: startFEN, Movetime: searchMaxTimeMs + 1},
+	} {
+		if _, err := search(request); err == nil {
+			t.Fatalf("refused: %+v", request)
+		}
+	}
+
+	result, err := search(searchRequest{Fen: startFEN, Moves: []string{"e2e4", "e7e5"}, Depth: 4, Nodes: 1000000,
+		Movetime: 30000, MultiPV: 2, NewGame: true})
+	if err != nil || result.BestMove != "e2e4" || len(result.Lines) != 2 {
+		t.Fatalf("search: %v %+v", err, result)
+	}
+	first, second := result.Lines[0], result.Lines[1]
+	if first.MultiPV != 1 || first.Depth != 4 || first.Score.Cp == nil || *first.Score.Cp != 32 || first.PV[0] != "e2e4" ||
+		second.Score.Cp == nil || *second.Score.Cp != -68 || second.PV[0] != "a2a3" {
+		t.Fatalf("two lines, best first, with exact scores (not the upper bound): %+v", result.Lines)
+	}
+	for _, sent := range []string{"setoption name MultiPV value 2", "ucinewgame",
+		"position fen " + startFEN + " moves e2e4 e7e5", "go depth 4 nodes 1000000 movetime 30000"} {
+		if countLines(t, engineLog, sent) != 1 {
+			t.Fatalf("the engine was not sent %q", sent)
+		}
+	}
+
+	result, err = search(searchRequest{Fen: blackFEN, Depth: 2})
+	if err != nil || len(result.Lines) != 1 || result.BestMove != "e7e5" {
+		t.Fatalf("one line: %v %+v", err, result)
+	}
+	if countLines(t, engineLog, "setoption name MultiPV value 1") != 1 || countLines(t, engineLog, "ucinewgame") != 1 {
+		t.Fatal("the same engine is used again, back to one line, without forgetting the game")
+	}
+
+	// A search that is cancelled is stopped, and the next one works.
+	t.Setenv("MOCK_DELAY_MS", "20")
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if _, err := h.srv.search.search(ctx, searchRequest{Fen: startFEN, Depth: 200}); err == nil {
+		t.Fatal("a 4-second search answered within 300 ms")
+	}
+	if h.srv.search.load() != 0 || countLines(t, engineLog, "stop") != 1 {
+		t.Fatal("the cancelled search was stopped with \"stop\"")
+	}
+	if _, err := search(searchRequest{Fen: startFEN, Depth: 2}); err != nil {
+		t.Fatalf("after a cancelled search: %v", err)
+	}
+	if n := countLines(t, engineLog, "setoption name Syzygy50MoveRule value false"); n != 1 {
+		t.Fatalf("one engine for every search (%d started)", n)
+	}
+}
+
+// The puzzle search engine ends when it has not been used for a while.
+func TestSearchEngineCloses(t *testing.T) {
+	saved := searchIdleQuit
+	searchIdleQuit = 200 * time.Millisecond
+	t.Cleanup(func() { searchIdleQuit = saved })
+	t.Setenv("MOCK_DELAY_MS", "5")
+	t.Setenv("MOCK_SCORE", "mate -3")
+	engineLog := filepath.Join(t.TempDir(), "engine.log")
+	t.Setenv("MOCK_LOG", engineLog)
+	h := newHarness(t, 4)
+	result, err := h.srv.search.search(context.Background(), searchRequest{Fen: startFEN, Depth: 2})
+	if err != nil || result.Lines[0].Score.Mate == nil || *result.Lines[0].Score.Mate != -3 || result.Lines[0].Score.Cp != nil {
+		t.Fatalf("a mate score: %v %+v", err, result)
+	}
+	quits := countLines(t, engineLog, "quit")
+	time.Sleep(searchIdleQuit + 300*time.Millisecond)
+	if n := countLines(t, engineLog, "quit"); n != quits+1 {
+		t.Fatalf("the idle engine was not closed (quit sent %d more times)", n-quits)
+	}
+	if _, err := h.srv.search.search(context.Background(), searchRequest{Fen: startFEN, Depth: 2}); err != nil {
+		t.Fatalf("a new engine for the next search: %v", err)
+	}
+}
+
+// puzzlesWhen waits until done(view) for the profile.
+func (h *harness) puzzlesWhen(profile string, done func(view map[string]any) bool) map[string]any {
+	h.t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		view := h.do("GET", "/api/puzzles?profile="+profile, nil, nil).body
+		if done(view) {
+			return view
+		}
+		if time.Now().After(deadline) {
+			h.t.Fatalf("waited in vain for %s: %v", profile, view)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func finished(view map[string]any) bool { return view["running"] == false && view["task"] == nil }
+
+// One update goes to the end by itself: the rating, the games, and every
+// game that counts analysed, newest first; the results wait to be collected.
+func TestPuzzleUpdate(t *testing.T) {
+	t.Setenv("MOCK_DELAY_MS", "1")
+	var requests []string
+	fakeSites(t, 3, &requests)
+	h := newHarness(t, 4)
+	if r := h.do("GET", "/api/status", nil, nil); r.body["puzzles"] != true || r.body["version"] != version {
+		t.Fatalf("the status names the puzzles: %v", r.body)
+	}
+	update := map[string]any{"profile": "lichess:me", "site": "lichess", "username": "Me", "effort": "quick"}
+	for _, change := range []map[string]any{{"site": "fics"}, {"username": "Me quit"}, {"profile": "lichess:other"}, {"effort": "slow"}} {
+		body := map[string]any{}
+		for key, value := range update {
+			body[key] = value
+		}
+		for key, value := range change {
+			body[key] = value
+		}
+		if r := h.do("POST", "/api/puzzles/update", body, nil); r.status != 400 {
+			t.Fatalf("refused: %v -> %d %v", change, r.status, r.body)
+		}
+	}
+	if r := h.do("POST", "/api/puzzles/update", update, map[string]string{"Origin": ""}); r.status != 403 {
+		t.Fatalf("only the site may start it: %d", r.status)
+	}
+	if r := h.do("POST", "/api/puzzles/update", update, nil); r.status != 200 || r.body["running"] != true {
+		t.Fatalf("update: %d %v", r.status, r.body)
+	}
+	view := h.puzzlesWhen("lichess:me", finished)
+	results := view["results"].([]any)
+	order := []string{}
+	for _, result := range results {
+		order = append(order, result.(map[string]any)["id"].(string))
+	}
+	if !reflect.DeepEqual(order, []string{"lichess:g0", "lichess:g1", "lichess:g2"}) {
+		t.Fatalf("newest first: %v", order)
+	}
+	game := results[0].(map[string]any)["game"].(map[string]any)
+	if game["opponent"] != "Opp" || len(game["moves"].([]any)) != 4 || game["evals"] != nil || game["playedAt"].(float64) != 2000 {
+		t.Fatalf("each result carries its game: %v", game)
+	}
+	if view["rating"].(float64) != 1500 || view["games"].(float64) != 3 || view["counted"].(float64) != 3 ||
+		view["analysed"].(float64) != 3 || view["pending"].(float64) != 0 || view["complete"] != true {
+		t.Fatalf("counts: %v", view)
+	}
+
+	// Collected results go; another update analyses nothing twice.
+	h.do("POST", "/api/puzzles/collected", map[string]any{"profile": "lichess:me", "games": order}, nil)
+	h.do("POST", "/api/puzzles/update", update, nil)
+	view = h.puzzlesWhen("lichess:me", finished)
+	if len(view["results"].([]any)) != 0 || view["analysed"].(float64) != 3 {
+		t.Fatalf("the second update: %v", view)
+	}
+	if last := requests[len(requests)-1]; !strings.Contains(last, "since=2001") {
+		t.Fatalf("the second update asks for the games since: %s", last)
+	}
+
+	// A player who is not there: the update ends, saying why.
+	nobody := map[string]any{"profile": "lichess:nobody", "site": "lichess", "username": "nobody", "effort": "quick"}
+	h.do("POST", "/api/puzzles/update", nobody, nil)
+	view = h.puzzlesWhen("lichess:nobody", finished)
+	if !strings.Contains(fmt.Sprint(view["error"]), "no such player") {
+		t.Fatalf("an unknown player: %v", view)
+	}
+	// Forget.
+	h.do("POST", "/api/puzzles/forget", map[string]any{"profile": "lichess:me"}, nil)
+	if view := h.do("GET", "/api/puzzles?profile=lichess:me", nil, nil).body; view["known"] != false {
+		t.Fatalf("forgotten: %v", view)
+	}
+}
+
+// Stop keeps what was done; the next update carries on. What is under way
+// when the bridge closes goes on when it starts again.
+func TestPuzzleUpdateStopAndRestart(t *testing.T) {
+	t.Setenv("MOCK_DELAY_MS", "20")
+	var requests []string
+	fakeSites(t, 4, &requests)
+	h := newHarness(t, 4)
+	update := map[string]any{"profile": "lichess:slow", "site": "lichess", "username": "slow", "effort": "lichess"}
+	analysing := func(view map[string]any) bool {
+		task, _ := view["task"].(map[string]any)
+		return task != nil && task["step"] == "analyse"
+	}
+	h.do("POST", "/api/puzzles/update", update, nil)
+	h.puzzlesWhen("lichess:slow", analysing)
+	if r := h.do("POST", "/api/puzzles/stop", map[string]any{"profile": "lichess:slow"}, nil); r.body["running"] != false {
+		t.Fatalf("stop: %v", r.body)
+	}
+	view := h.puzzlesWhen("lichess:slow", finished)
+	if done := len(view["results"].([]any)); done == 4 || view["pending"].(float64) == 0 {
+		t.Fatalf("stopped before the end: %v", view)
+	}
+
+	h.do("POST", "/api/puzzles/update", update, nil)
+	h.puzzlesWhen("lichess:slow", analysing)
+	h.srv.puzzles.shutdown()
+	t.Setenv("MOCK_DELAY_MS", "1")
+	again := newPuzzleManager(h.dir, h.srv.search.search, h.srv.currentEngine)
+	t.Cleanup(again.shutdown)
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		view := again.view("lichess:slow")
+		if !view.Running && view.Task == nil && view.Pending == 0 && len(view.Results) == 4 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the update did not carry on after a restart: %+v", view)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// Two accounts (one per site) are brought up to date together, taking turns.
+func TestPuzzleTwoAccounts(t *testing.T) {
+	t.Setenv("MOCK_DELAY_MS", "1")
+	var requests []string
+	fakeSites(t, 3, &requests)
+	h := newHarness(t, 4)
+	h.do("POST", "/api/puzzles/update", map[string]any{"profile": "lichess:me", "site": "lichess", "username": "Me", "effort": "quick"}, nil)
+	h.do("POST", "/api/puzzles/update", map[string]any{"profile": "chesscom:me", "site": "chesscom", "username": "Me", "effort": "quick"}, nil)
+	lichess := h.puzzlesWhen("lichess:me", finished)
+	chesscom := h.puzzlesWhen("chesscom:me", finished)
+	if len(lichess["results"].([]any)) != 3 || len(chesscom["results"].([]any)) != 160 {
+		t.Fatalf("both accounts: %d Lichess, %d chess.com results", len(lichess["results"].([]any)), len(chesscom["results"].([]any)))
+	}
+	analysedAt := func(view map[string]any, i int) float64 {
+		return view["results"].([]any)[i].(map[string]any)["analysed_at"].(float64)
+	}
+	if analysedAt(lichess, 2) > analysedAt(chesscom, 3) {
+		t.Fatal("the accounts take turns: Lichess's three games are done before chess.com's fourth")
 	}
 }

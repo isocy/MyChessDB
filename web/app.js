@@ -7,9 +7,10 @@
 // computer through the engine bridge at http://127.0.0.1:8765.
 import * as chess from "./chesslib.js";
 import { BrowserEngine, browserEngineSupported, ENGINE_SIZE_MB } from "./browserengine.js";
+import { playMoveSound } from "./sounds.js";
 
 const BRIDGE_URL = "http://127.0.0.1:8765";
-const BRIDGE_MIN_VERSION = "1.0.6";
+const BRIDGE_MIN_VERSION = "1.0.7";
 // Phones and tablets cannot run the engine bridge, so on them it is neither
 // offered nor looked for (looking would ask for local network access for
 // nothing). iPads say they are Macs, but Macs have no touch screen.
@@ -29,37 +30,10 @@ const ENGINES = {stockfish:"Stockfish 19",lichess:"Lichess"};
 // Analyses started from this page (or picked up from the bridge), by engine
 // and position (see jobKey).
 const activeJobs = new Map();
-let audioContext=null;
+// Which of the two views is shown: "best" (this file) or "puzzles"
+// (puzzles.js). See showPage.
+let page = "best";
 function status(text) { document.querySelector("#status").textContent=text; }
-function playMoveSound(kind) {
-  try {
-    audioContext ||= new (window.AudioContext || window.webkitAudioContext)();
-    if(audioContext.state==="suspended") audioContext.resume();
-    const now=audioContext.currentTime;
-    const patterns={
-      move:[[440,0.06,0.04,0]],
-      capture:[[330,0.08,0.06,0],[220,0.12,0.07,0]],
-      castle:[[392,0.07,0.04,0],[523,0.13,0.07,0]],
-      check:[[660,0.08,0.05,0],[880,0.14,0.08,0]],
-      mate:[[660,0.08,0.06,0],[523,0.08,0.06,0],[330,0.2,0.1,0]],
-      ui:[[520,0.05,0.035,0]],
-      complete:[[523,0.16,0.05,0],[659,0.16,0.05,0.14],[784,0.18,0.06,0.28],[1047,0.6,0.07,0.44]]
-    };
-    for(const [frequency,duration,volume,offset] of patterns[kind]||patterns.move) {
-      const start=now+(offset||0);
-      const oscillator=audioContext.createOscillator();
-      const gain=audioContext.createGain();
-      oscillator.type=kind==="capture"?"square":"sine";
-      oscillator.frequency.value=frequency;
-      gain.gain.setValueAtTime(volume,start);
-      gain.gain.exponentialRampToValueAtTime(0.001,start+duration);
-      oscillator.connect(gain).connect(audioContext.destination);
-      oscillator.start(start); oscillator.stop(start+duration);
-    }
-  } catch(error) {
-    console.warn("Move sound unavailable",error);
-  }
-}
 // Same position => same key, however the en passant square was written.
 function positionKey(fen) { return chess.positionKey(fen); }
 function jobKey(source, fen) { return `${source}|${positionKey(fen)}`; }
@@ -369,7 +343,7 @@ function updateHistoryControls() {
   document.querySelector("#history-forward").disabled=state.historyIndex>=state.history.length-1;
   document.querySelector("#history-last").disabled=state.historyIndex>=state.history.length-1;
 }
-function showHistoryPosition(index) {
+function showHistoryPosition(index, { sound=true }={}) {
   if(index<0||index>=state.history.length) return;
   if(index===state.historyIndex) return;
   const previousIndex=state.historyIndex;
@@ -400,7 +374,7 @@ function showHistoryPosition(index) {
   animateNextRender=true;
   render();
   updateHistoryControls();
-  playMoveSound(index>previousIndex?position.lastSound||"move":previousPosition?.lastSound||"move");
+  if(sound) playMoveSound(index>previousIndex?position.lastSound||"move":previousPosition?.lastSound||"move");
   void updateOpeningDisplay();
 }
 function parseFen(fen, openingMoves=null, positionHistory=null) {
@@ -522,10 +496,18 @@ function renderAnnotations() {
 // Each side's captures go next to that side of the board: the side at the
 // bottom (White, unless the board is flipped) below it, the other above.
 function renderMaterialStatus() {
-  const top=document.querySelector("#captured-top"), bottom=document.querySelector("#captured-bottom");
+  drawMaterial(document.querySelector("#captured-top"),document.querySelector("#captured-bottom"),state.board.flat(),state.captured,state.flipped);
+}
+/**
+ * The captured pieces of each side and who is ahead in material by how much,
+ * next to that side of the board (the puzzle board shows them the same way).
+ * board: 64 squares, a8 first, "" when empty; captured: {w, b}, the pieces
+ * each side has taken.
+ */
+export function drawMaterial(top, bottom, board, captured, flipped) {
   const scoreOf=piece=>({p:1,n:3,b:3,r:5,q:9}[piece.toLowerCase()]||0);
   const material={w:0,b:0};
-  for(const piece of state.board.flat()) {
+  for(const piece of board) {
     if(piece) material[piece===piece.toUpperCase()?"w":"b"]+=scoreOf(piece);
   }
   const difference=material.w-material.b;
@@ -544,7 +526,7 @@ function renderMaterialStatus() {
     const set=document.createElement("span");
     set.className="captured-set";
     for(const type of ["p","n","b","r","q"]) {
-      const sameType=[...state.captured[color]].filter(piece=>piece.toLowerCase()===type);
+      const sameType=[...captured[color]].filter(piece=>piece.toLowerCase()===type);
       if(!sameType.length) continue;
       const group=document.createElement("span");
       group.className="captured-piece-group";
@@ -567,7 +549,7 @@ function renderMaterialStatus() {
       points.textContent=`+${advantage}`;
       row.appendChild(points);
     }
-    ((color==="w")!==state.flipped?bottom:top).appendChild(row);
+    ((color==="w")!==flipped?bottom:top).appendChild(row);
   }
 }
 // Pieces that move by themselves slide to their new square instead of
@@ -1228,9 +1210,11 @@ async function bridge(path, options={}) {
     response=await fetch(BRIDGE_URL+path,{
       method:options.method||(options.body!==undefined?"POST":"GET"),
       headers:options.body!==undefined?{"Content-Type":"application/json"}:{},
-      body:options.body!==undefined?JSON.stringify(options.body):undefined
+      body:options.body!==undefined?JSON.stringify(options.body):undefined,
+      signal:options.signal
     });
   } catch(error) {
+    if(error.name==="AbortError") throw error;   // cancelled by the caller
     if(bridgeState.connected){ bridgeState.connected=false; bridgeState.status=null; renderBridge(); }
     const failure=Error("The engine bridge is not running on this computer.");
     failure.code="BRIDGE_OFFLINE";
@@ -1274,6 +1258,7 @@ function renderBridge() {
     connect.style.display="";
     connect.textContent=bridgeState.waiting?"Hide setup":"Connect";
     engineInput.disabled=true;
+    notifyBridgeListeners();
     return;
   }
   // An out-of-date bridge keeps working, but the button stays so the install
@@ -1295,7 +1280,11 @@ function renderBridge() {
   if(outdated) message+=" · this bridge is out of date: run the install command again (Update)";
   text.textContent=`Engine bridge ${info.version} connected · ${message}`;
   if(bridgeState.waiting && !outdated){ bridgeState.waiting=false; document.querySelector("#bridge-setup").style.display="none"; }
+  notifyBridgeListeners();
 }
+// The puzzle view is told whenever the bridge's state may have changed.
+const bridgeListeners=new Set();
+function notifyBridgeListeners() { for(const listener of bridgeListeners) listener(); }
 function scheduleBridgeCheck() {
   clearTimeout(bridgeState.timer);
   const installing=bridgeState.connected && INSTALL_BUSY.includes(bridgeState.status?.install.state);
@@ -1499,7 +1488,7 @@ function liveBackend() {
 function liveAvailable() { return liveBackend()!==null; }
 // The position the bridge should be searching now, or null for none.
 function liveTarget() {
-  if(!liveState.enabled || state.view==="lichess" || document.hidden || !liveAvailable()) return null;
+  if(!liveState.enabled || state.view==="lichess" || document.hidden || page!=="best" || !liveAvailable()) return null;
   const fen=currentFen();
   // A Stockfish analysis of this position is running: it shows its own progress.
   const job=activeJobs.get(jobKey("stockfish",fen));
@@ -2445,6 +2434,93 @@ async function renderHistory() {
   try {
     await loadSession();
   } catch(e) { status(e.message); }
+  showPage(pageInAddress());
   // Only look for the bridge by ourselves if this browser has used it before.
   if(!MOBILE && localStorage.getItem("chessdb_bridge_used")) await checkBridge();
 })();
+
+// ===========================================================================
+// Two views in one page: the best moves (this file) and the puzzles from the
+// player's own games (puzzles.js, loaded the first time it is shown).
+// Switching between them keeps each as it was, and a puzzle update goes on
+// while the best moves are shown. The address says which one ("#puzzles"),
+// so the browser's back button and a reload keep it too.
+// ===========================================================================
+let puzzlesModule=null;
+const pageInAddress=()=>location.hash==="#puzzles"?"puzzles":"best";
+function showPage(name) {
+  const changed=name!==page;
+  page=name;
+  document.querySelector("#best-view").hidden=name!=="best";
+  document.querySelector("#puzzle-view").hidden=name!=="puzzles";
+  document.title=name==="puzzles"?"My Chess DB · Puzzles":"My Chess DB";
+  // Live analysis follows this board only while it is shown.
+  syncLiveAnalysis();
+  if(name==="puzzles") {
+    puzzlesModule ||= import("./puzzles.js");
+    puzzlesModule.then(module=>module.pageShown(),error=>{ console.error(error); status(`Could not load the puzzles: ${error.message}`); });
+  } else if(changed) {
+    cancelPieceDrag();
+  }
+}
+/** Shows a view, as a new entry in the browser's history. */
+export function goToPage(name) {
+  if(pageInAddress()!==name) history.pushState(null,"",name==="puzzles"?"#puzzles":location.pathname+location.search);
+  showPage(name);
+}
+window.addEventListener("popstate",()=>showPage(pageInAddress()));
+window.addEventListener("hashchange",()=>showPage(pageInAddress()));
+for(const link of document.querySelectorAll("[data-page]")) {
+  link.addEventListener("click",event=>{
+    event.preventDefault();
+    playMoveSound("ui");
+    goToPage(link.dataset.page);
+  });
+}
+
+// What the puzzle view uses from here: the engine bridge and the board.
+export { MOBILE, bridge, checkBridge, versionAtLeast };
+/** The bridge's /api/status while it is connected, else null. */
+export function bridgeStatus() { return bridgeState.connected?bridgeState.status:null; }
+/** Calls listener whenever the bridge's state may have changed. */
+export function onBridgeChange(listener) { bridgeListeners.add(listener); }
+/** Shows the engine bridge's setup (or update) instructions. */
+export function openBridgeSetup() {
+  goToPage("best");
+  showBridgeSetup(true);
+  document.querySelector("#bridge-bar").scrollIntoView({block:"center",behavior:"smooth"});
+}
+/**
+ * Opens a line of moves (from the starting position, or startFen) on this
+ * board, as if they had been played here: with the history, the opening
+ * name and live analysis, shown after `index` of the moves.
+ */
+export function openLine({ startFen=chess.START_FEN, moves, index=moves.length, flipped=false }) {
+  let position=chess.parseFen(startFen);
+  const tracking=positionKey(startFen)===positionKey(chess.START_FEN);
+  const openingMoves=[], captured={w:[],b:[]};
+  const snapshot=(last,lastSound)=>({
+    board:Array.from({length:8},(_,row)=>position.board.slice(row*8,row*8+8)),
+    turn:position.turn, castling:position.castling, ep:position.ep>=0?chess.squareName(position.ep):"-",
+    last, lastSound, captured:{w:[...captured.w],b:[...captured.b]}, flipped,
+    openingTracking:tracking, openingMoves:openingMoves.slice(),
+  });
+  const snapshots=[snapshot(null,"move")];
+  for(const uci of moves) {
+    const legal=chess.legalMoves(position), move=chess.parseUci(position,uci,legal);
+    if(!move) break;
+    if(move.captured) captured[position.turn].push(move.captured);
+    const next=chess.makeMove(position,move), check=chess.inCheck(next);
+    const sound=check?(chess.legalMoves(next).length?"check":"mate"):move.castle?"castle":move.captured?"capture":"move";
+    openingMoves.push(chess.moveToUci(move).slice(0,4));
+    position=next;
+    snapshots.push(snapshot(chess.moveToUci(move).slice(0,4),sound));
+  }
+  goToPage("best");
+  const last=snapshots[snapshots.length-1];
+  parseFen(snapshotFen(last),tracking?last.openingMoves:null,snapshots);
+  state.flipped=flipped;
+  if(index<snapshots.length-1) showHistoryPosition(Math.max(0,index),{sound:false});
+  else render();
+  window.scrollTo({top:0,behavior:"smooth"});
+}

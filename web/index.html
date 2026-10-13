@@ -48,12 +48,12 @@
     @media (orientation: landscape) and (min-width: 640px) and (max-height: 599px) {
       :root { --tools-h:0px; }
     }
-    #board { display:grid; grid-template-columns:repeat(8,1fr); grid-template-rows:repeat(8,1fr); width:100%; height:100%; }
-    #board-wrap { position:relative; flex:1 1 auto; min-width:0; aspect-ratio:1; }
-    #annotation-layer { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+    .board { position:relative; display:grid; grid-template-columns:repeat(8,1fr); grid-template-rows:repeat(8,1fr); width:100%; height:100%; }
+    .board-wrap { position:relative; flex:1 1 auto; min-width:0; aspect-ratio:1; }
+    .annotation-layer { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
     /* The evaluation bar stands left of the board, as tall as it; everything
        else in the column lines up with the board. */
-    #board-row { display:flex; gap:var(--eval-gap); }
+    .board-row { display:flex; gap:var(--eval-gap); }
     .board-tools, #captured-bottom, .history-controls, #opening-status, .board-hints { margin-left:var(--side); }
     /* The guide stays as wide as the board and starts folded. */
     .board-hints { margin-top:8px; color:#aaa; font-size:12px; }
@@ -114,6 +114,9 @@
     .legal-castle::after { content:""; width:calc(var(--board) * .0286); height:calc(var(--board) * .0286); border-radius:50%; background:rgba(55,170,75,.78); }
     .square { position:relative; }
     aside { background:var(--panel); padding:16px; border-radius:6px; }
+    .page-nav { display:flex; gap:14px; margin:-4px 0 8px; font-size:13px; }
+    .page-nav a { color:#9bc4ff; }
+    .page-nav [aria-current] { color:#fff; font-weight:600; }
     /* Phones zoom into a text field whose text is smaller than 16px. */
     @media (pointer: coarse) { input { font-size:16px; } }
     /* Phones and tablets cannot run the engine bridge (app.js marks them). */
@@ -135,8 +138,8 @@
     /* Each side's captures sit next to that side of the board: White's
        below and Black's above, the other way round when the board is flipped. */
     .material-status { box-sizing:border-box; padding:4px 10px; background:var(--panel); border-radius:4px; }
-    #captured-bottom { margin-top:6px; }
-    .board-tools #captured-top { flex:1 1 0; min-width:0; overflow:hidden; }
+    #captured-bottom, #pz-captured-bottom { margin-top:6px; }
+    .board-tools #captured-top, .board-tools #pz-captured-top { flex:1 1 0; min-width:0; overflow:hidden; }
     .captured-row { display:flex; align-items:center; gap:0; min-height:24px; }
     .captured-label { width:112px; color:#bbb; flex:0 0 auto; }
     .captured-pieces { display:flex; align-items:center; flex:1; min-width:0; }
@@ -173,17 +176,74 @@
     #admin-tools li button { padding:3px 8px; flex:0 0 auto; }
     .admin-item-text { flex:1; min-width:0; overflow-wrap:anywhere; }
     #admin-note { white-space:pre-wrap; overflow-wrap:anywhere; color:#9bd49b; font-size:12px; min-height:16px; margin-top:6px; user-select:text; }
+    /* ---------------------------------------------------------------- puzzles
+       The puzzle view (puzzles.js): the same board as above, without the
+       evaluation bar, and its own panel. */
+    [hidden] { display:none !important; }
+    #puzzle-view > section { --side:0px; --board:min(720px, 100cqw - 2px); }
+    @media (orientation: landscape) and (min-width: 640px) {
+      #puzzle-view > section { --board:min(560px, 100svh - 2 * var(--pad) - var(--tools-h), 100cqw - var(--gap) - 282px); }
+    }
+    .board .square.check { background-image:radial-gradient(ellipse at center, #ff0000 0%, #e70000 25%, rgba(169,0,0,0) 89%); }
+    .mark { position:absolute; z-index:4; top:-7%; right:-7%; width:36%; height:36%; border-radius:50%; display:flex; align-items:center; justify-content:center; font:700 clamp(9px, calc(var(--board) * .028), 16px)/1 Segoe UI,sans-serif; color:#fff; box-shadow:0 1px 3px rgba(0,0,0,.5); pointer-events:none; }
+    .mark.good { background:#629924; } .mark.bad { background:#df5353; }
+    .promotion { position:absolute; z-index:6; width:12.5%; height:62.5%; display:flex; background:#f4f4f4; box-shadow:0 2px 12px rgba(0,0,0,.7); border-radius:4px; overflow:hidden; }
+    .promotion button { flex:1 1 0; min-height:0; padding:0; border:0; border-radius:0; background:transparent; display:flex; align-items:center; justify-content:center; color:#333; font-size:22px; }
+    @media (hover: hover) { .promotion button:hover { background:#d6e6ff; } }
+    .promotion img { width:86%; height:86%; object-fit:contain; pointer-events:none; }
+    .to-move { flex:0 0 auto; display:flex; align-items:center; gap:6px; color:#ccc; min-height:30px; white-space:nowrap; }
+    .to-move .swatch { width:16px; height:16px; border-radius:50%; border:1px solid #888; flex:0 0 auto; }
+    #puzzle-view h1 { font-size:17px; margin:0 0 4px; }
+    #puzzle-view select { font:inherit; padding:8px; border-radius:4px; border:1px solid #555; background:#151515; color:#eee; }
+    @media (pointer: coarse) { #puzzle-view select { font-size:16px; } }
+    #puzzle-view button:disabled { cursor:default; opacity:.5; }
+    #pz-accounts { display:grid; grid-template-columns:auto 1fr auto; gap:6px 8px; align-items:center; margin:7px 0; }
+    #pz-accounts label { margin:0; }
+    #pz-accounts input { min-width:0; }
+    #pz-accounts button { grid-column:3; grid-row:1 / span 2; align-self:stretch; }
+    .site-tag { flex:0 0 auto; font-size:10px; padding:1px 5px; border-radius:3px; color:#111; }
+    .site-tag.chesscom { background:#81b64c; } .site-tag.lichess { background:#d9d9d9; }
+    button.primary { background:#2f5d3a; border-color:#6bbf7b; }
+    @media (hover: hover) { button.primary:not(:disabled):hover { background:#3a7448; } }
+    #puzzle-view .summary { color:#bbb; font-size:12px; line-height:1.5; min-height:18px; }
+    #puzzle-view .summary b { color:#eee; font-weight:600; }
+    #puzzle-view .status { min-height:18px; margin-top:6px; font-size:12px; overflow-wrap:anywhere; white-space:pre-line; }
+    #puzzle-view .status.error { color:#ff9b8f; }
+    #pz-bridge { display:flex; align-items:center; gap:8px; margin-top:6px; font-size:12px; color:#bbb; }
+    #pz-bridge span { flex:1; min-width:0; overflow-wrap:anywhere; }
+    #pz-bridge button { padding:3px 8px; flex:0 0 auto; }
+    #pz-progress { width:100%; height:14px; }
+    #pz-panel { margin-top:14px; border-top:1px solid #3a3a3a; padding-top:12px; }
+    .feedback { background:#1c1c1c; border-radius:4px; padding:10px 12px; font-size:15px; min-height:44px; }
+    .feedback.good { color:#9bd49b; } .feedback.bad { color:#ff9b8f; } .feedback.info { color:#c8d8ff; }
+    .puzzle-info { margin-top:8px; font-size:13px; color:#ccc; line-height:1.55; overflow-wrap:anywhere; }
+    .puzzle-info .line { color:#eee; }
+    .puzzle-info a, #puzzle-view small a { color:#9bc4ff; }
+    #puzzle-view details { margin-top:12px; }
+    #puzzle-view summary { cursor:pointer; user-select:none; color:#ddd; }
+    #pz-pool-list { list-style:none; padding:0; margin:6px 0; max-height:320px; overflow:auto; }
+    #pz-pool-list li { display:flex; align-items:center; gap:6px; background:#1c1c1c; padding:5px 8px; border-radius:4px; margin:3px 0; font-size:12px; }
+    #pz-pool-list li.current { outline:1px solid #6bbf7b; }
+    #pz-pool-list .pool-text { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; text-align:left; background:none; border:0; padding:2px 0; color:#ddd; }
+    #pz-pool-list .pool-state { flex:0 0 auto; color:#9bd49b; }
+    #pz-pool-list .pool-state.missed { color:#ff9b8f; }
+    #pz-pool-list .pool-state.later { color:#999; }
+    #pz-pool-list li button.small { padding:2px 7px; flex:0 0 auto; }
+    .checkline { display:flex; align-items:center; gap:6px; margin-top:6px; color:#bbb; }
+    .checkline input { width:auto; }
+    #puzzle-view .hints ul { margin:6px 0 0; padding-left:18px; color:#aaa; font-size:12px; }
+    #puzzle-view .hints li { margin:4px 0; }
   </style>
 </head>
 <body>
-<main>
+<main id="best-view">
   <section>
     <div class="board-tools"><div id="captured-top" class="material-status" aria-live="polite"></div><button id="live-toggle" aria-pressed="true">Live analysis</button><button id="flip">↻ Flip<span class="tool-full"> board</span></button></div>
-    <div id="board-row">
+    <div id="board-row" class="board-row">
       <div id="eval-bar" class="empty" role="img" aria-label="No evaluation for this position"><div id="eval-bar-white"></div><span id="eval-bar-label" class="for-white"></span></div>
-      <div id="board-wrap">
-        <div id="board" aria-label="Chess board"></div>
-        <svg id="annotation-layer" aria-hidden="true"></svg>
+      <div id="board-wrap" class="board-wrap">
+        <div id="board" class="board" aria-label="Chess board"></div>
+        <svg id="annotation-layer" class="annotation-layer" aria-hidden="true"></svg>
       </div>
     </div>
     <div id="captured-bottom" class="material-status" aria-live="polite"></div>
@@ -206,6 +266,7 @@
     </details>
   </section>
   <aside>
+    <nav class="page-nav"><span aria-current="page">Best moves</span><a href="#puzzles" data-page="puzzles">Puzzles from your games</a></nav>
     <div class="row" id="key-bar" title="Optional. A key marks the analyses you save as verified; the admin token also unlocks the admin tools.">
       <input id="key-input" type="password" placeholder="Admin token or contributor key (optional)" style="flex:1" autocomplete="off">
       <span id="key-role" class="key-role"></span>
@@ -266,6 +327,85 @@
     <label>Depth / nodes</label><input id="depth-result" autocomplete="off" readonly>
     <label>Best line / database moves</label><div id="notation" class="notation"></div>
     <div id="status" class="status"></div>
+  </aside>
+</main>
+<main id="puzzle-view" hidden>
+  <section>
+    <div class="board-tools"><div id="pz-captured-top" class="material-status" aria-live="polite"></div><span id="pz-to-move" class="to-move" aria-live="polite"></span><button id="pz-flip">↻ Flip<span class="tool-full"> board</span></button></div>
+    <div class="board-row">
+      <div id="pz-board-wrap" class="board-wrap">
+        <div id="pz-board" class="board" aria-label="Puzzle board"></div>
+        <svg id="pz-annotation-layer" class="annotation-layer" aria-hidden="true"></svg>
+      </div>
+    </div>
+    <div id="pz-captured-bottom" class="material-status" aria-live="polite"></div>
+    <div class="history-controls" aria-label="Move navigation">
+      <button id="pz-history-first" aria-label="Go to the puzzle's first position" title="First position" disabled>|◀</button>
+      <button id="pz-history-back" aria-label="Go back one move" title="Back one move" disabled>◀</button>
+      <button id="pz-history-forward" aria-label="Go forward one move" title="Forward one move" disabled>▶</button>
+      <button id="pz-history-last" aria-label="Go to the last position" title="Last position" disabled>▶|</button>
+    </div>
+    <details class="board-hints">
+      <summary>Board guide</summary>
+      <ul>
+        <li>The opponent's last move is played on the board; then find the best move. ◀ shows the position before it.</li>
+        <li>Right-click a square or drag to annotate; hold Ctrl for red annotations.</li>
+        <li>Once the puzzle is done, the arrows, the mouse wheel and the arrow keys go through the moves, and "Analyse in Best moves" opens them there with live analysis.</li>
+      </ul>
+    </details>
+  </section>
+  <aside>
+    <nav class="page-nav"><a href="./" data-page="best">Best moves</a><span aria-current="page">Puzzles from your games</span></nav>
+    <h1>Puzzles from your games</h1>
+    <div id="pz-accounts">
+      <label for="pz-chesscom">chess.com</label>
+      <input id="pz-chesscom" placeholder="Username (optional)" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <label for="pz-lichess">Lichess</label>
+      <input id="pz-lichess" placeholder="Username (optional)" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <button id="pz-load">Load</button>
+    </div>
+    <div id="pz-summary" class="summary"></div>
+    <div class="row"><button id="pz-update" class="primary" disabled>Update puzzles</button><button id="pz-stop" hidden>Stop</button></div>
+    <div id="pz-bridge"><span id="pz-bridge-status"></span><button id="pz-bridge-setup" hidden>Set up</button></div>
+    <progress id="pz-progress" max="100" value="0" hidden></progress>
+    <div id="pz-work-status" class="status" aria-live="polite"></div>
+
+    <div id="pz-panel">
+      <div id="pz-feedback" class="feedback info" aria-live="polite">Enter your chess.com and/or Lichess username and click Load.</div>
+      <div class="row"><button id="pz-solution" disabled>Show solution</button><button id="pz-next" disabled>Next puzzle</button></div>
+      <div class="row"><button id="pz-analyse" hidden>Analyse in Best moves</button></div>
+      <div id="pz-info" class="puzzle-info"></div>
+    </div>
+
+    <details id="pz-pool">
+      <summary id="pz-pool-summary">Puzzle list</summary>
+      <ul id="pz-pool-list"></ul>
+      <label class="checkline"><input type="checkbox" id="pz-show-mastered"> Show mastered puzzles</label>
+    </details>
+
+    <details id="pz-settings">
+      <summary>Settings and data</summary>
+      <label for="pz-effort">Engine effort for new games</label>
+      <select id="pz-effort"></select>
+      <small>Lichess's own computer analysis searches every position to 1,000,000 nodes. "Quicker" is about three times as fast and finds a little less.</small>
+      <div class="row"><button id="pz-export" disabled>Export this player's puzzles</button><button id="pz-import">Import</button></div>
+      <input id="pz-import-file" type="file" accept=".json,application/json" style="display:none">
+      <div class="row"><button id="pz-delete" disabled>Delete these accounts' data</button></div>
+      <small>Everything is kept in this browser only: the games, the puzzles and how you solved them. Export moves them to another browser or device (a phone, for instance, which cannot run the engine bridge but can solve the puzzles).</small>
+    </details>
+
+    <details class="hints">
+      <summary>How the puzzles are made</summary>
+      <ul>
+        <li>Give your chess.com and/or Lichess username: the puzzles of both are shown together, each marked with its site.</li>
+        <li>Update asks the engine bridge on your computer to fetch your rated rapid games and analyse the ones in which your rating was at least 80% of your current rapid rating (for each site its own rating), newest first, until all of them are done. It goes on by itself while the bridge runs, also with this tab closed; the puzzles it found show up here the next time. When your rating changes, Update re-checks the games already fetched and analyses the ones that now count.</li>
+        <li>Each game is analysed by Stockfish 19 the way Lichess's computer analysis does it (1,000,000 nodes per position). A Lichess game that Lichess has already analysed uses Lichess's own evaluations.</li>
+        <li>Puzzles are found the way Lichess finds its puzzles: where your opponent's move gave you a winning chance or a mate, and the winning line is one where each of your moves is clearly the only good one.</li>
+        <li>Lichess only makes puzzles where the opponent has just blundered. So where your move was a mistake or a blunder, the position is also a puzzle when its best move was the only good one: every other move would have been a blunder too.</li>
+        <li>A puzzle is kept only if you missed it in the game.</li>
+        <li>A puzzle solved at the first try comes back after 1, 3, then 7 days; solved a fourth time in a row, it leaves the list. A wrong move or the solution sends it back to the start, and it keeps coming back until you solve it.</li>
+      </ul>
+    </details>
   </aside>
 </main>
 <script type="module" src="/app.js"></script>

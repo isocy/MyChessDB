@@ -145,7 +145,8 @@ later, it is green like any saved analysis until the new search goes deeper.
   use it.
 - **Live analysis: on/off** above the board, next to Flip board, turns it on and off.
   It is on until turned off; the choice is remembered in the browser. It needs
-  the engine bridge 1.0.6 or newer; without it the button's tooltip says why
+  the engine bridge 1.0.6 or newer (the site now asks for 1.0.7, which the
+  puzzles need); without it the button's tooltip says why
   nothing happens. The tooltip also tells how the last save went.
 
 The bridge keeps one Stockfish process for it, apart from the analysis
@@ -194,6 +195,131 @@ for them; serving the files from an R2 bucket through the Worker was tried
 and gave about 0.2 MB/s in a browser. Nothing has to be set up for it; if
 unpkg cannot be reached, the browser engine reports that it could not
 download, and the engine bridge still works.
+
+### Puzzles from your games
+
+The second view of the page, **Puzzles from your games** (linked at the top
+of the panel; the address ends in `#puzzles`), makes puzzles from a player's
+own games: positions where one move was clearly better than every other and
+the player missed it. It needs nothing from this site's server: the engine
+bridge (1.0.7 or newer) fetches the games from chess.com's and Lichess's
+public APIs, analyses them with Stockfish 19 and finds the puzzles on the
+player's computer, and the puzzles and how they were solved are kept in the
+browser (IndexedDB). **Export** and **Import** under *Settings and data* move
+them to another browser or device; a phone or tablet, which cannot run the
+bridge, can solve puzzles found on a computer that way.
+
+The two views are one page (`index.html`; the puzzle view's code,
+`web/puzzles.js`, is loaded the first time it is shown). Switching between
+them keeps each as it was, and an update of the puzzles goes on while the
+best moves are shown; the browser's back and forward buttons switch too.
+Live analysis only runs while the best moves are shown.
+
+- **Accounts.** Enter a chess.com username, a Lichess username, or both,
+  and click **Load**. The puzzles of both accounts are shown together, in one
+  list and one rotation, each marked with its site (in the list, and "From
+  your chess.com game ..." on the puzzle).
+- **Which games.** The player's rated rapid games (standard chess, not
+  against the computer). A game counts when the player's rating in it was at
+  least 80% of their current rapid rating on that site.
+- **Update puzzles** asks the bridge to bring each account up to date
+  (`bridge/puzzles.go`, with the fetching in `bridge/games.go`): it checks
+  the rapid rating, fetches the games played since the last update (the
+  first time the newest ones, about 100), analyses the games that count,
+  each account's newest first and the accounts taking turns, and fetches
+  older games whenever it runs out, about 100 at a time, until every game
+  that counts has been analysed, or a batch of older games brings none that
+  count (the player's rating was lower then). It does all of this by itself:
+  the site's tab can be closed. When the rating has changed, the games
+  already fetched are only checked against the new limit (their rating is
+  stored): puzzles from games that no longer count are set aside, and games
+  that now count are analysed. **Stop** ends the update; the next one
+  carries on.
+- **Collecting.** What the bridge finds waits in `puzzles.json` next to its
+  settings, with the games still waiting and how far fetching got, until the
+  page collects it: the page follows the bridge while it is open (progress,
+  and each game's puzzles as they come) and, opened again later, collects
+  what was found meanwhile. A bridge that is closed in the middle carries on
+  when it is started again, and the page finds it again by itself (it looks
+  every 15 seconds after losing it). **Delete these accounts' data** also
+  makes the bridge forget them.
+- chess.com lists the odd month it then cannot find; such a month is passed
+  over and asked for again at the next update.
+- **Game analysis**, as Lichess's computer analysis does it: every position
+  searched to 1,000,000 nodes (`Origin.manualRequest` in lila's fishnet
+  module), and Lichess's judgement of each of the player's moves (inaccuracy,
+  mistake, blunder, lila `Advice.scala`). A Lichess game that Lichess has
+  analysed already comes with Lichess's own evaluations, which are used.
+- **Puzzles** (`bridge/puzzlegen.go`, where the rules are written out in
+  full, with the chess rules it needs in `bridge/chess.go`, a port of
+  `web/chesslib.js` checked against the same perft counts).
+  Only where the player's move was not the best one found and Lichess marks
+  it:
+  - *Lichess puzzles*: the rules of Lichess's own puzzle generator
+    ([lichess-puzzler](https://github.com/ornicar/lichess-puzzler), version 50):
+    the opponent's move has just given the player a winning chance (a jump of
+    more than 0.6 in winning chances to +2.00 or more) or a mate, and every
+    move of the player's in the solution is the only good one (0.7 winning
+    chances better than the second-best; two lines searched to depth 50,
+    25 million nodes or 30 seconds). One-move puzzles are kept, and every
+    puzzle of a game.
+  - *Only moves*: Lichess makes puzzles only where the opponent has just
+    blundered, which leaves out most of what a player misses (it found none
+    in 30 rapid games of a 1365-rated player). So where the player's move was
+    a mistake or a blunder and there is no Lichess puzzle, the position is a
+    puzzle when every other move loses at least 0.3 winning chances against
+    the best one (what Lichess calls a blunder), and the line goes on while
+    the player's next moves are again such only moves. In those 30 games this
+    gave 10 puzzles.
+  - Either way it is kept only if the player's move in the game was not the
+    solution's first move (nor another checkmate), and a position already in
+    the pool from another game is not added twice.
+- **Engine effort** (*Settings and data*): "As Lichess" uses the numbers
+  above; "Quicker" analyses each position to 300,000 nodes (Lichess's
+  background analysis) and searches puzzles to 5 million nodes or 10 seconds.
+  With Stockfish 19 on 8 threads, a rapid game took about 36 seconds as
+  Lichess (20 to 90) and about 10 seconds quicker, and there was a puzzle in
+  every three to five games either way. Puzzles show up as they are found.
+- **The bridge's engine for puzzles** (`bridge/search.go`): one Stockfish
+  process, apart from the analysis queue and live analysis, runs one limited
+  search at a time (several lines; a node, depth or time limit; the game's
+  moves before the position, so that Stockfish sees repetitions). It gets a
+  share of the processor like one more analysis (and counts as one for
+  analyses and live analysis started meanwhile), a hash table of at most
+  1 GB, and ends after a minute without searches. The view says when the
+  bridge is missing or too old, with a button to the setup (or update)
+  instructions.
+- The bridge's API for it: `POST /api/puzzles/update` (`{profile, site,
+  username, effort}`), `GET /api/puzzles?profile=` (the rating, how many
+  games are fetched, count and are analysed, what it is doing, and what it
+  found), `POST /api/puzzles/collected` (`{profile, games}`), `POST
+  /api/puzzles/stop` and `POST /api/puzzles/forget` (`{profile}`);
+  `/api/status` has `"puzzles": true`. The bridge asks chess.com and Lichess
+  as `mychessdb-bridge/<version>` (chess.com turns away requests without a
+  name).
+- **Solving**: the opponent's last move is played, then it is the player's
+  turn; ◀ (or the mouse wheel, or the arrow keys) shows the position
+  before it, ▶ comes back. A move must be the solution's, but any checkmate
+  is accepted, as on Lichess; the opponent's replies are played
+  automatically. A wrong move is shown and taken back, and the puzzle counts
+  as missed; **Show solution** plays the rest. The board is the best-move
+  board's: the same marks for where a piece can go, dragging, right-click
+  arrows and circles (red with Ctrl), and each side's captured pieces with
+  who is ahead in material. Afterwards the arrows go
+  through all the moves, and the panel shows the solution, the move played
+  in the game with Lichess's judgement, and a link to the game.
+- **Analyse in Best moves** (once a puzzle is done) opens the game up to the
+  puzzle and the solution on the best-move board, at the position shown, with
+  its history and opening name, where live analysis takes over.
+- **When puzzles come back** (`web/puzzlestore.js`): solved at the first try,
+  after 1, then 3, then 7 days; solved at the first try a fourth time in a
+  row, it leaves the list ("mastered"; **Show mastered puzzles** lists them
+  with **Bring back**). A miss sets it back to the start: it is due at once
+  and comes back after three other puzzles, again and again until it is
+  solved. Missed puzzles come first, but never two in a row while other
+  puzzles are due; then new ones, newest game first. Solving a puzzle before
+  it is due (**Practice anyway**, or from the list) does not move it on, but
+  a miss counts.
 
 ### The Lichess evaluation database
 
@@ -431,7 +557,7 @@ same.
 
 ```powershell
 npm run dev          # http://localhost:8787, local SQLite file, no Cloudflare needed
-npm test             # chess rules, API rules, Lichess database import
+npm test             # chess rules, API rules, Lichess database import, puzzles
 ```
 
 `npm run dev` prints a development admin token. To use the bridge with the
@@ -455,7 +581,7 @@ kept in the repository).
 plus `SHA256SUMS`. To rebuild after changing `bridge/*.go`, install Go and run
 `scripts\build_bridge.ps1` (Windows) or `sh scripts/build_bridge.sh`, then
 deploy. Builds are reproducible: the same Go version gives byte-identical
-files. The current ones (1.0.6) were built with Go 1.24.7.
+files. The current ones (1.0.7) were built with Go 1.24.7.
 
 The site names the bridge version it expects (`BRIDGE_MIN_VERSION` in
 `web/app.js`). An older bridge keeps working, and the site shows an **Update**
@@ -463,7 +589,7 @@ button with the install command. Bridges before 1.0.4 do not report the search
 as it goes, so with them the page is not updated during an analysis and Stop
 saves nothing. Bridges before 1.0.5 cannot hold an analysis that is waiting in
 the queue; with them its Pause button stays disabled. Bridges before 1.0.6 have
-no live analysis.
+no live analysis, and bridges before 1.0.7 cannot find puzzles.
 
 If you deploy from another copy of the repository, make sure `web/bridge/` is
 there (commit it, or build it), otherwise the install command has nothing to
@@ -504,6 +630,18 @@ Automated tests (Linux, real browser):
   pieces above and below the board following Flip board
 - the macOS/Linux install script (on Linux)
 - importing the real `saved_positions.json` (492 entries, none skipped)
+- puzzles in the page (`tests/puzzles.test.mjs`): when puzzles come back
+- puzzles in the engine bridge (`npm run test:bridge`, Windows 11): the chess
+  rules against the same perft counts as chesslib.js; Lichess's judgements and
+  both kinds of puzzle with a scripted engine; the searches with a stand-in
+  engine (several lines, the limits passed on, bad input refused,
+  cancelling, one engine for one search after another, closing it when
+  idle); reading chess.com and Lichess games (PGN, SAN, which games count)
+  and fetching them in batches, against a stand-in for both sites, also a
+  month chess.com cannot find; an update to the end (rating, games, newest
+  first, collecting, a second update analysing nothing twice, a player who
+  is not there, forgetting), two accounts taking turns, Stop, and carrying on
+  after the bridge was closed
 
 Checked by hand on the live site, Windows 11 with Firefox:
 
@@ -517,7 +655,34 @@ Checked by hand on the live site, Windows 11 with Firefox:
   `scripts/lichess_db.mjs` output (`--max-moves 10 --min-pieces 28`, run on
   the whole Lichess file) loaded with wrangler
 
+Puzzles, checked by hand on Windows 11:
+
+- the puzzle finder with the real Stockfish 19 on 30 real Lichess rapid
+  games of a 1365-rated player: 10 puzzles from the first version (in the
+  page), 8 from the bridge's (mostly the same positions; Stockfish on
+  several threads does not find exactly the same lines twice), checked by eye
+- bridge 1.0.7 with the real Stockfish 19, chess.com and Lichess, and the
+  page in the browser built into the Claude desktop app (Chromium): a
+  chess.com and a Lichess account updated together (232 chess.com months
+  fetched by the bridge, the accounts taking turns, their puzzles in one
+  list), the bridge closed and started again in the middle (it carried on,
+  and the page found it again), the tab closed while the bridge went on and
+  the puzzles collected when it was opened again, Stop, deleting the
+  accounts, switching to the best moves and back, solving (click and
+  drag, a wrong move, a three-move line with the reply played by itself, ◀
+  to the position before the opponent's move, the solution, the promotion
+  choice, arrows and circles, captured pieces), the order puzzles come back
+  in, **Analyse in Best moves** with live analysis on the bridge, and the
+  phone layout
+- fetching a chess.com player's games in that browser (232 months, 36 rated
+  rapid games read)
+
 Not yet run anywhere:
+
+- bridge 1.0.7 on macOS and Linux, and its install over 1.0.6 with the
+  install command (on Windows it was run from a build, not installed)
+- the puzzle animations seen on screen (the desktop app's browser was hidden
+  while it was tested, so the animations were checked to start, not watched)
 
 - the browser engine with several threads: the browser built into the
   Claude desktop app, where it was tested (download, check, live analysis,

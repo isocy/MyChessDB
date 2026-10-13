@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -27,7 +28,7 @@ import (
 
 const (
 	appName     = "mychessdb-bridge"
-	version     = "1.0.6"
+	version     = "1.0.7"
 	defaultPort = 8765
 	maxBody     = 4 << 20
 )
@@ -65,6 +66,8 @@ type server struct {
 	installer *installer
 	jobs      *jobManager
 	live      *liveEngine
+	search    *searcher
+	puzzles   *puzzleManager
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -163,7 +166,7 @@ func (s *server) statusBody() map[string]any {
 	return map[string]any{
 		"app": appName, "version": version, "os": runtime.GOOS, "arch": runtime.GOARCH,
 		"engine": engine, "install": s.installer.current(), "can_install": canInstall,
-		"threads": threads, "hash": hash, "max_jobs": s.jobs.maxJobs, "live": true,
+		"threads": threads, "hash": hash, "max_jobs": s.jobs.maxJobs, "live": true, "puzzles": true,
 	}
 }
 
@@ -266,6 +269,43 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, 202, view)
 
+	case path == "/api/puzzles" && get:
+		writeJSON(w, 200, s.puzzles.view(r.URL.Query().Get("profile")))
+
+	case path == "/api/puzzles/update" && post:
+		var body struct {
+			Profile  string `json:"profile"`
+			Site     string `json:"site"`
+			Username string `json:"username"`
+			Effort   string `json:"effort"`
+		}
+		if err := s.readBody(r, &body); err != nil {
+			writeError(w, err)
+			return
+		}
+		view, err := s.puzzles.update(body.Profile, body.Site, strings.TrimSpace(body.Username), body.Effort)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, 200, view)
+
+	case (path == "/api/puzzles/collected" || path == "/api/puzzles/stop" || path == "/api/puzzles/forget") && post:
+		var body struct {
+			Profile string   `json:"profile"`
+			Games   []string `json:"games"`
+		}
+		if err := s.readBody(r, &body); err != nil {
+			writeError(w, err)
+			return
+		}
+		switch path {
+		case "/api/puzzles/collected":
+			writeJSON(w, 200, s.puzzles.collected(body.Profile, body.Games))
+		default:
+			writeJSON(w, 200, s.puzzles.stop(body.Profile, path == "/api/puzzles/forget"))
+		}
+
 	case path == "/api/live/stop" && post:
 		view, err := s.live.set("")
 		if err != nil {
@@ -324,7 +364,19 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 // shutdown stops every engine the bridge started.
 func (s *server) shutdown() {
 	s.live.shutdown()
+	s.puzzles.shutdown()
+	s.search.shutdown()
 	s.jobs.shutdown()
+}
+
+// connectEngines creates the job manager, live analysis and puzzle searches.
+// Each of them counts the others' searches when it shares out the processor.
+func (s *server) connectEngines(maxJobs int) {
+	s.jobs = newJobManager(maxJobs, s.currentEngine)
+	s.live = newLiveEngine(s.currentEngine, func() int { return s.jobs.runningCount() + s.search.load() })
+	s.search = newSearcher(s.currentEngine, func() int { return s.jobs.runningCount() + s.live.load() })
+	s.jobs.liveLoad = func() int { return s.live.load() + s.search.load() }
+	s.puzzles = newPuzzleManager(filepath.Dir(s.store.path), s.search.search, s.currentEngine)
 }
 
 // alreadyRunning reports whether another copy of the bridge owns the port.
@@ -418,9 +470,7 @@ func main() {
 		port: *port, store: store, verifier: verifier,
 		installer: &installer{dir: dir, store: store, verifier: verifier, status: installStatus{State: "idle"}},
 	}
-	srv.jobs = newJobManager(*maxJobs, srv.currentEngine)
-	srv.live = newLiveEngine(srv.currentEngine, srv.jobs.runningCount)
-	srv.jobs.liveLoad = srv.live.load
+	srv.connectEngines(*maxJobs)
 
 	logf("My Chess DB engine bridge %s", version)
 	logf("Listening on http://127.0.0.1:%d for %s", *port, strings.Join(cfg.Sites, ", "))

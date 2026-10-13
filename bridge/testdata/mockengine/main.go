@@ -9,6 +9,9 @@
 //	MOCK_SCORE     score to report, e.g. "cp 32" or "mate 3" (default "cp 32")
 //	MOCK_PV_WHITE / MOCK_PV_BLACK  principal variation by side to move
 //	MOCK_LOG       file that receives every command the engine was sent
+//
+// With "setoption name MultiPV value N" it reports N lines at each depth:
+// the first as above, line k after it with a score k*100 lower and pv a2a3.
 package main
 
 import (
@@ -44,6 +47,7 @@ func main() {
 	delay, _ := strconv.Atoi(env("MOCK_DELAY_MS", "15"))
 	score := env("MOCK_SCORE", "cp 32")
 	blackToMove := false
+	multipv := 1
 	var stop chan struct{}
 	var done sync.WaitGroup
 
@@ -69,6 +73,10 @@ func main() {
 			say("option name Syzygy50MoveRule type check default true")
 			say("option name Debug Log File type string default <empty>")
 			say("uciok")
+		case "setoption":
+			if len(fields) == 5 && fields[2] == "MultiPV" {
+				multipv, _ = strconv.Atoi(fields[4])
+			}
 		case "isready":
 			say("readyok")
 		case "position":
@@ -89,7 +97,7 @@ func main() {
 			}
 			stop = make(chan struct{})
 			done.Add(1)
-			go func(stop chan struct{}) {
+			go func(stop chan struct{}, multipv int) {
 				defer done.Done()
 				say("info string NNUE evaluation using nn-mock.nnue")
 				for d := 1; d <= depth; d++ {
@@ -102,9 +110,12 @@ func main() {
 					say("info depth %d currmove e2e4 currmovenumber 1", d)
 					say("info depth %d seldepth %d multipv 1 score cp 999 upperbound nodes %d nps 1000 hashfull 5 tbhits 0 time %d pv a2a3", d, d+3, d*900, d*delay)
 					say("info depth %d seldepth %d multipv 1 score %s nodes %d nps 1000 hashfull 5 tbhits 0 time %d pv %s", d, d+3, score, d*1000, d*delay, pv)
+					for k := 2; k <= multipv; k++ {
+						say("info depth %d seldepth %d multipv %d score cp %d nodes %d nps 1000 hashfull 5 tbhits 0 time %d pv a2a3", d, d+3, k, 32-100*(k-1), d*1000, d*delay)
+					}
 				}
 				say("bestmove %s ponder %s", strings.Fields(pv)[0], strings.Fields(pv)[len(strings.Fields(pv))-1])
-			}(stop)
+			}(stop, multipv)
 		case "stop":
 			if stop != nil {
 				close(stop)
