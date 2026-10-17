@@ -11,7 +11,9 @@ export function pieceImageUrl(piece) {
 
 // How long a piece slides (as on the best-move board).
 export const MOVE_ANIMATION_MS = 180;
-const DRAG_THRESHOLD_PX = 6;
+// How far a pressed piece moves before it is dragged (a finger moves a
+// little in a tap), as on the best-move board.
+const DRAG_MOUSE_PX = 6, DRAG_TOUCH_PX = 12;
 const GREEN = "#24a148", RED = "#e5534b";
 
 export class PuzzleBoard {
@@ -288,7 +290,7 @@ export class PuzzleBoard {
       this.updateHighlights();
       return;
     }
-    this.pointer = { from: index, x: event.clientX, y: event.clientY, dragging: false, wasSelected: this.selected === index };
+    this.pointer = { from: index, x: event.clientX, y: event.clientY, dragging: false, wasSelected: this.selected === index, touch: event.pointerType === "touch" };
     this.selected = index;
     this.updateHighlights();
   }
@@ -297,7 +299,7 @@ export class PuzzleBoard {
     if (!pointer) return;
     if (event.buttons & 2) { this.cancelDrag(); return; }
     if (!pointer.dragging) {
-      if (Math.hypot(event.clientX - pointer.x, event.clientY - pointer.y) < DRAG_THRESHOLD_PX) return;
+      if (Math.hypot(event.clientX - pointer.x, event.clientY - pointer.y) < (pointer.touch ? DRAG_TOUCH_PX : DRAG_MOUSE_PX)) return;
       pointer.dragging = true;
       // As large as a piece on the board (the best-move board's drag preview).
       const size = this.el.querySelector(".square")?.getBoundingClientRect().width || 70;
@@ -361,6 +363,11 @@ export class PuzzleBoard {
     const white = this.position.board[from] < "a";
     const chooser = document.createElement("div");
     chooser.className = "promotion";
+    // On a phone the click of the tap that opened the choice can land on it:
+    // only a choice pressed itself (or the keyboard's) counts.
+    let pressed = false;
+    chooser.addEventListener("pointerdown", event => { event.stopPropagation(); pressed = true; });
+    const chosen = event => { event.stopPropagation(); return !!this.promotion && (pressed || event.detail === 0); };
     for (const letter of ["q", "n", "r", "b"]) {
       const button = document.createElement("button");
       button.type = "button";
@@ -370,7 +377,7 @@ export class PuzzleBoard {
       image.alt = button.title;
       button.appendChild(image);
       button.onclick = event => {
-        event.stopPropagation();
+        if (!chosen(event)) return;
         const slide = this.promotion.slide;
         this.promotion = null;
         chooser.remove();
@@ -382,9 +389,8 @@ export class PuzzleBoard {
     cancel.type = "button";
     cancel.textContent = "×";
     cancel.title = "Cancel";
-    cancel.onclick = event => { event.stopPropagation(); this.promotion = null; chooser.remove(); };
+    cancel.onclick = event => { if (chosen(event)) { this.promotion = null; chooser.remove(); } };
     chooser.appendChild(cancel);
-    chooser.addEventListener("pointerdown", event => event.stopPropagation());
     this.el.appendChild(chooser);
     this.placePromotion();
   }

@@ -48,7 +48,9 @@ There are no accounts. Trust comes from where an entry came from:
   Lichess answers with its deepest evaluation that has at least the number of
   lines asked for, and its deepest ones are mostly single-line.
 - **Stockfish entries saved with a key** (your admin token, or a contributor
-  key you created for someone) count as verified.
+  key you created for someone) count as verified. Under the key field the
+  page tells visitors who know you to contact you for a key (no address is
+  shown: those who know you have it).
 - **Stockfish entries without a key** are stored as *unverified* and shown with
   that mark. A depth reported by someone's own computer cannot be checked.
 
@@ -474,6 +476,17 @@ upright, the board is as wide as the screen and the panel is below it; held
 sideways (and on computers), the board fits the height and the panel is
 beside it.
 
+On the board a piece is moved by clicking it and then where it goes, or by
+dragging it; a pawn that reaches the last rank asks which piece it becomes
+(on the puzzle board too), and × or a click beside the choice cancels. The
+material count beside the board always comes from the pieces on it, so a
+promotion counts. A best move that promotes shows the piece it becomes in the
+corner of its square (and as "=Q" and so on in the line below). With a
+finger a piece is dragged only once it moves more than 12 pixels (6 with a
+mouse), a piece dragged back to its square stays selected, and a long press
+keeps it selected. The squares also work from the keyboard (Tab, then Enter
+or Space).
+
 The installer adds a "My Chess DB Bridge" launcher (Start menu shortcut on
 Windows, Applications entry on macOS and Linux) for next time; the site also
 shows a short start command. The bridge's window has to stay open while
@@ -690,6 +703,18 @@ Puzzles, checked by hand on Windows 11:
   phone layout
 - fetching a chess.com player's games in that browser (232 months, 36 rated
   rapid games read)
+- in that browser: promotion on the best-move board (to a knight for White,
+  dragged to a rook for Black on the flipped board, the history back and
+  forth, the material count) and on the puzzle board (a puzzle solved with
+  a8=Q); a phone's tap simulated with touch pointer events and a click 40 ms
+  later (the piece stays selected; the same late click on the promotion
+  choice picks nothing), a long press, a tap that moves 9 pixels, a piece
+  dragged back to its square, the keyboard; the key note on a phone's width;
+  a saved best move that promotes (a stand-in answer from the page's fetch:
+  a white knight badge on b8, a black rook badge on g1 of the flipped
+  board), and +9 for Black after g1=Q; a puzzle without its game's moves
+  whose position has a promoted queen (the missing pawn not counted as
+  taken). On a real phone this has not been tried.
 - **Delete this puzzle** in that browser, with stand-in puzzles: not offered
   before the puzzle is done nor after a wrong move, offered once the
   solution was shown; the next puzzle shown, Undo, two deleted and listed,

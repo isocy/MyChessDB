@@ -24,7 +24,7 @@ const MOBILE_DEPTH_NOTE="On a phone or tablet, Stockfish 19 runs as live analysi
 const symbols = {K:"♔",Q:"♕",R:"♖",B:"♗",N:"♘",P:"♙",k:"♚",q:"♛",r:"♜",b:"♝",n:"♞",p:"♟"};
 const boardEl = document.querySelector("#board"), annotationLayer = document.querySelector("#annotation-layer"), fenEl = document.querySelector("#fen");
 const notationEl = document.querySelector("#notation");
-let state = { board: [], turn:"w", castling:"-", ep:"-", selected:null, last:null, lastSound:"move", captured:{w:[],b:[]}, shown:null, shownMove:null, analysis:null, history:[], historyIndex:0, openingMoves:[], openingTracking:false, flipped:false, annotations:[], annotationStart:null, suppressRightAnnotation:false, lichessRetryUntil:0, dragging:false, pointerStart:null, pointerCurrent:null, dragPreview:null, ignoreNextClick:false, positions:new Map(), view:"combined", key: localStorage.getItem("chessdb_key")||"", role:null, roleLabel:null, minDepth:21, fullDepth:46 };
+let state = { board: [], turn:"w", castling:"-", ep:"-", selected:null, last:null, lastSound:"move", captured:{w:[],b:[]}, shown:null, shownMove:null, analysis:null, history:[], historyIndex:0, openingMoves:[], openingTracking:false, flipped:false, annotations:[], annotationStart:null, suppressRightAnnotation:false, lichessRetryUntil:0, dragging:false, pointerStart:null, pointerCurrent:null, dragPreview:null, promotion:null, positions:new Map(), view:"combined", key: localStorage.getItem("chessdb_key")||"", role:null, roleLabel:null, minDepth:21, fullDepth:46 };
 // The engines results are kept for, with the names shown for them.
 const ENGINES = {stockfish:"Stockfish 19",lichess:"Lichess"};
 // Analyses started from this page (or picked up from the bridge), by engine
@@ -363,6 +363,7 @@ function showHistoryPosition(index, { sound=true }={}) {
   state.openingTracking=position.openingTracking;
   state.openingMoves=position.openingMoves.slice();
   state.selected=null;
+  state.promotion=null;
   state.annotations=[];
   state.annotationStart=null;
   state.pointerStart=null;
@@ -389,7 +390,7 @@ function parseFen(fen, openingMoves=null, positionHistory=null) {
     if(out.length!==8) throw Error("Invalid FEN row");
     board.push(out);
   }
-  state.board=board; state.turn=parts[1]; state.castling=parts[2]; state.ep=parts[3]; state.selected=null; state.last=null; state.lastSound="move"; state.captured={w:[],b:[]}; state.analysis=null; state.shown=null; state.shownMove=null; state.history=[];
+  state.board=board; state.turn=parts[1]; state.castling=parts[2]; state.ep=parts[3]; state.selected=null; state.promotion=null; state.last=null; state.lastSound="move"; state.captured={w:[],b:[]}; state.analysis=null; state.shown=null; state.shownMove=null; state.history=[];
   // Arrows and circles belong to the position they were drawn on.
   state.annotations=[]; state.annotationStart=null;
   const preferences=flipPreferences(), savedFlip=preferences[positionKey(fen)];
@@ -433,6 +434,23 @@ function bestMoveSquares(uci) {
 }
 function pieceImageUrl(piece) {
   return `https://raw.githubusercontent.com/lichess-org/lila/master/public/piece/cburnett/${piece===piece.toUpperCase()?"w":"b"}${piece.toUpperCase()}.svg`;
+}
+// A best move that promotes shows the piece it promotes to in the corner of
+// its square.
+function renderPromotionBadge() {
+  boardEl.querySelector(".promotion-badge")?.remove();
+  const uci=state.shownMove;
+  if(!uci || uci.length!==5 || !"qrbn".includes(uci[4])) return;
+  const [from,to]=moveSquares(uci), pawn=state.board[Math.floor(from/8)][from%8];
+  if(pawn!=="P" && pawn!=="p") return;
+  const square=boardEl.querySelector(`.square[data-index="${to}"]`);
+  if(!square) return;
+  const name={q:"queen",r:"rook",b:"bishop",n:"knight"}[uci[4]];
+  const badge=document.createElement("img");
+  badge.className="promotion-badge";
+  badge.src=pieceImageUrl(pawn==="P"?uci[4].toUpperCase():uci[4]);
+  badge.alt=badge.title=`Promotes to a ${name}`;
+  square.appendChild(badge);
 }
 function createDragPreview(piece) {
   const preview=document.createElement("img");
@@ -558,6 +576,8 @@ export function drawMaterial(top, bottom, board, captured, flipped) {
 // board drawn last is compared with the new one, so going back, castling,
 // en passant and jumps over several moves all slide what changed.
 const MOVE_ANIMATION_MS=180;
+// How far a pressed piece moves before it is dragged rather than clicked.
+const DRAG_MOUSE_PX=6, DRAG_TOUCH_PX=12;
 let renderedBoard=null, renderedFlipped=false, animateNextRender=false;
 function animatePieces(before, after) {
   if(window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
@@ -634,11 +654,17 @@ function render() {
       file.textContent="abcdefgh"[i%8];
       b.appendChild(file);
     }
-    b.draggable=false; b.onclick=e=>{e.preventDefault();handleSquareClick(i);};
+    // A click with the mouse or a finger is handled by the pointer events
+    // (pointerDownSquare, pointerUpSquare); this is only for the keyboard
+    // (detail 0). On a phone the click comes some time after the tap, and
+    // handling it as well undid the selection the tap had just made.
+    b.draggable=false; b.onclick=e=>{e.preventDefault(); if(e.detail===0) handleSquareClick(i);};
     b.oncontextmenu=e=>e.preventDefault(); b.onpointerdown=e=>pointerDownSquare(e,i,piece);
     b.onpointermove=e=>pointerMoveSquare(e,i); b.onpointerup=e=>pointerUpSquare(e,i);
     b.onpointercancel=cancelPieceDrag; boardEl.appendChild(b);
   }
+  renderPromotionBadge();
+  if(state.promotion) showPromotion();
   renderedBoard=state.board.flat(); renderedFlipped=state.flipped;
   if(animate) animatePieces(before,renderedBoard);
   renderAnnotations();
@@ -733,12 +759,13 @@ function updateSelectionVisual() {
     square.classList.toggle("legal-move",legalMoves.includes(index) && !piece && !castle);
     square.classList.toggle("legal-capture",legalMoves.includes(index) && !!piece && !castle);
   });
+  renderPromotionBadge();
 }
 function cancelPieceDrag() {
   if(!state.dragging && !state.pointerStart) return;
   state.dragging=false; state.pointerStart=null; state.pointerCurrent=null; state.annotationStart=null;
   if(state.dragPreview){state.dragPreview.remove();state.dragPreview=null;}
-  state.selected=null; state.ignoreNextClick=false; render();
+  state.selected=null; render();
 }
 function cancelOnRightButton(e) {
   if((e.buttons & 2) && (state.dragging || state.pointerStart)) {
@@ -761,10 +788,12 @@ function pointerDownSquare(e,i,piece) {
     return;
   }
   if(e.button!==0) return;
+  // A press beside the promotion choice cancels it.
+  if(state.promotion) { cancelPromotion(); return; }
   state.annotations=[];
   renderAnnotations();
   if(state.selected!==null && state.selected!==i && getLegalDestinations(state.selected).includes(i)) {
-    state.pointerStart={index:state.selected,x:e.clientX,y:e.clientY,wasSelected:false,target:i};
+    state.pointerStart={index:state.selected,x:e.clientX,y:e.clientY,wasSelected:false,target:i,touch:e.pointerType==="touch"};
     state.pointerCurrent={x:e.clientX,y:e.clientY};
     return;
   }
@@ -782,7 +811,7 @@ function pointerDownSquare(e,i,piece) {
     render();
     return;
   }
-  state.pointerStart={index:i,x:e.clientX,y:e.clientY,wasSelected:state.selected===i};
+  state.pointerStart={index:i,x:e.clientX,y:e.clientY,wasSelected:state.selected===i,touch:e.pointerType==="touch"};
   state.pointerCurrent={x:e.clientX,y:e.clientY};
   state.selected=i;
   updateSelectionVisual();
@@ -791,7 +820,8 @@ function pointerMoveSquare(e,i) {
   if(!state.pointerStart) return;
   state.pointerCurrent={x:e.clientX,y:e.clientY};
   const distance=Math.hypot(e.clientX-state.pointerStart.x,e.clientY-state.pointerStart.y);
-  if(!state.dragging && distance>=6 && !state.pointerStart.target) {
+  // A finger moves a little in a tap: it drags only further than a mouse.
+  if(!state.dragging && distance>=(state.pointerStart.touch?DRAG_TOUCH_PX:DRAG_MOUSE_PX) && state.pointerStart.target===undefined) {
     state.dragging=true;
     state.dragPreview=createDragPreview(state.board.flat()[state.pointerStart.index]);
   }
@@ -825,16 +855,16 @@ function pointerUpSquare(e,i) {
   state.pointerStart=null; state.pointerCurrent=null; state.dragging=false;
   if(state.dragPreview){state.dragPreview.remove();state.dragPreview=null;}
   if(clickTarget!==undefined) movePiece(from,clickTarget,true);
+  else if(wasDragging && to===from) updateSelectionVisual();   // put back: it stays selected
   else if(wasDragging && Number.isInteger(to)) movePiece(from,to);
   else if(!wasDragging && wasSelected) {
     state.selected=null;
     updateSelectionVisual();
   }
-  state.ignoreNextClick=true;
-  setTimeout(()=>{state.ignoreNextClick=false;},0);
 }
+// The keyboard's Enter or Space on a square (see render).
 function handleSquareClick(i) {
-  if(state.ignoreNextClick) { state.ignoreNextClick=false; return; }
+  if(state.promotion) { cancelPromotion(); return; }
   state.annotations=[];
   const piece=state.board[Math.floor(i/8)][i%8];
   if(state.selected!==null && getLegalDestinations(state.selected).includes(i)) {
@@ -855,7 +885,9 @@ boardEl.onpointerup=e=>{
 document.addEventListener("contextmenu",e=>{
   if(state.dragging || state.pointerStart) {
     e.preventDefault();
-    cancelPieceDrag();
+    // The right button puts a held piece back; a long press of a finger
+    // (which phones also send as contextmenu) keeps it.
+    if(!state.pointerStart?.touch) cancelPieceDrag();
   }
 });
 document.addEventListener("pointermove",e=>{
@@ -927,18 +959,24 @@ document.addEventListener("auxclick",e=>{
   }
 }, true);
 // animate: the piece was not dragged there, so it slides (see animatePieces).
-function movePiece(from,to,animate=false) {
+// promotion: the piece a pawn on the last rank becomes ("q", "r", "b", "n");
+// without it, it is asked for first.
+function movePiece(from,to,animate=false,promotion=null) {
   const fr=Math.floor(from/8), ff=from%8, tr=Math.floor(to/8), tf=to%8, piece=state.board[fr][ff];
   if(!piece || !getLegalDestinations(from).includes(to)){state.selected=null;render();return;}
+  const promoting=piece.toLowerCase()==="p" && (tr===0 || tr===7);
+  if(promoting && !["q","r","b","n"].includes(promotion)) { askPromotion(from,to,animate); return; }
+  if(!promoting) promotion=null;
+  const uci=squareName(from)+squareName(to)+(promotion||"");
   state.history=state.history.slice(0,state.historyIndex+1);
-  if(state.openingTracking) state.openingMoves.push(squareName(from)+squareName(to));
+  if(state.openingTracking) state.openingMoves.push(uci);
   const castling=legalCastle(piece,fr,ff,tr,tf);
   const enPassant=legalEnPassant(piece,fr,ff,tr,tf);
   const capturedPiece=enPassant?state.board[fr][tf]:state.board[tr][tf];
   const capture=!!capturedPiece;
   if(capturedPiece) state.captured[state.turn].push(capturedPiece);
   updateCastlingRights(piece,fr,ff,tr,tf);
-  state.board[tr][tf]=piece; state.board[fr][ff]="";
+  state.board[tr][tf]=promotion?(piece==="P"?promotion.toUpperCase():promotion):piece; state.board[fr][ff]="";
   if(enPassant) state.board[fr][tf]="";
   if(castling){
     const rookFrom=tf>ff?7:0, rookTo=tf>ff?5:3;
@@ -946,7 +984,7 @@ function movePiece(from,to,animate=false) {
   }
   state.ep=(piece.toLowerCase()==="p" && Math.abs(tr-fr)===2)
     ? squareName(from + (tr>fr?8:-8)) : "-";
-  state.last=squareName(from)+squareName(to); state.turn=state.turn==="w"?"b":"w";
+  state.last=uci; state.turn=state.turn==="w"?"b":"w";
   const check=isKingInCheck(state.turn);
   const mate=check && !hasAnyLegalMove(state.turn);
   state.lastSound=mate?"mate":check?"check":castling?"castle":capture?"capture":"move";
@@ -955,6 +993,50 @@ function movePiece(from,to,animate=false) {
   state.historyIndex=state.history.length-1;
   fenEl.value=currentFen(); applyShownAnalysis(fenEl.value); state.selected=null;
   animateNextRender=animate; render(); updateHistoryControls(); void updateOpeningDisplay();
+}
+// A pawn that reaches the last rank: the piece it becomes is chosen over the
+// square's file, as on the puzzle board; × or a press beside it cancels.
+function askPromotion(from,to,animate) {
+  state.promotion={from,to,animate};
+  state.selected=null;
+  updateSelectionVisual();
+  showPromotion();
+}
+function cancelPromotion() {
+  state.promotion=null;
+  boardEl.querySelector(".promotion")?.remove();
+}
+function showPromotion() {
+  boardEl.querySelector(".promotion")?.remove();
+  const {from,to}=state.promotion;
+  const white=state.board[Math.floor(from/8)][from%8]==="P";
+  const chooser=document.createElement("div");
+  chooser.className="promotion";
+  // On a phone the click of the tap that opened the choice can land on it:
+  // only a choice pressed itself (or the keyboard's) counts.
+  let pressed=false;
+  chooser.addEventListener("pointerdown",e=>{ e.stopPropagation(); pressed=true; });
+  const choose=(e,act)=>{ e.stopPropagation(); if(state.promotion && (pressed || e.detail===0)) act(); };
+  for(const letter of ["q","n","r","b"]) {
+    const button=document.createElement("button");
+    button.type="button";
+    button.title={q:"Queen",n:"Knight",r:"Rook",b:"Bishop"}[letter];
+    const image=document.createElement("img");
+    image.src=pieceImageUrl(white?letter.toUpperCase():letter); image.alt=button.title;
+    button.appendChild(image);
+    button.onclick=e=>choose(e,()=>{ const {animate}=state.promotion; cancelPromotion(); movePiece(from,to,animate,letter); });
+    chooser.appendChild(button);
+  }
+  const cancel=document.createElement("button");
+  cancel.type="button"; cancel.textContent="×"; cancel.title="Cancel";
+  cancel.onclick=e=>choose(e,cancelPromotion);
+  chooser.appendChild(cancel);
+  // From the edge the pawn arrives at.
+  const display=state.flipped?63-to:to, top=Math.floor(display/8)===0;
+  chooser.style.left=`${display%8*12.5}%`;
+  chooser.style.top=top?"0":"auto"; chooser.style.bottom=top?"auto":"0";
+  chooser.style.flexDirection=top?"column":"column-reverse";
+  boardEl.appendChild(chooser);
 }
 function undoMove() {
   if(state.historyIndex<=0){status("Already at the first position");return;}
@@ -1063,6 +1145,7 @@ function setRoleUI() {
   document.querySelector("#purge").style.display=admin?"":"none";
   document.querySelector("#admin-tools").style.display=admin?"":"none";
   document.querySelector("#key-input").style.display=state.role?"none":"";
+  document.querySelector("#key-note").style.display=state.role?"none":"";
   document.querySelector("#key-login").textContent=state.role?"🔓 Logout":"Login";
   document.querySelector("#key-role").textContent=admin?"Admin":state.role==="contributor"?`Contributor: ${state.roleLabel||""}`:"";
   document.querySelector("#depth").min=state.minDepth;
@@ -2512,9 +2595,9 @@ export function openLine({ startFen=chess.START_FEN, moves, index=moves.length, 
     if(move.captured) captured[position.turn].push(move.captured);
     const next=chess.makeMove(position,move), check=chess.inCheck(next);
     const sound=check?(chess.legalMoves(next).length?"check":"mate"):move.castle?"castle":move.captured?"capture":"move";
-    openingMoves.push(chess.moveToUci(move).slice(0,4));
+    openingMoves.push(chess.moveToUci(move));
     position=next;
-    snapshots.push(snapshot(chess.moveToUci(move).slice(0,4),sound));
+    snapshots.push(snapshot(chess.moveToUci(move),sound));
   }
   goToPage("best");
   const last=snapshots[snapshots.length-1];

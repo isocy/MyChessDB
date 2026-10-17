@@ -113,6 +113,8 @@
     .legal-castle { box-shadow:inset 0 0 0 calc(var(--board) * .009) rgba(55,170,75,.78); }
     .legal-castle::after { content:""; width:calc(var(--board) * .0286); height:calc(var(--board) * .0286); border-radius:50%; background:rgba(55,170,75,.78); }
     .square { position:relative; }
+    /* The piece a best move promotes to, in the corner of its square. */
+    .promotion-badge { position:absolute; z-index:3; top:3%; right:3%; width:44%; height:44%; padding:3%; box-sizing:border-box; border-radius:50%; background:#f4f4f4; box-shadow:0 1px 3px rgba(0,0,0,.6); pointer-events:none; }
     aside { background:var(--panel); padding:16px; border-radius:6px; }
     .page-nav { display:flex; gap:14px; margin:-4px 0 8px; font-size:13px; }
     .page-nav a { color:#9bc4ff; }
@@ -157,6 +159,7 @@
     .key-role { color:#9bd49b; align-self:center; white-space:nowrap; }
     #view-switch button[aria-pressed="true"] { background:#2f5d3a; border-color:#6bbf7b; }
     #view-note { display:block; }
+    #key-note { display:block; margin:-3px 0 6px; font-size:12px; line-height:1.4; }
     #bridge-bar { display:flex; align-items:center; gap:8px; margin-top:8px; font-size:12px; color:#bbb; }
     #bridge-bar span { flex:1; min-width:0; overflow-wrap:anywhere; }
     #bridge-bar button { padding:3px 8px; flex:0 0 auto; }
@@ -267,6 +270,7 @@
         <li>Scroll over the board to move through the current history.</li>
         <li>Right-click a square or drag to annotate; hold Ctrl for red annotations.</li>
         <li id="best-move-hint">Green squares show the best move: full colour from depth 46, paler the shallower the analysis.</li>
+        <li>A best move that promotes a pawn shows the piece it becomes in the corner of its square.</li>
         <li>Purple squares show live analysis, shown while it is deeper than the saved result and saved once it is deeper than the saved Stockfish 19 analysis. It needs the engine bridge or the browser engine; turn it on or off with the button above the board.</li>
         <li>The bar left of the board shows the evaluation, also while an analysis is running.</li>
       </ul>
@@ -279,6 +283,7 @@
       <span id="key-role" class="key-role"></span>
       <button id="key-login">Login</button>
     </div>
+    <small id="key-note">Know the person who made this site? Contact them for a contributor key, and they will make one for you. With it, the analyses you save are marked as verified, and there is no hourly limit on saving.</small>
     <details id="advanced-settings">
       <summary>Position and engine settings</summary>
       <label for="fen">FEN</label>
