@@ -1151,7 +1151,9 @@ function setRoleUI() {
   document.querySelector("#depth").min=state.minDepth;
   document.querySelector("#depth-label").textContent=`Stockfish analysis depth (${state.minDepth} or more)`;
   document.querySelector("#best-move-hint").textContent=`Green squares show the best move: full colour from depth ${state.fullDepth}, paler the shallower the analysis.`;
+  for(const listener of roleListeners) listener();
 }
+const roleListeners=new Set();
 async function loadSession() {
   const session=await api("/api/session");
   state.minDepth=session.min_depth; state.fullDepth=session.full_depth;
@@ -1160,7 +1162,7 @@ async function loadSession() {
     localStorage.removeItem("chessdb_key");
     status("Your saved key is no longer valid; you are logged out.");
   }
-  state.role=session.role; state.roleLabel=session.label;
+  state.role=session.role; state.roleLabel=session.label; state.owner=session.owner||null;
   // Every visit starts at the site's full depth, whatever was typed last time.
   document.querySelector("#depth").value=state.fullDepth;
   setRoleUI();
@@ -1168,7 +1170,7 @@ async function loadSession() {
 }
 document.querySelector("#key-login").onclick=async()=>{
   if(state.role){
-    state.key=""; state.role=null; state.roleLabel=null;
+    state.key=""; state.role=null; state.roleLabel=null; state.owner=null;
     localStorage.removeItem("chessdb_key");
     setRoleUI();
     status("Logged out");
@@ -1187,7 +1189,7 @@ document.querySelector("#key-login").onclick=async()=>{
     }
     localStorage.setItem("chessdb_key",key);
     input.value="";
-    state.role=session.role; state.roleLabel=session.label; state.minDepth=session.min_depth; state.fullDepth=session.full_depth;
+    state.role=session.role; state.roleLabel=session.label; state.owner=session.owner||null; state.minDepth=session.min_depth; state.fullDepth=session.full_depth;
     setRoleUI();
     status(session.role==="admin"?"Admin mode enabled":"Contributor key accepted: your analyses are saved as verified");
   } catch(error) { state.key=""; status(error.message); }
@@ -2567,6 +2569,15 @@ export { MOBILE, bridge, checkBridge, versionAtLeast };
 export function bridgeStatus() { return bridgeState.connected?bridgeState.status:null; }
 /** Calls listener whenever the bridge's state may have changed. */
 export function onBridgeChange(listener) { bridgeListeners.add(listener); }
+/**
+ * Whose puzzle lists the server keeps for the key logged in ("admin" or
+ * "key:<id>"), or null without one (see /api/puzzles/* in worker/index.js).
+ */
+export function cloudOwner() { return state.role&&state.owner||null; }
+/** Calls listener whenever someone logs in or out (and once the session is known). */
+export function onRoleChange(listener) { roleListeners.add(listener); }
+/** This site's API, with the key logged in. */
+export { api };
 /** Shows the engine bridge's setup (or update) instructions. */
 export function openBridgeSetup() {
   goToPage("best");

@@ -2,7 +2,7 @@
 // When puzzles come back, and deleted ones (web/puzzlestore.js). Finding them, and fetching
 // the games, happens in the engine bridge: see bridge/*_test.go.
 import assert from "node:assert/strict";
-import { withResult, withDeleted, mergePuzzle, pickNext, pickPractice, reviewOf, isDue, DAY, MASTER_AFTER } from "../web/puzzlestore.js";
+import { withResult, withDeleted, mergePuzzle, changedAtOf, pickNext, pickPractice, reviewOf, isDue, DAY, MASTER_AFTER } from "../web/puzzlestore.js";
 
 let checks = 0;
 const ok = (condition, message) => { assert.ok(condition, message); checks++; };
@@ -64,6 +64,16 @@ const eq = (actual, expected, message) => { assert.deepEqual(actual, expected, m
   eq(mergePuzzle(back, deleted).deleted, false, "brought back after the import's copy was deleted: stays back");
   eq(mergePuzzle(deleted, back).deleted, false, "and the other way round");
   eq(mergePuzzle(puzzle, triedMore), triedMore, "neither deleted: the one tried more often");
+}
+
+// --- when a puzzle last changed (the later change wins on the server) --------
+{
+  const now = 1_000 * DAY;
+  eq(changedAtOf({ foundAt: 5 }), 5, "found, never tried");
+  eq(changedAtOf({ foundAt: 5, review: { lastAt: 9 } }), 9, "kept before it was recorded: its last try");
+  eq(changedAtOf(withResult({ id: "p", foundAt: 5 }, true, now)), now, "a try");
+  eq(changedAtOf(withDeleted({ id: "p", changedAt: 3 }, true, now + 1)), now + 1, "deleted");
+  eq(changedAtOf({ analysedAt: 7 }), 7, "a game: when it was analysed");
 }
 
 console.log(`puzzles: ${checks} checks passed`);

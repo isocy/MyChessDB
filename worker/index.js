@@ -44,6 +44,10 @@
 //     ("anon:<id>"), so the admin can take back all of one visitor's
 //     unverified entries at once (/api/purge).
 //
+// The puzzle lists of the admin and of each contributor key are kept here
+// too (puzzle_store; see the puzzles section below), so that every browser
+// logged in with the key has the same ones. Others keep theirs in the browser.
+//
 // Besides what visitors save, the lichess_db table can hold evaluations
 // taken over in bulk from the Lichess evaluation database
 // (scripts/lichess_db.mjs). They are read-only reference data: a position's
@@ -742,6 +746,137 @@ async function handleExport(request, env) {
   }, { "Content-Disposition": "attachment; filename=\"mychessdb-backup.json\"" });
 }
 
+// -------------------------------------------------------------- puzzles ----
+// The puzzle lists of those with a key (migrations/0005_puzzles.sql), kept
+// for the admin and for each contributor key apart. The page sends what
+// changed in the browser and gets back what changed on the server since its
+// last sync; of two changes to one item, the later one wins.
+
+const PUZZLE_PROFILE = /^(chesscom|lichess):[a-z0-9][a-z0-9_-]{1,29}$/;
+const PUZZLE_KINDS = ["profile", "game", "puzzle"];
+const PUZZLE_SYNC_ITEMS = 200;       // items sent in one request
+const PUZZLE_PULL_ROWS = 500;        // items answered in one response
+const PUZZLE_ITEM_BYTES = 32 * 1024;
+// A browser whose clock runs ahead must not win every later change.
+const PUZZLE_CLOCK_SLACK_MS = 60_000;
+
+// Whose lists: "admin" or "key:<id>".
+async function puzzleOwner(request, env) {
+  const who = await identify(request, env);
+  if (!who.role) {
+    throw new HttpError(who.sentKey ? 401 : 403, who.sentKey ? "That key is not recognised." : "Only the admin and contributors keep puzzles on the server.");
+  }
+  return who.savedBy;
+}
+
+function puzzleProfile(value) {
+  if (typeof value !== "string" || !PUZZLE_PROFILE.test(value)) throw new HttpError(400, "profile must look like \"lichess:name\"");
+  return value;
+}
+
+function cleanPuzzleItem(raw) {
+  if (raw === null || typeof raw !== "object") throw new HttpError(400, "Each item must be an object.");
+  if (!PUZZLE_KINDS.includes(raw.kind)) throw new HttpError(400, "kind must be profile, game or puzzle");
+  const id = raw.kind === "profile" ? "" : raw.id;
+  if (typeof id !== "string" || (raw.kind !== "profile" && (!id || id.length > 120))) throw new HttpError(400, "id is missing");
+  if (!Number.isSafeInteger(raw.changed_at) || raw.changed_at < 0) throw new HttpError(400, "changed_at must be a time in ms");
+  if (raw.data === null || typeof raw.data !== "object" || Array.isArray(raw.data)) throw new HttpError(400, "data must be an object");
+  const data = JSON.stringify(raw.data);
+  if (data.length > PUZZLE_ITEM_BYTES) throw new HttpError(413, `An item is larger than ${PUZZLE_ITEM_BYTES / 1024} KB.`);
+  return { kind: raw.kind, id, changed_at: Math.min(raw.changed_at, Date.now() + PUZZLE_CLOCK_SLACK_MS), data };
+}
+
+// The next rev of an account. Binds: owner, profile.
+const NEXT_PUZZLE_REV = "(SELECT COALESCE(MAX(rev), 0) + 1 FROM puzzle_store WHERE owner = ? AND profile = ?)";
+
+// GET /api/puzzles/profiles: the owner's accounts, the last changed first.
+async function handlePuzzleProfiles(request, env) {
+  const owner = await puzzleOwner(request, env);
+  const { results } = await env.DB.prepare(
+    `SELECT profile, changed_at FROM puzzle_store
+     WHERE owner = ? AND kind = 'profile' AND data IS NOT NULL ORDER BY changed_at DESC`,
+  ).bind(owner).all();
+  return json(200, { profiles: results });
+}
+
+// POST /api/puzzles/sync {profile, since, items: [{kind, id, changed_at, data}]}
+// Stores each item unless the server has a later change of it, then answers
+// {rev, items, more}: what changed since `since` (the rev of the browser's
+// last sync, 0 the first time), apart from what was just sent, at most
+// PUZZLE_PULL_ROWS at a time (more: ask again from the rev answered).
+//   {gone: true}: the account was deleted (in another browser) after the
+//     browser's last sync; nothing is stored.
+//   {missing: true}: the server has nothing for an account the browser has
+//     synced before: it sends everything again (since 0).
+// Sent from scratch (since 0), a deleted account starts again.
+async function handlePuzzleSync(request, env) {
+  const owner = await puzzleOwner(request, env);
+  const body = await readJson(request, 2 * 1024 * 1024);
+  const profile = puzzleProfile(body.profile);
+  if (!Number.isSafeInteger(body.since) || body.since < 0) throw new HttpError(400, "since must be a whole number");
+  const since = body.since;
+  const raw = body.items === undefined ? [] : body.items;
+  if (!Array.isArray(raw) || raw.length > PUZZLE_SYNC_ITEMS) throw new HttpError(400, `items must be a list of at most ${PUZZLE_SYNC_ITEMS}`);
+  const items = raw.map(cleanPuzzleItem);
+  const head = await env.DB.prepare(
+    "SELECT data IS NULL AS gone FROM puzzle_store WHERE owner = ? AND profile = ? AND kind = 'profile' AND id = ''",
+  ).bind(owner, profile).first();
+  if (since > 0 && !head) return json(200, { missing: true });
+  if (since > 0 && head.gone) return json(200, { gone: true });
+  // Every account has its profile row, which also outlives the account.
+  if (!head && !items.some(item => item.kind === "profile")) items.unshift({ kind: "profile", id: "", changed_at: 0, data: "{}" });
+  const statements = items.map(item => env.DB.prepare(
+    `INSERT INTO puzzle_store (owner, profile, kind, id, data, changed_at, rev)
+     VALUES (?, ?, ?, ?, ?, ?, ${NEXT_PUZZLE_REV})
+     ON CONFLICT(owner, profile, kind, id) DO UPDATE SET
+       data = excluded.data, changed_at = excluded.changed_at, rev = excluded.rev
+     WHERE excluded.changed_at > puzzle_store.changed_at OR puzzle_store.data IS NULL
+     RETURNING rev`,
+  ).bind(owner, profile, item.kind, item.id, item.data, item.changed_at, owner, profile));
+  const stored = statements.length ? await env.DB.batch(statements) : [];
+  const { results } = await env.DB.prepare(
+    `SELECT kind, id, data, changed_at, rev FROM puzzle_store
+     WHERE owner = ? AND profile = ? AND rev > ? ORDER BY rev LIMIT ?`,
+  ).bind(owner, profile, since, PUZZLE_PULL_ROWS + 1).all();
+  const more = results.length > PUZZLE_PULL_ROWS;
+  const rows = results.slice(0, PUZZLE_PULL_ROWS);
+  // What was just sent and kept is not sent back; where the server had a
+  // later change, that one is, even when the browser had it before.
+  const sent = new Map(items.map(item => [`${item.kind}|${item.id}`, item.changed_at]));
+  const answer = rows.filter(row => row.data !== null && sent.get(`${row.kind}|${row.id}`) !== row.changed_at);
+  for (const [index, item] of items.entries()) {
+    if (stored[index].results?.length || answer.some(row => row.kind === item.kind && row.id === item.id)) continue;
+    const later = await env.DB.prepare(
+      "SELECT kind, id, data, changed_at FROM puzzle_store WHERE owner = ? AND profile = ? AND kind = ? AND id = ?",
+    ).bind(owner, profile, item.kind, item.id).first();
+    if (later?.data != null) answer.push(later);
+  }
+  return json(200, {
+    rev: rows.length ? rows[rows.length - 1].rev : since,
+    more,
+    items: answer.map(row => ({ kind: row.kind, id: row.id, changed_at: row.changed_at, data: JSON.parse(row.data) })),
+  });
+}
+
+// POST /api/puzzles/forget {profile}: deletes an account's puzzles. Its
+// profile row stays, emptied, so that the browsers that synced it delete
+// their copy too.
+async function handlePuzzleForget(request, env) {
+  const owner = await puzzleOwner(request, env);
+  const profile = puzzleProfile((await readJson(request, 4096)).profile);
+  // The mark first: its rev comes after every row the account had, so the
+  // revs of an account started again later never go back.
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO puzzle_store (owner, profile, kind, id, data, changed_at, rev)
+       VALUES (?, ?, 'profile', '', NULL, ?, ${NEXT_PUZZLE_REV})
+       ON CONFLICT(owner, profile, kind, id) DO UPDATE SET data = NULL, changed_at = excluded.changed_at, rev = excluded.rev`,
+    ).bind(owner, profile, Date.now(), owner, profile),
+    env.DB.prepare("DELETE FROM puzzle_store WHERE owner = ? AND profile = ? AND kind <> 'profile'").bind(owner, profile),
+  ]);
+  return json(200, { forgotten: true });
+}
+
 // --------------------------------------------------------------- router ----
 
 async function route(request, env) {
@@ -766,6 +901,8 @@ async function route(request, env) {
     const who = await identify(request, env);
     return json(200, {
       role: who.role, label: who.label || null,
+      // Whose puzzle lists the server keeps for this key.
+      owner: who.role ? who.savedBy : null,
       min_depth: minDepth(env), full_depth: fullDepth(env), admin_configured: adminConfigured(env),
     });
   }
@@ -779,6 +916,9 @@ async function route(request, env) {
   if (path === "/api/keys/revoke" && method === "POST") return handleRevokeKey(request, env);
   if (path === "/api/import" && method === "POST") return handleImport(request, env);
   if (path === "/api/export" && method === "GET") return handleExport(request, env);
+  if (path === "/api/puzzles/profiles" && method === "GET") return handlePuzzleProfiles(request, env);
+  if (path === "/api/puzzles/sync" && method === "POST") return handlePuzzleSync(request, env);
+  if (path === "/api/puzzles/forget" && method === "POST") return handlePuzzleForget(request, env);
   throw new HttpError(404, "Not found");
 }
 

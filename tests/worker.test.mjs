@@ -67,11 +67,12 @@ const at = async (env, fen) => (await call(env, "GET", "/api/position?fen=" + en
 // --- session ------------------------------------------------------------
 {
   const env = makeEnv();
-  eq((await call(env, "GET", "/api/session")).data, { role: null, label: null, min_depth: 21, full_depth: 46, admin_configured: true });
+  eq((await call(env, "GET", "/api/session")).data, { role: null, label: null, owner: null, min_depth: 21, full_depth: 46, admin_configured: true });
   eq((await call(env, "GET", "/api/session", { key: ADMIN })).data.role, "admin");
+  eq((await call(env, "GET", "/api/session", { key: ADMIN })).data.owner, "admin");
   eq((await call(env, "GET", "/api/session", { key: "wrong" })).data.role, null);
   eq((await call(makeEnv({ ADMIN_TOKEN: "short" }), "GET", "/api/session", { key: "short" })).data,
-    { role: null, label: null, min_depth: 21, full_depth: 46, admin_configured: false }, "a short admin token is refused");
+    { role: null, label: null, owner: null, min_depth: 21, full_depth: 46, admin_configured: false }, "a short admin token is refused");
   const custom = (await call(makeEnv({ MIN_DEPTH: "12", FULL_DEPTH: "30" }), "GET", "/api/session")).data;
   eq([custom.min_depth, custom.full_depth], [12, 30]);
   eq((await call(env, "GET", "/index.html")).data, "<html>static</html>", "non-API paths go to static assets");
@@ -170,7 +171,7 @@ const at = async (env, fen) => (await call(env, "GET", "/api/position?fen=" + en
   ok(/^mck_[A-Za-z0-9_-]{32}$/.test(created.key), "key format");
   const stored = env.DB.db.prepare("SELECT key_hash FROM contributor_keys").all();
   ok(stored.length === 1 && !JSON.stringify(stored).includes(created.key), "only the hash is stored");
-  eq((await call(env, "GET", "/api/session", { key: created.key })).data, { role: "contributor", label: "Minsu", min_depth: 21, full_depth: 46, admin_configured: true });
+  eq((await call(env, "GET", "/api/session", { key: created.key })).data, { role: "contributor", label: "Minsu", owner: `key:${created.id}`, min_depth: 21, full_depth: 46, admin_configured: true });
 
   // verified depth 46 replaces unverified depth 47
   r = await call(env, "POST", "/api/saved", { body: sf(START, 46, ["g1f3"]), key: created.key });
@@ -615,6 +616,84 @@ const at = async (env, fen) => (await call(env, "GET", "/api/position?fen=" + en
   r = await call(broken, "GET", `/api/position?next=1&fen=${encodeURIComponent(START)}`);
   console.error = realError;
   eq([Object.keys(r.data.next).length, r.data.limited], [20, undefined]);
+}
+
+// --- puzzle lists of those with a key ----------------------------------------
+{
+  const env = makeEnv();
+  const minsu = (await call(env, "POST", "/api/keys", { body: { label: "Minsu" }, key: ADMIN })).data;
+  const sync = (key, body) => call(env, "POST", "/api/puzzles/sync", { body, key });
+  const profileItem = (changed_at, data = { rating: 1500 }) => ({ kind: "profile", changed_at, data });
+  const puzzle = (id, changed_at, data = {}) => ({ kind: "puzzle", id, changed_at, data: { id, ...data } });
+  const P = "lichess:minsu";
+
+  // Without a key, or with a wrong one: no.
+  eq((await sync(undefined, { profile: P, since: 0 })).status, 403);
+  eq((await sync("wrong-key", { profile: P, since: 0 })).status, 401);
+  eq((await call(env, "GET", "/api/puzzles/profiles")).status, 403);
+  // Bad requests.
+  eq((await sync(minsu.key, { profile: "lichess:Minsu", since: 0 })).status, 400, "profile ids are lower case");
+  eq((await sync(minsu.key, { profile: "other:minsu", since: 0 })).status, 400);
+  eq((await sync(minsu.key, { profile: P, since: -1 })).status, 400);
+  eq((await sync(minsu.key, { profile: P, since: 0, items: [{ kind: "song", id: "x", changed_at: 1, data: {} }] })).status, 400);
+  eq((await sync(minsu.key, { profile: P, since: 0, items: [puzzle("", 1)] })).status, 400, "an item needs its id");
+  eq((await sync(minsu.key, { profile: P, since: 0, items: [{ ...puzzle("p", 1), data: "text" }] })).status, 400);
+  eq((await sync(minsu.key, { profile: P, since: 0, items: [puzzle("p", 1, { big: "x".repeat(40_000) })] })).status, 413);
+  eq((await sync(minsu.key, { profile: P, since: 0, items: Array.from({ length: 201 }, (_, i) => puzzle(`p${i}`, 1)) })).status, 400);
+  eq(env.DB.db.prepare("SELECT COUNT(*) AS n FROM puzzle_store").get().n, 0, "nothing stored by bad requests");
+
+  // The computer sends its list the first time.
+  let r = await sync(minsu.key, { profile: P, since: 0, items: [profileItem(100), puzzle("g1#5", 100), puzzle("g1#9", 100), { kind: "game", id: "g1", changed_at: 90, data: { id: "g1", moves: ["e2e4"] } }] });
+  eq([r.status, r.data.items, r.data.more], [200, [], false], "what was just sent is not sent back");
+  const computerRev = r.data.rev;
+  eq(computerRev, 4);
+  // The phone, with the same key, gets all of it.
+  r = await sync(minsu.key, { profile: P, since: 0 });
+  eq([r.data.rev, r.data.items.map(item => `${item.kind}:${item.id}`)], [4, ["profile:", "puzzle:g1#5", "puzzle:g1#9", "game:g1"]]);
+  eq(r.data.items[3].data, { id: "g1", moves: ["e2e4"] });
+  eq((await call(env, "GET", "/api/puzzles/profiles", { key: minsu.key })).data.profiles, [{ profile: P, changed_at: 100 }]);
+
+  // The phone solves one; the computer gets that change only.
+  r = await sync(minsu.key, { profile: P, since: 4, items: [puzzle("g1#5", 200, { solved: 1 })] });
+  eq([r.data.rev, r.data.items], [5, []]);
+  r = await sync(minsu.key, { profile: P, since: computerRev });
+  eq([r.data.rev, r.data.items.map(item => [item.id, item.data.solved])], [5, [["g1#5", 1]]]);
+  // An older change (made before, sent later) loses, and the newer one comes back.
+  r = await sync(minsu.key, { profile: P, since: 5, items: [puzzle("g1#5", 150, { solved: 0 })] });
+  eq([r.data.rev, r.data.items.map(item => [item.id, item.changed_at, item.data.solved])], [5, [["g1#5", 200, 1]]]);
+  // A clock far ahead counts as now.
+  r = await sync(minsu.key, { profile: P, since: 5, items: [puzzle("g1#9", Date.now() + 86_400_000)] });
+  ok(env.DB.db.prepare("SELECT changed_at FROM puzzle_store WHERE id = 'g1#9'").get().changed_at <= Date.now() + 60_000);
+
+  // Pages of 500.
+  for (let start = 0; start < 600; start += 200) {
+    await sync(minsu.key, { profile: P, since: 6, items: Array.from({ length: 200 }, (_, i) => puzzle(`many#${start + i}`, 300)) });
+  }
+  r = await sync(minsu.key, { profile: P, since: 6 });
+  eq([r.data.items.length, r.data.more, r.data.rev], [500, true, 506]);
+  r = await sync(minsu.key, { profile: P, since: r.data.rev });
+  eq([r.data.items.length, r.data.more, r.data.rev], [100, false, 606]);
+
+  // Each key has its own lists.
+  eq((await sync(ADMIN, { profile: P, since: 0 })).data.items, [], "the admin does not see a contributor's puzzles");
+  eq((await call(env, "GET", "/api/puzzles/profiles", { key: ADMIN })).data.profiles, [{ profile: P, changed_at: 0 }], "only the empty account the admin just opened");
+
+  // Deleted in one browser: another that synced it is told so; nothing it sends is kept.
+  eq((await call(env, "POST", "/api/puzzles/forget", { body: { profile: P }, key: minsu.key })).data.forgotten, true);
+  eq(env.DB.db.prepare("SELECT COUNT(*) AS n FROM puzzle_store WHERE owner = ?").get(`key:${minsu.id}`).n, 1, "only the mark of the deleted account is left");
+  r = await sync(minsu.key, { profile: P, since: 606, items: [puzzle("g1#5", 999)] });
+  eq(r.data, { gone: true });
+  eq((await call(env, "GET", "/api/puzzles/profiles", { key: minsu.key })).data.profiles, [], "a deleted account is not listed");
+  // Sent again from scratch, it starts anew, after the revs it had.
+  r = await sync(minsu.key, { profile: P, since: 0, items: [profileItem(50), puzzle("g2#3", 50)] });
+  eq([r.status, r.data.rev > 606, r.data.items], [200, true, []]);
+  eq((await sync(minsu.key, { profile: P, since: 0 })).data.items.map(item => item.id), ["", "g2#3"]);
+  // An account the server does not know, though the browser synced it before.
+  eq((await sync(minsu.key, { profile: "chesscom:minsu", since: 12 })).data, { missing: true });
+
+  // A revoked key reaches nothing.
+  await call(env, "POST", "/api/keys/revoke", { body: { id: minsu.id }, key: ADMIN });
+  eq((await sync(minsu.key, { profile: P, since: 0 })).status, 401);
 }
 
 // --- API answers are never sniffed as another type -------------------------

@@ -10,14 +10,16 @@
 // Lichess finds its puzzles (bridge/puzzlegen.go), until every game that
 // counts has been analysed, whether or not this tab stays open. The page
 // collects what it found and the puzzles come back for practice on a
-// schedule (puzzlestore.js). Nothing is sent to this site's server: the
-// puzzles are kept in this browser.
+// schedule (puzzlestore.js). The puzzles are kept in this browser; for those
+// logged in with a key (the admin, contributors) also on this site's server,
+// the same in every browser they log in with (see "server" below).
 import * as chess from "./chesslib.js";
 import { playMoveSound } from "./sounds.js";
 import { PuzzleBoard } from "./puzzleboard.js";
 import * as store from "./puzzlestore.js";
 import {
   MOBILE, bridge, checkBridge, bridgeStatus, onBridgeChange, openBridgeSetup, openLine, versionAtLeast, drawMaterial,
+  api, cloudOwner, onRoleChange,
 } from "./app.js";
 
 // Games count when the player's rating in them was at least this share of
@@ -31,6 +33,10 @@ const PUZZLES_MIN_VERSION = "1.0.8";
 // How hard the bridge's engine works (bridge/puzzlegen.go, puzzleEfforts).
 const EFFORTS = { lichess: "As Lichess (1,000,000 nodes per position)", quick: "Quicker (300,000 nodes per position)" };
 const FOLLOW_MS = 1500, RECONNECT_MS = 15000;
+// The server (with a key): a change is sent this soon; what other browsers
+// changed is asked for this often while the puzzles are on screen; this many
+// items go in one request.
+const SYNC_SOON_MS = 1500, SYNC_EVERY_MS = 60_000, SYNC_PART = 200;
 const $ = selector => document.querySelector(selector);
 
 const state = {
@@ -45,6 +51,9 @@ const state = {
   views: {},            // account id -> the bridge's last word on it
   session: null,        // since Update was clicked: {finished, found, stopped}
 };
+// The sync with the server: whose lists (owner), the one running, timers,
+// when it last worked, and what went wrong.
+const cloud = { owner: null, running: null, again: false, soon: null, poll: null, at: 0, error: null };
 let timers = [];
 const board = new PuzzleBoard($("#pz-board"), $("#pz-annotation-layer"), { onMove: (uci, options) => userMove(uci, options) });
 
@@ -136,6 +145,7 @@ function renderSummary() {
   const summary = $("#pz-summary");
   $("#pz-export").disabled = $("#pz-delete").disabled = !state.accounts.length;
   renderWork();
+  renderCloud();
   if (!state.accounts.length) { summary.textContent = ""; renderPool(); return; }
   const lines = [];
   for (const account of state.accounts) {
@@ -170,8 +180,10 @@ function typedNames() {
 }
 
 // Opens the accounts (creating the ones not seen before) and shows their
-// puzzles together.
-async function openAccounts(names, { create = false } = {}) {
+// puzzles together. An account the server keeps for the key logged in comes
+// from there (kept: the server's account ids, when already asked for).
+async function openAccounts(names, { create = false, kept = null } = {}) {
+  if (create && !kept && cloudOwner()) kept = await cloudProfiles().catch(() => []);
   const loaded = [];
   let created = false;
   for (const site of Object.keys(SITES)) {
@@ -184,7 +196,7 @@ async function openAccounts(names, { create = false } = {}) {
       if (!create) continue;
       found = { profile: { id, site, username, rating: null, createdAt: Date.now() }, games: [], puzzles: [] };
       await store.save(found.profile);
-      created = true;
+      if (!kept?.includes(id)) created = true;
     }
     loaded.push(found);
   }
@@ -197,9 +209,7 @@ async function openAccounts(names, { create = false } = {}) {
   state.accounts = loaded.map(entry => entry.profile);
   state.games = new Map(loaded.flatMap(entry => entry.games.map(game => [game.id, game])));
   state.puzzles = new Map(loaded.flatMap(entry => entry.puzzles.map(puzzle => [puzzle.id, puzzle])));
-  try {
-    localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(Object.fromEntries(state.accounts.map(account => [account.site, account.username]))));
-  } catch (error) { /* not remembered */ }
+  rememberAccounts();
   $("#pz-chesscom").value = accountFor("chesscom")?.username || "";
   $("#pz-lichess").value = accountFor("lichess")?.username || "";
   setStatus("");
@@ -209,6 +219,13 @@ async function openAccounts(names, { create = false } = {}) {
   if (created) update();
   else watchBridge();
   nextPuzzle();
+  if (cloudOwner()) syncAll();
+}
+
+function rememberAccounts() {
+  try {
+    localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(Object.fromEntries(state.accounts.map(account => [account.site, account.username]))));
+  } catch (error) { /* not remembered */ }
 }
 
 // --------------------------------------------------------- engine bridge ----
@@ -373,16 +390,22 @@ async function collect(account, view) {
   const changed = JSON.stringify(stats) !== JSON.stringify(account.bridge) || (view.rating && view.rating !== account.rating);
   if (view.rating) { account.rating = view.rating; account.ratingAt = view.rating_at; }
   account.bridge = stats;
+  if (changed) { account.changedAt = Date.now(); account.unsynced = true; }
   const results = view.results || [];
   const games = [], puzzles = [];
   for (const result of results) {
-    const game = { ...result.game, status: result.error ? "failed" : "done", puzzles: 0, analysedAt: result.analysed_at || Date.now(), analysedWith: result.effort };
+    const analysedAt = result.analysed_at || Date.now();
+    const game = {
+      ...result.game, status: result.error ? "failed" : "done", puzzles: 0, analysedAt, analysedWith: result.effort,
+      changedAt: analysedAt, unsynced: true,
+    };
     if (result.error) game.error = result.error;
     for (const candidate of result.puzzles || []) {
       const id = `${game.id}#${candidate.ply}`;
       if (state.puzzles.has(id) || [...state.puzzles.values()].some(puzzle => puzzle.key === candidate.key)) continue;
       try { chess.parseFen(candidate.fenBefore); } catch (error) { continue; }
-      const puzzle = { ...candidate, id, gameId: game.id, playedAt: game.playedAt, foundAt: Date.now() };
+      const now = Date.now();
+      const puzzle = { ...candidate, id, gameId: game.id, playedAt: game.playedAt, foundAt: now, changedAt: now, unsynced: true };
       state.puzzles.set(id, puzzle);
       puzzles.push(puzzle);
       game.puzzles++;
@@ -397,6 +420,7 @@ async function collect(account, view) {
   }
   if (changed || results.length) renderSummary();
   if (puzzles.length && idle()) nextPuzzle();
+  if (changed || puzzles.length) syncSoon();
 }
 
 async function stop() {
@@ -669,11 +693,16 @@ function record(current, solved) {
   savePuzzle(updated);
 }
 
+// A puzzle changed here: kept in this browser, and sent to the server soon
+// (with a key).
 function savePuzzle(puzzle) {
+  puzzle = { ...puzzle, unsynced: true };
   state.puzzles.set(puzzle.id, puzzle);
   const owner = ownerOf(puzzle);
   if (owner) store.save(owner, { puzzles: [puzzle] }).catch(error => setStatus(error.message, true));
   renderSummary();
+  syncSoon();
+  return puzzle;
 }
 
 // Deletes the puzzle on the board from the list and shows the next one: once
@@ -830,8 +859,9 @@ function renderPool() {
       back.className = "small";
       back.textContent = "Bring back";
       back.onclick = () => {
-        if (puzzle.deleted) bringBack(puzzle.id);
-        else savePuzzle({ ...puzzle, mastered: false, review: { ...store.reviewOf(puzzle), streak: 0, due: Date.now() } });
+        const latest = state.puzzles.get(puzzle.id) || puzzle;
+        if (latest.deleted) bringBack(latest.id);
+        else savePuzzle({ ...latest, mastered: false, review: { ...store.reviewOf(latest), streak: 0, due: Date.now() }, changedAt: Date.now() });
         if (state.current?.puzzle?.id === puzzle.id && state.current.done) $("#pz-delete-puzzle").hidden = false;
         if (state.current?.waiting) nextPuzzle();
       };
@@ -841,14 +871,204 @@ function renderPool() {
   }
 }
 
+// ---------------------------------------------------------------- server ----
+// Logged in with a key (the admin token or a contributor key, on the best
+// moves page), the accounts are kept on this site's server too, the same in
+// every browser logged in with that key (/api/puzzles/* in worker/index.js):
+// what changed here is sent, what changed elsewhere comes back, and of two
+// changes to one puzzle the later one wins. Of the games, only those with
+// puzzles are kept there. Without a key, everything stays in this browser.
+
+// What only this browser needs to know.
+const withoutLocal = ({ unsynced, cloud: synced, ...kept }) => kept;
+function validPuzzle(puzzle) {
+  if (typeof puzzle?.id !== "string" || typeof puzzle.gameId !== "string" || typeof puzzle.fenBefore !== "string"
+    || typeof puzzle.lastMove !== "string" || !Array.isArray(puzzle.solution)) return false;
+  try { chess.parseFen(puzzle.fenBefore); return true; } catch (error) { return false; }
+}
+
+// The ids of the accounts the server keeps for the key ("lichess:name"),
+// the last changed first.
+async function cloudProfiles() {
+  return (await api("/api/puzzles/profiles")).profiles.map(entry => entry.profile);
+}
+
+// Sends what changed in a moment (several changes go together).
+function syncSoon() {
+  if (!cloudOwner() || !state.accounts.length || cloud.soon) return;
+  cloud.soon = setTimeout(() => { cloud.soon = null; syncAll(); }, SYNC_SOON_MS);
+}
+
+// Syncs every open account; asked again while it runs, it runs once more.
+// While the puzzles are on screen, it runs again now and then, for what
+// other browsers changed.
+async function syncAll() {
+  if (cloud.running) { cloud.again = true; return cloud.running; }
+  clearTimeout(cloud.poll);
+  cloud.running = (async () => {
+    try {
+      do {
+        cloud.again = false;
+        for (const account of state.accounts.slice()) await syncAccount(account);
+      } while (cloud.again && cloudOwner());
+      cloud.at = Date.now();
+      cloud.error = null;
+    } catch (error) {
+      cloud.error = error.message;
+    } finally {
+      cloud.running = null;
+      renderCloud();
+      if (cloudOwner() && state.accounts.length) {
+        const poll = () => { if (shown() && !document.hidden) syncAll(); else cloud.poll = setTimeout(poll, SYNC_EVERY_MS); };
+        cloud.poll = setTimeout(poll, SYNC_EVERY_MS);
+      }
+    }
+  })();
+  renderCloud();
+  return cloud.running;
+}
+
+async function syncAccount(account) {
+  const owner = cloudOwner();
+  if (!owner || !state.accounts.includes(account)) return;
+  // The first time with this key everything is sent, after that what
+  // changed here since.
+  const fresh = account.cloud?.owner !== owner;
+  const mine = [...state.puzzles.values()].filter(puzzle => siteOf(puzzle.gameId) === account.site);
+  const withPuzzles = new Set(mine.map(puzzle => puzzle.gameId));
+  const sent = [];   // [record, item]
+  const profileAt = account.changedAt || 0;
+  if (fresh || account.unsynced) sent.push([account, { kind: "profile", changed_at: profileAt, data: withoutLocal(account) }]);
+  for (const game of state.games.values()) {
+    if (game.site !== account.site || !withPuzzles.has(game.id) || !(fresh || game.unsynced)) continue;
+    sent.push([game, { kind: "game", id: game.id, changed_at: store.changedAtOf(game), data: withoutLocal(game) }]);
+  }
+  for (const puzzle of mine) {
+    if (fresh || puzzle.unsynced) sent.push([puzzle, { kind: "puzzle", id: puzzle.id, changed_at: store.changedAtOf(puzzle), data: withoutLocal(puzzle) }]);
+  }
+  let rev = fresh ? 0 : account.cloud.rev;
+  for (let start = 0; start === 0 || start < sent.length; start += SYNC_PART) {
+    const items = sent.slice(start, start + SYNC_PART).map(([, item]) => item);
+    let answer = await api("/api/puzzles/sync", { body: { profile: account.id, since: rev, items } });
+    if (answer.gone) { await forgetHere(account); return; }
+    if (answer.missing) { account.cloud = null; return syncAccount(account); }   // everything again
+    for (;;) {
+      await take(account, answer.items);
+      rev = answer.rev;
+      if (!answer.more) break;
+      answer = await api("/api/puzzles/sync", { body: { profile: account.id, since: rev } });
+    }
+  }
+  // What was sent is on the server now, unless it changed here meanwhile.
+  const games = [], puzzles = [];
+  for (const [record, item] of sent) {
+    const map = item.kind === "game" ? state.games : item.kind === "puzzle" ? state.puzzles : null;
+    if (!map || map.get(record.id) !== record) continue;
+    const synced = { ...record, unsynced: false };
+    map.set(synced.id, synced);
+    (item.kind === "game" ? games : puzzles).push(synced);
+  }
+  if ((account.changedAt || 0) === profileAt) account.unsynced = false;
+  account.cloud = { owner, rev };
+  if (state.accounts.includes(account)) await store.save(account, { games, puzzles });
+}
+
+// Takes what changed in other browsers, unless it changed here since.
+async function take(account, items = []) {
+  const games = [], puzzles = [];
+  let profile = false;
+  const newerHere = (here, changedAt) => here?.unsynced && store.changedAtOf(here) >= changedAt;
+  for (const { kind, changed_at: changedAt, data } of items) {
+    if (kind === "profile") {
+      if (account.unsynced && (account.changedAt || 0) >= changedAt) continue;
+      const { id, site, ...rest } = withoutLocal(data);
+      Object.assign(account, rest, { changedAt });
+      profile = true;
+    } else if (kind === "game") {
+      if (typeof data?.id !== "string" || siteOf(data.id) !== account.site || newerHere(state.games.get(data.id), changedAt)) continue;
+      const game = { ...withoutLocal(data), changedAt, unsynced: false };
+      state.games.set(game.id, game);
+      games.push(game);
+    } else if (kind === "puzzle") {
+      if (!validPuzzle(data) || siteOf(data.gameId) !== account.site || newerHere(state.puzzles.get(data.id), changedAt)) continue;
+      const puzzle = { ...withoutLocal(data), changedAt, unsynced: false };
+      state.puzzles.set(puzzle.id, puzzle);
+      puzzles.push(puzzle);
+    }
+  }
+  if (!profile && !games.length && !puzzles.length) return;
+  if (state.accounts.includes(account)) await store.save(account, { games, puzzles });
+  renderSummary();
+  if (puzzles.length && idle()) nextPuzzle();
+}
+
+// The account was deleted in another browser logged in with the same key.
+async function forgetHere(account) {
+  await store.deleteProfile(account.id);
+  state.accounts = state.accounts.filter(other => other !== account);
+  for (const [id, game] of state.games) if (game.site === account.site) state.games.delete(id);
+  for (const [id, puzzle] of state.puzzles) if (siteOf(puzzle.gameId) === account.site) state.puzzles.delete(id);
+  delete state.views[account.id];
+  if (bridgeStatus()?.puzzles) bridge("/api/puzzles/forget", { body: { profile: account.id } }).catch(() => {});
+  rememberAccounts();
+  $(account.site === "chesscom" ? "#pz-chesscom" : "#pz-lichess").value = "";
+  setStatus(`${SITES[account.site]} ${account.username}: deleted in another browser logged in with this key, so here too.`);
+  renderSummary();
+  if (idle() || siteOf(state.current.puzzle.gameId) === account.site) nextPuzzle();
+}
+
+// Logged in with no accounts open here: the ones the server keeps for the
+// key (the last changed of each site).
+async function openFromCloud() {
+  if (!cloudOwner() || state.accounts.length) return;
+  let kept;
+  try { kept = await cloudProfiles(); } catch (error) { cloud.error = error.message; renderCloud(); return; }
+  const names = { chesscom: "", lichess: "" };
+  for (const id of kept) {
+    const site = siteOf(id);
+    if (site in names && !names[site]) names[site] = id.slice(site.length + 1);
+  }
+  if ((names.chesscom || names.lichess) && !state.accounts.length) await openAccounts(names, { create: true, kept });
+}
+
+function renderCloud() {
+  const element = $("#pz-cloud");
+  element.classList.toggle("error", !!(cloudOwner() && cloud.error));
+  if (!cloudOwner()) {
+    element.textContent = state.accounts.length
+      ? "Kept in this browser only. Logged in with a key (Best moves), the puzzles are kept on the server too, the same in every browser."
+      : "";
+  } else if (cloud.error) {
+    element.textContent = `Not synced with the server: ${cloud.error}`;
+  } else if (cloud.running) {
+    element.textContent = "Syncing with the server…";
+  } else {
+    const at = cloud.at ? ` · synced at ${new Date(cloud.at).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}` : "";
+    element.textContent = state.accounts.length ? `Kept on the server for your key${at}.` : "";
+  }
+}
+
+// Logging in or out, here or on the best moves page.
+onRoleChange(() => started.then(() => {
+  const owner = cloudOwner();
+  if (owner === cloud.owner) return;
+  cloud.owner = owner;
+  cloud.error = null;
+  renderCloud();
+  if (!owner) { clearTimeout(cloud.poll); return; }
+  if (state.accounts.length) syncAll();
+  else openFromCloud();
+}));
+document.addEventListener("visibilitychange", () => { if (!document.hidden && shown()) syncSoon(); });
+
 // ------------------------------------------------------- export, import ----
 
 function exportAccounts() {
   if (!state.accounts.length) return;
   const accounts = state.accounts.map(profile => ({
-    profile,
-    games: [...state.games.values()].filter(game => game.site === profile.site),
-    puzzles: [...state.puzzles.values()].filter(puzzle => siteOf(puzzle.gameId) === profile.site),
+    profile: withoutLocal(profile),
+    games: [...state.games.values()].filter(game => game.site === profile.site).map(withoutLocal),
+    puzzles: [...state.puzzles.values()].filter(puzzle => siteOf(puzzle.gameId) === profile.site).map(withoutLocal),
   }));
   const data = { format: "mychessdb-puzzles", version: 2, exported_at: new Date().toISOString(), accounts };
   const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
@@ -864,7 +1084,8 @@ function exportAccounts() {
 // Merges an export into what this browser has: an analysed game wins over
 // one that is not, and of two copies of a puzzle the one tried more often,
 // deleted or not as decided last (store.mergePuzzle). Takes both this
-// version's exports (several accounts) and the first one's.
+// version's exports (several accounts) and the first one's. With a key,
+// what was imported goes to the server too.
 async function importAccounts(file) {
   let data;
   try { data = JSON.parse(await file.text()); } catch (error) { setStatus("That file is not an export of the puzzles.", true); return; }
@@ -884,16 +1105,17 @@ async function importAccounts(file) {
     for (const game of entry.games) {
       if (typeof game?.id !== "string" || !Array.isArray(game.moves)) continue;
       const mine = games.get(game.id);
-      if (!mine || (mine.status !== "done" && game.status === "done")) games.set(game.id, game);
+      if (!mine || (mine.status !== "done" && game.status === "done")) games.set(game.id, { ...game, unsynced: true });
     }
     const puzzles = new Map((existing?.puzzles || []).map(puzzle => [puzzle.id, puzzle]));
     for (const puzzle of entry.puzzles) {
-      if (typeof puzzle?.id !== "string" || typeof puzzle.fenBefore !== "string" || !Array.isArray(puzzle.solution)) continue;
-      try { chess.parseFen(puzzle.fenBefore); } catch (error) { continue; }
-      puzzles.set(puzzle.id, store.mergePuzzle(puzzles.get(puzzle.id), puzzle));
+      if (!validPuzzle(puzzle)) continue;
+      puzzles.set(puzzle.id, { ...store.mergePuzzle(puzzles.get(puzzle.id), puzzle), unsynced: true });
     }
-    const { sync, ...kept } = profile;   // what fetching had reached is the bridge's now
-    await store.save({ ...(existing?.profile || {}), ...kept, id }, { games: [...games.values()], puzzles: [...puzzles.values()] });
+    // What fetching had reached is the bridge's now; how far this browser
+    // synced with the server is its own.
+    const { sync, cloud: synced, unsynced, ...kept } = profile;
+    await store.save({ ...(existing?.profile || {}), ...kept, id, unsynced: true }, { games: [...games.values()], puzzles: [...puzzles.values()] });
     names[profile.site] = profile.username;
     puzzleCount += entry.puzzles.length;
   }
@@ -912,6 +1134,16 @@ async function deleteAccounts() {
   }
   state.deleteArmed = 0;
   button.textContent = "Delete these accounts' data";
+  // With a key, from the server first: then from every browser logged in
+  // with it (they are told at their next sync).
+  if (cloudOwner()) {
+    try {
+      for (const account of state.accounts) await api("/api/puzzles/forget", { body: { profile: account.id } });
+    } catch (error) {
+      setStatus(`Not deleted: ${error.message}`, true);
+      return;
+    }
+  }
   // Nothing follows the bridge for these accounts any more, first.
   const accounts = state.accounts;
   state.accounts = [];
@@ -1004,13 +1236,16 @@ export function pageShown() {
   if (state.accounts.length) {
     renderSummary();
     if (!state.following) watchBridge();
+    syncSoon();
   } else if (!MOBILE && !bridgeStatus()) {
     checkBridge().catch(() => {});
   }
 }
 
-// The accounts used last (one per site; the first version kept one).
-(async () => {
+// The accounts used last (one per site; the first version kept one), or,
+// logged in with a key, the ones the server keeps for it.
+const started = (async () => {
+  cloud.owner = cloudOwner();
   let names = null;
   try {
     names = JSON.parse(localStorage.getItem(ACCOUNTS_KEY) || "null");
@@ -1020,5 +1255,7 @@ export function pageShown() {
   if (names && typeof names === "object") {
     await openAccounts({ chesscom: typeof names.chesscom === "string" ? names.chesscom : "", lichess: typeof names.lichess === "string" ? names.lichess : "" });
   }
+  if (!state.accounts.length) await openFromCloud();
   if (!state.accounts.length) nextPuzzle();
+  renderCloud();
 })();

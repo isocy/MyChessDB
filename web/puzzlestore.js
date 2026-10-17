@@ -15,6 +15,10 @@
 // A puzzle the player deletes stays in the pool, marked, so that it is not
 // found again (nor the same position from another game); it can be brought
 // back.
+//
+// Each record also says when it last changed (changedAt), and "unsynced"
+// marks what changed here and has not reached the server yet (only for those
+// logged in with a key; see the sync in puzzles.js).
 
 export const DAY = 86_400_000;
 export const REVIEW_DAYS = [1, 3, 7];
@@ -32,7 +36,16 @@ export function isDue(puzzle, now) { return !puzzle.mastered && !puzzle.deleted 
 
 /** The puzzle deleted from the list (deleted: true) or brought back. */
 export function withDeleted(puzzle, deleted, now) {
-  return { ...puzzle, deleted, deletedChangedAt: now };
+  return { ...puzzle, deleted, deletedChangedAt: now, changedAt: now };
+}
+
+/**
+ * When a puzzle last changed (changedAt): of two copies in two browsers the
+ * later change wins (the server's sync, worker/index.js). Puzzles from
+ * before it was kept count from their last try, or when they were found.
+ */
+export function changedAtOf(item) {
+  return item.changedAt || item.review?.lastAt || item.foundAt || item.analysedAt || 0;
 }
 
 /**
@@ -68,7 +81,7 @@ export function withResult(puzzle, solved, now, early = false) {
     if (review.streak >= MASTER_AFTER) mastered = true;
     else review.due = now + REVIEW_DAYS[review.streak - 1] * DAY;
   }
-  return { ...puzzle, review, mastered };
+  return { ...puzzle, review, mastered, changedAt: now };
 }
 
 /**

@@ -50,7 +50,8 @@ There are no accounts. Trust comes from where an entry came from:
 - **Stockfish entries saved with a key** (your admin token, or a contributor
   key you created for someone) count as verified. Under the key field the
   page tells visitors who know you to contact you for a key (no address is
-  shown: those who know you have it).
+  shown: those who know you have it), and that it also keeps their puzzles
+  on the server.
 - **Stockfish entries without a key** are stored as *unverified* and shown with
   that mark. A depth reported by someone's own computer cannot be checked.
 
@@ -203,13 +204,14 @@ download, and the engine bridge still works.
 The second view of the page, **Puzzles from your games** (linked at the top
 of the panel; the address ends in `#puzzles`), makes puzzles from a player's
 own games: positions where one move was clearly better than every other and
-the player missed it. It needs nothing from this site's server: the engine
-bridge (1.0.8 or newer) fetches the games from chess.com's and Lichess's
-public APIs, analyses them with Stockfish 19 and finds the puzzles on the
-player's computer, and the puzzles and how they were solved are kept in the
-browser (IndexedDB). **Export** and **Import** under *Settings and data* move
-them to another browser or device; a phone or tablet, which cannot run the
-bridge, can solve puzzles found on a computer that way.
+the player missed it. Finding them needs nothing from this site's server: the
+engine bridge (1.0.8 or newer) fetches the games from chess.com's and
+Lichess's public APIs, analyses them with Stockfish 19 and finds the puzzles
+on the player's computer, and the puzzles and how they were solved are kept
+in the browser (IndexedDB). **Export** and **Import** under *Settings and
+data* move them to another browser or device; a phone or tablet, which cannot
+run the bridge, can solve puzzles found on a computer that way. Those with a
+key keep them on the server too (below).
 
 The two views are one page (`index.html`; the puzzle view's code,
 `web/puzzles.js`, is loaded the first time it is shown). Switching between
@@ -327,6 +329,31 @@ Live analysis only runs while the best moves are shown.
   puzzles are due; then new ones, newest game first. Solving a puzzle before
   it is due (**Practice anyway**, or from the list) does not move it on, but
   a miss counts.
+- **On the server, with a key.** Logged in with the admin token or a
+  contributor key (on the best moves, or before opening the puzzles), the
+  accounts are also kept in the database (`puzzle_store`,
+  `migrations/0005_puzzles.sql`), for that key alone: the admin's lists and
+  each contributor key's are apart. Every browser logged in with the key has
+  the same ones: a phone logged in with it opens the accounts by itself, and
+  the puzzles a computer's bridge finds reach it at its next sync. The page
+  syncs when the puzzles are opened or shown again, a moment after each
+  change (a puzzle found, a try, a delete), and every minute while they are
+  on screen: it sends what changed in the browser and gets back what changed
+  on the server since its last sync (each account counts its writes, `rev`).
+  Of two changes to one puzzle the later one wins (`changedAt`, when it was
+  made; a clock more than a minute ahead counts as now). Only the games that
+  have puzzles are sent, not the ones without. **Delete these accounts'
+  data** deletes them from the server first, and the other browsers logged in
+  with the key delete their copy at their next sync (the account's row stays
+  as a mark). The first sync with a key sends everything the browser has,
+  also what was there before logging in; logged out, the browser keeps its
+  copy and works on its own. A revoked key reaches its lists no longer; they
+  stay in the database. The admin's backup does not include them.
+- The server's API for it (key only): `GET /api/puzzles/profiles` (the key's
+  accounts), `POST /api/puzzles/sync` (`{profile, since, items}`, at most 200
+  items in, 500 out; `{gone}` for an account deleted elsewhere, `{missing}`
+  for one to send again) and `POST /api/puzzles/forget` (`{profile}`);
+  `/api/session` tells whose lists the key reaches (`owner`).
 - **Delete this puzzle**, offered once the puzzle on the board is solved or
   its solution shown, takes it out of the list and shows the next one. It
   stays in the browser, marked deleted (with how it was solved), so the
@@ -427,9 +454,11 @@ npx wrangler secret put ADMIN_TOKEN
 ```
 
 When a later version adds a file to `migrations/` (as the per-engine storage
-did with `0002_engines.sql`), download a backup from the admin tools first,
-then run the first two of these commands again, one right after the other:
-between them the old site code meets the new tables and saving fails.
+did with `0002_engines.sql`, and the puzzles kept for keys with
+`0005_puzzles.sql`), download a backup from the admin tools first, then run
+the first two of these commands again, one right after the other: between
+them the old site code meets the new tables and saving fails.
+(`0005_puzzles.sql` only adds a table, so there the old code goes on working.)
 
 `deploy` prints the site address, something like
 `https://mychessdb.<your-subdomain>.workers.dev`. For `ADMIN_TOKEN` enter a
@@ -657,7 +686,14 @@ Automated tests (Linux, real browser):
 - the macOS/Linux install script (on Linux)
 - importing the real `saved_positions.json` (492 entries, none skipped)
 - puzzles in the page (`tests/puzzles.test.mjs`): when puzzles come back;
-  deleted puzzles (never due, and merging an import's copy)
+  deleted puzzles (never due, and merging an import's copy); when each one
+  last changed
+- puzzles kept for keys (`tests/worker.test.mjs`, Windows 11): no key or a
+  wrong or revoked one, bad requests, the first sync, another browser getting
+  everything and then only what changed, an older change losing (and the
+  newer one sent back), a clock far ahead, pages of 500, each key's lists
+  apart, an account deleted (other browsers told, revs going on when it is
+  sent again), an account the server does not know
 - puzzles in the engine bridge (`npm run test:bridge`, Windows 11): the chess
   rules against the same perft counts as chesslib.js; Lichess's judgements and
   both kinds of puzzle with a scripted engine; the searches with a stand-in
@@ -715,6 +751,18 @@ Puzzles, checked by hand on Windows 11:
   board), and +9 for Black after g1=Q; a puzzle without its game's moves
   whose position has a promoted queen (the missing pawn not counted as
   taken). On a real phone this has not been tried.
+- puzzles kept for keys, in that browser against the development server
+  (`scripts/dev_server.mjs`, which applies `0005_puzzles.sql` to its
+  database), with stand-in puzzles: one tab on `localhost` and one on
+  `127.0.0.1` (two origins, so two separate browser stores, as two devices):
+  the first sync of a contributor key (the account, the three games with
+  puzzles and not the one without, the three puzzles), switching that tab to
+  the admin token (everything sent again for the admin), the other tab
+  logged in with no accounts opening the admin's account from the server
+  (rating, counts, puzzles; no update started), a solution shown, a delete
+  and a first-try solve there reaching the first tab, and **Delete these
+  accounts' data** in the first tab removing the account from the second at
+  its next sync. Not yet against the real D1.
 - **Delete this puzzle** in that browser, with stand-in puzzles: not offered
   before the puzzle is done nor after a wrong move, offered once the
   solution was shown; the next puzzle shown, Undo, two deleted and listed,

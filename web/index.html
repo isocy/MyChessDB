@@ -212,6 +212,7 @@
     #puzzle-view .summary b { color:#eee; font-weight:600; }
     #puzzle-view .status { min-height:18px; margin-top:6px; font-size:12px; overflow-wrap:anywhere; white-space:pre-line; }
     #puzzle-view .status.error { color:#ff9b8f; }
+    #pz-cloud { min-height:0; margin-top:4px; color:#9a9a9a; }
     #pz-bridge { display:flex; align-items:center; gap:8px; margin-top:6px; font-size:12px; color:#bbb; }
     #pz-bridge span { flex:1; min-width:0; overflow-wrap:anywhere; }
     #pz-bridge button { padding:3px 8px; flex:0 0 auto; }
@@ -278,12 +279,12 @@
   </section>
   <aside>
     <nav class="page-nav"><span aria-current="page">Best moves</span><a href="#puzzles" data-page="puzzles">Puzzles from your games</a></nav>
-    <div class="row" id="key-bar" title="Optional. A key marks the analyses you save as verified; the admin token also unlocks the admin tools.">
+    <div class="row" id="key-bar" title="Optional. A key marks the analyses you save as verified and keeps your puzzles on the server; the admin token also unlocks the admin tools.">
       <input id="key-input" type="password" placeholder="Admin token or contributor key (optional)" style="flex:1" autocomplete="off">
       <span id="key-role" class="key-role"></span>
       <button id="key-login">Login</button>
     </div>
-    <small id="key-note">Know the person who made this site? Contact them for a contributor key, and they will make one for you. With it, the analyses you save are marked as verified, and there is no hourly limit on saving.</small>
+    <small id="key-note">Know the person who made this site? Contact them for a contributor key, and they will make one for you. With it, the analyses you save are marked as verified, there is no hourly limit on saving, and the puzzles from your games are kept on the server, the same in every browser you log in with.</small>
     <details id="advanced-settings">
       <summary>Position and engine settings</summary>
       <label for="fen">FEN</label>
@@ -377,6 +378,7 @@
       <button id="pz-load">Load</button>
     </div>
     <div id="pz-summary" class="summary"></div>
+    <div id="pz-cloud" class="status"></div>
     <div class="row"><button id="pz-update" class="primary" disabled>Update puzzles</button><button id="pz-stop" hidden>Stop</button></div>
     <div id="pz-bridge"><span id="pz-bridge-status"></span><button id="pz-bridge-setup" hidden>Set up</button></div>
     <progress id="pz-progress" max="100" value="0" hidden></progress>
@@ -404,7 +406,7 @@
       <div class="row"><button id="pz-export" disabled>Export this player's puzzles</button><button id="pz-import">Import</button></div>
       <input id="pz-import-file" type="file" accept=".json,application/json" style="display:none">
       <div class="row"><button id="pz-delete" disabled>Delete these accounts' data</button></div>
-      <small>Everything is kept in this browser only: the games, the puzzles and how you solved them. Export moves them to another browser or device (a phone, for instance, which cannot run the engine bridge but can solve the puzzles).</small>
+      <small>Everything is kept in this browser: the games, the puzzles and how you solved them. Export moves them to another browser or device (a phone, for instance, which cannot run the engine bridge but can solve the puzzles). Logged in with a key (the admin token or a contributor key, on Best moves), the puzzles are also kept on this site's server, the same in every browser you log in with; deleting the accounts' data then deletes them there and in those browsers too.</small>
     </details>
 
     <details class="hints">
