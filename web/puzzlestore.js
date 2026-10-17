@@ -11,6 +11,10 @@
 // for the solution) sets it back to the start: it is due at once and comes
 // back after a few other puzzles until it is solved. Solving a puzzle before
 // it is due ("practice") does not move it on, but a miss still counts.
+//
+// A puzzle the player deletes stays in the pool, marked, so that it is not
+// found again (nor the same position from another game); it can be brought
+// back.
 
 export const DAY = 86_400_000;
 export const REVIEW_DAYS = [1, 3, 7];
@@ -24,7 +28,25 @@ export function reviewOf(puzzle) {
 }
 
 export function isNew(puzzle) { return reviewOf(puzzle).attempts === 0; }
-export function isDue(puzzle, now) { return !puzzle.mastered && reviewOf(puzzle).due <= now; }
+export function isDue(puzzle, now) { return !puzzle.mastered && !puzzle.deleted && reviewOf(puzzle).due <= now; }
+
+/** The puzzle deleted from the list (deleted: true) or brought back. */
+export function withDeleted(puzzle, deleted, now) {
+  return { ...puzzle, deleted, deletedChangedAt: now };
+}
+
+/**
+ * Of two copies of a puzzle (this browser's and an import's): the one tried
+ * more often, deleted or not as it was decided last.
+ */
+export function mergePuzzle(mine, theirs) {
+  if (!mine) return theirs;
+  const kept = reviewOf(theirs).attempts > reviewOf(mine).attempts ? theirs : mine;
+  const changed = puzzle => puzzle.deletedChangedAt || 0;
+  const decided = changed(theirs) > changed(mine) ? theirs : mine;
+  if (changed(decided) === changed(kept)) return kept;
+  return { ...kept, deleted: !!decided.deleted, deletedChangedAt: decided.deletedChangedAt };
+}
 
 /**
  * The puzzle after one attempt. solved: solved at the first try, without
@@ -77,7 +99,7 @@ export function pickNext(puzzles, now, recent = []) {
 
 /** For practice when nothing is due: the one due soonest, not a recent one. */
 export function pickPractice(puzzles, recent = []) {
-  const active = puzzles.filter(puzzle => !puzzle.mastered);
+  const active = puzzles.filter(puzzle => !puzzle.mastered && !puzzle.deleted);
   const blocked = new Set(recent.slice(-RETRY_GAP));
   const pool = active.filter(puzzle => !blocked.has(puzzle.id));
   return (pool.length ? pool : active).sort((a, b) => reviewOf(a).due - reviewOf(b).due)[0] || null;

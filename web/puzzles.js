@@ -116,7 +116,7 @@ function counts(game) {
   return limit !== null && game.rating >= limit;
 }
 function activePuzzles() {
-  return [...state.puzzles.values()].filter(puzzle => !puzzle.mastered && counts(state.games.get(puzzle.gameId)));
+  return [...state.puzzles.values()].filter(puzzle => !puzzle.mastered && !puzzle.deleted && counts(state.games.get(puzzle.gameId)));
 }
 // The account a puzzle belongs to (the site of its game).
 function ownerOf(puzzle) { return accountFor(siteOf(puzzle.gameId)); }
@@ -150,14 +150,15 @@ function renderSummary() {
     }
     lines.push(line);
   }
-  const all = [...state.puzzles.values()];
+  const all = [...state.puzzles.values()], kept = all.filter(puzzle => !puzzle.deleted);
   const active = activePuzzles();
   const due = active.filter(puzzle => store.isDue(puzzle, Date.now())).length;
-  const mastered = all.filter(puzzle => puzzle.mastered).length;
-  const setAside = all.filter(puzzle => !puzzle.mastered && !counts(state.games.get(puzzle.gameId))).length;
+  const mastered = kept.filter(puzzle => puzzle.mastered).length;
+  const setAside = kept.filter(puzzle => !puzzle.mastered && !counts(state.games.get(puzzle.gameId))).length;
   let puzzles = `${plural(active.length, "puzzle")} (${due} due)`;
   if (mastered) puzzles += `, ${mastered} mastered`;
   if (setAside) puzzles += `, ${setAside} set aside (from games below 80% of the rating)`;
+  if (all.length > kept.length) puzzles += `, ${all.length - kept.length} deleted`;
   lines.push(puzzles);
   summary.innerHTML = lines.join("<br>");
   renderPool();
@@ -364,7 +365,8 @@ function renderRemote() {
 }
 
 // Stores what the bridge found and tells it so. The same position from
-// another game is not added twice. Keeps the account's rating and counts.
+// another game is not added twice, nor a deleted one again. Keeps the
+// account's rating and counts.
 async function collect(account, view) {
   if (!view?.known) return;
   const stats = { games: view.games, counted: view.counted, analysed: view.analysed, pending: view.pending, oldest: view.oldest, complete: view.complete };
@@ -411,6 +413,7 @@ async function stop() {
 
 function nextPuzzle({ practice = false } = {}) {
   clearTimers();
+  $("#pz-deleted").hidden = true;
   const active = activePuzzles();
   let puzzle = store.pickNext(active, Date.now(), state.recent);
   if (!puzzle && practice) puzzle = store.pickPractice(active, state.recent);
@@ -421,6 +424,7 @@ function nextPuzzle({ practice = false } = {}) {
   board.setMovable(false);
   $("#pz-solution").disabled = true;
   $("#pz-analyse").hidden = true;
+  $("#pz-delete-puzzle").hidden = true;
   $("#pz-info").textContent = "";
   updateHistoryButtons();
   renderToMove(null);
@@ -437,7 +441,7 @@ function nextPuzzle({ practice = false } = {}) {
     $("#pz-next").disabled = true;
     $("#pz-next").textContent = "Next puzzle";
     feedback(working() ? "No puzzles yet. They appear here as the games are analysed."
-      : state.puzzles.size ? "No puzzles left: every puzzle is mastered or set aside." : "No puzzles yet. Click Update puzzles.");
+      : state.puzzles.size ? "No puzzles left: every puzzle is mastered, set aside or deleted." : "No puzzles yet. Click Update puzzles.");
   }
 }
 
@@ -447,6 +451,7 @@ function orientationFor(puzzle) {
 
 function showPuzzle(puzzle) {
   clearTimers();
+  $("#pz-deleted").hidden = true;
   const start = chess.parseFen(puzzle.fenBefore);
   const opponentMove = chess.parseUci(start, puzzle.lastMove);
   const position = chess.makeMove(start, opponentMove);
@@ -470,6 +475,7 @@ function showPuzzle(puzzle) {
   $("#pz-next").disabled = false;
   $("#pz-next").textContent = "Next puzzle";
   $("#pz-analyse").hidden = true;
+  $("#pz-delete-puzzle").hidden = true;   // once it is solved or its solution shown
   feedback(`${colorName(puzzle.color === "w" ? "b" : "w")} plays…`);
   renderPuzzleInfo();
   updateHistoryButtons();
@@ -510,11 +516,16 @@ function capturedBefore(puzzle, start) {
     }
     if (chess.positionKey(chess.toFen(position)) === chess.positionKey(chess.toFen(start))) return captured;
   }
+  // A piece beyond the usual number is a promoted pawn, which was not taken.
   const full = { p: 8, n: 2, b: 2, r: 2, q: 1 }, captured = { w: [], b: [] };
-  for (const [type, count] of Object.entries(full)) {
-    for (const [side, piece] of [["w", type], ["b", type.toUpperCase()]]) {
-      const left = start.board.filter(square => square === piece).length;
-      for (let i = left; i < count; i++) captured[side].push(piece);
+  for (const [side, white] of [["w", false], ["b", true]]) {   // what side took: the other colour's pieces
+    const pieceOf = type => white ? type.toUpperCase() : type;
+    const left = type => start.board.filter(square => square === pieceOf(type)).length;
+    let promoted = 0;
+    for (const type of ["n", "b", "r", "q"]) promoted += Math.max(0, left(type) - full[type]);
+    for (const [type, count] of Object.entries(full)) {
+      const missing = Math.max(0, count - left(type) - (type === "p" ? promoted : 0));
+      for (let i = 0; i < missing; i++) captured[side].push(pieceOf(type));
     }
   }
   return captured;
@@ -645,18 +656,54 @@ function finish() {
   $("#pz-next").disabled = false;
   $("#pz-next").textContent = "Next puzzle";
   $("#pz-analyse").hidden = false;
+  $("#pz-delete-puzzle").hidden = !!state.puzzles.get(current.puzzle.id)?.deleted;
   renderPuzzleInfo();
   updateHistoryButtons();
   renderSummary();
 }
 
 function record(current, solved) {
-  const updated = store.withResult(current.puzzle, solved, Date.now(), current.early);
+  // The stored copy: it may have been deleted or brought back meanwhile.
+  const updated = store.withResult(state.puzzles.get(current.puzzle.id) || current.puzzle, solved, Date.now(), current.early);
   current.puzzle = updated;
-  state.puzzles.set(updated.id, updated);
-  const owner = ownerOf(updated);
-  if (owner) store.save(owner, { puzzles: [updated] }).catch(error => setStatus(error.message, true));
+  savePuzzle(updated);
+}
+
+function savePuzzle(puzzle) {
+  state.puzzles.set(puzzle.id, puzzle);
+  const owner = ownerOf(puzzle);
+  if (owner) store.save(owner, { puzzles: [puzzle] }).catch(error => setStatus(error.message, true));
   renderSummary();
+}
+
+// Deletes the puzzle on the board from the list and shows the next one: once
+// it is done (solved, or its solution shown). It is kept, marked, so that it
+// is not found again; Undo (or the list's deleted puzzles) brings it back.
+function deleteShownPuzzle() {
+  const shown = state.current?.puzzle;
+  if (!shown || !state.current.done) return;
+  const puzzle = store.withDeleted(state.puzzles.get(shown.id) || shown, true, Date.now());
+  savePuzzle(puzzle);
+  nextPuzzle();
+  const game = state.games.get(puzzle.gameId);
+  $("#pz-deleted-text").textContent = `Deleted the puzzle from the game against ${game?.opponent || "?"} (${dateText(puzzle.playedAt)}, move ${puzzleMoveNumber(puzzle)}).`;
+  // Back in the list as it was; the puzzle on the board stays.
+  $("#pz-deleted-undo").onclick = () => {
+    playMoveSound("ui");
+    bringBack(puzzle.id);
+    $("#pz-deleted").hidden = true;
+    if (state.current?.waiting) nextPuzzle();
+  };
+  $("#pz-deleted").hidden = false;
+}
+
+// Brings a deleted puzzle back to the list, as it was.
+function bringBack(id) {
+  const puzzle = state.puzzles.get(id);
+  if (!puzzle?.deleted) return null;
+  const back = store.withDeleted(puzzle, false, Date.now());
+  savePuzzle(back);
+  return back;
 }
 
 function renderPuzzleInfo() {
@@ -753,11 +800,14 @@ function renderPool() {
   list.replaceChildren();
   if (!state.accounts.length) { $("#pz-pool-summary").textContent = "Puzzle list"; return; }
   const now = Date.now();
-  const showMastered = $("#pz-show-mastered").checked;
-  const active = activePuzzles();
-  const listed = showMastered ? [...state.puzzles.values()].filter(puzzle => puzzle.mastered) : active;
-  $("#pz-pool-summary").textContent = showMastered ? `Mastered puzzles (${listed.length})` : `Puzzle list (${active.length})`;
-  listed.sort((a, b) => store.reviewOf(a).due - store.reviewOf(b).due || (b.playedAt || 0) - (a.playedAt || 0));
+  const show = $("#pz-pool-show").value;
+  const active = activePuzzles(), all = [...state.puzzles.values()];
+  const listed = show === "mastered" ? all.filter(puzzle => puzzle.mastered && !puzzle.deleted)
+    : show === "deleted" ? all.filter(puzzle => puzzle.deleted) : active;
+  $("#pz-pool-summary").textContent = show === "mastered" ? `Mastered puzzles (${listed.length})`
+    : show === "deleted" ? `Deleted puzzles (${listed.length})` : `Puzzle list (${active.length})`;
+  if (show === "deleted") listed.sort((a, b) => (b.deletedChangedAt || 0) - (a.deletedChangedAt || 0));   // the last deleted first
+  else listed.sort((a, b) => store.reviewOf(a).due - store.reviewOf(b).due || (b.playedAt || 0) - (a.playedAt || 0));
   for (const puzzle of listed.slice(0, 300)) {
     const game = state.games.get(puzzle.gameId), site = siteOf(puzzle.gameId);
     const item = document.createElement("li");
@@ -775,16 +825,14 @@ function renderPool() {
     label.className = `pool-state ${status.kind}`;
     label.textContent = status.text;
     item.append(tag, open, label);
-    if (puzzle.mastered) {
+    if (puzzle.mastered || puzzle.deleted) {
       const back = document.createElement("button");
       back.className = "small";
       back.textContent = "Bring back";
-      back.onclick = async () => {
-        const updated = { ...puzzle, mastered: false, review: { ...store.reviewOf(puzzle), streak: 0, due: Date.now() } };
-        state.puzzles.set(updated.id, updated);
-        const owner = ownerOf(updated);
-        if (owner) await store.save(owner, { puzzles: [updated] });
-        renderSummary();
+      back.onclick = () => {
+        if (puzzle.deleted) bringBack(puzzle.id);
+        else savePuzzle({ ...puzzle, mastered: false, review: { ...store.reviewOf(puzzle), streak: 0, due: Date.now() } });
+        if (state.current?.puzzle?.id === puzzle.id && state.current.done) $("#pz-delete-puzzle").hidden = false;
         if (state.current?.waiting) nextPuzzle();
       };
       item.appendChild(back);
@@ -814,8 +862,9 @@ function exportAccounts() {
 }
 
 // Merges an export into what this browser has: an analysed game wins over
-// one that is not, and of two copies of a puzzle the one tried more often.
-// Takes both this version's exports (several accounts) and the first one's.
+// one that is not, and of two copies of a puzzle the one tried more often,
+// deleted or not as decided last (store.mergePuzzle). Takes both this
+// version's exports (several accounts) and the first one's.
 async function importAccounts(file) {
   let data;
   try { data = JSON.parse(await file.text()); } catch (error) { setStatus("That file is not an export of the puzzles.", true); return; }
@@ -841,8 +890,7 @@ async function importAccounts(file) {
     for (const puzzle of entry.puzzles) {
       if (typeof puzzle?.id !== "string" || typeof puzzle.fenBefore !== "string" || !Array.isArray(puzzle.solution)) continue;
       try { chess.parseFen(puzzle.fenBefore); } catch (error) { continue; }
-      const mine = puzzles.get(puzzle.id);
-      if (!mine || store.reviewOf(puzzle).attempts > store.reviewOf(mine).attempts) puzzles.set(puzzle.id, puzzle);
+      puzzles.set(puzzle.id, store.mergePuzzle(puzzles.get(puzzle.id), puzzle));
     }
     const { sync, ...kept } = profile;   // what fetching had reached is the bridge's now
     await store.save({ ...(existing?.profile || {}), ...kept, id }, { games: [...games.values()], puzzles: [...puzzles.values()] });
@@ -919,13 +967,14 @@ $("#pz-next").onclick = () => {
 };
 $("#pz-solution").onclick = () => showSolution();
 $("#pz-analyse").onclick = () => { playMoveSound("ui"); analyseInBestMoves(); };
+$("#pz-delete-puzzle").onclick = () => { playMoveSound("ui"); deleteShownPuzzle(); };
 $("#pz-flip").onclick = () => {
   state.flipped = !state.flipped;
   board.setOrientation(board.orientation === "w" ? "b" : "w");
   const current = state.current;
   if (current?.positions) renderMaterial(current.positions[current.view], current.captured[current.view]);
 };
-$("#pz-show-mastered").onchange = () => renderPool();
+$("#pz-pool-show").onchange = () => renderPool();
 $("#pz-export").onclick = () => exportAccounts();
 $("#pz-import").onclick = () => $("#pz-import-file").click();
 $("#pz-import-file").onchange = async () => {

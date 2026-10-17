@@ -1,8 +1,8 @@
 // Run: node tests/puzzles.test.mjs
-// When puzzles come back (web/puzzlestore.js). Finding them, and fetching
+// When puzzles come back, and deleted ones (web/puzzlestore.js). Finding them, and fetching
 // the games, happens in the engine bridge: see bridge/*_test.go.
 import assert from "node:assert/strict";
-import { withResult, pickNext, pickPractice, reviewOf, isDue, DAY, MASTER_AFTER } from "../web/puzzlestore.js";
+import { withResult, withDeleted, mergePuzzle, pickNext, pickPractice, reviewOf, isDue, DAY, MASTER_AFTER } from "../web/puzzlestore.js";
 
 let checks = 0;
 const ok = (condition, message) => { assert.ok(condition, message); checks++; };
@@ -43,6 +43,27 @@ const eq = (actual, expected, message) => { assert.deepEqual(actual, expected, m
   eq(pickNext([fresh("a", 1), fresh("b", 2)], now, ["b", "x", "y", "z"]).id, "a", "a puzzle not shown yet before one skipped");
   eq(pickNext([later], now, []), null, "nothing due");
   eq(pickPractice([later, { ...fresh("m", 1), mastered: true }], [])?.id, "later", "practice: the next one due, never a mastered one");
+}
+
+// --- deleted puzzles ---------------------------------------------------------
+{
+  const now = 1_000 * DAY;
+  const puzzle = withResult({ id: "p", ply: 1 }, false, now);
+  const deleted = withDeleted(puzzle, true, now + 1);
+  ok(!isDue(deleted, now + 5) && isDue(puzzle, now + 5), "a deleted puzzle is never due");
+  eq(pickPractice([deleted], []), null, "nor practised");
+  eq([deleted.deleted, deleted.deletedChangedAt, reviewOf(deleted)], [true, now + 1, reviewOf(puzzle)], "it keeps how it was solved");
+
+  // Importing: the copy tried more often, deleted or not as decided last.
+  const triedMore = withResult(puzzle, true, now + 2);
+  eq(mergePuzzle(undefined, deleted), deleted, "a puzzle not here is taken");
+  const merged = mergePuzzle(deleted, triedMore);
+  eq([merged.deleted, reviewOf(merged).attempts], [true, 2], "deleted here: stays deleted, with the other copy's tries");
+  eq(mergePuzzle(triedMore, deleted).deleted, true, "deleted in the import: deleted here too");
+  const back = withDeleted(deleted, false, now + 9);
+  eq(mergePuzzle(back, deleted).deleted, false, "brought back after the import's copy was deleted: stays back");
+  eq(mergePuzzle(deleted, back).deleted, false, "and the other way round");
+  eq(mergePuzzle(puzzle, triedMore), triedMore, "neither deleted: the one tried more often");
 }
 
 console.log(`puzzles: ${checks} checks passed`);

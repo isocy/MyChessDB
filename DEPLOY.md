@@ -318,13 +318,20 @@ Live analysis only runs while the best moves are shown.
   its history and opening name, where live analysis takes over.
 - **When puzzles come back** (`web/puzzlestore.js`): solved at the first try,
   after 1, then 3, then 7 days; solved at the first try a fourth time in a
-  row, it leaves the list ("mastered"; **Show mastered puzzles** lists them
-  with **Bring back**). A miss sets it back to the start: it is due at once
+  row, it leaves the list ("mastered"; **Show** *the mastered puzzles* lists
+  them with **Bring back**). A miss sets it back to the start: it is due at once
   and comes back after three other puzzles, again and again until it is
   solved. Missed puzzles come first, but never two in a row while other
   puzzles are due; then new ones, newest game first. Solving a puzzle before
   it is due (**Practice anyway**, or from the list) does not move it on, but
   a miss counts.
+- **Delete this puzzle**, offered once the puzzle on the board is solved or
+  its solution shown, takes it out of the list and shows the next one. It
+  stays in the browser, marked deleted (with how it was solved), so the
+  bridge's results never add it again, nor the same position from another
+  game; **Undo** right after it, or **Bring back** in *the deleted puzzles*
+  of the list, returns it to the list as it was. Importing keeps whichever
+  was decided last (deleted, or brought back).
 
 ### The Lichess evaluation database
 
@@ -636,7 +643,8 @@ Automated tests (Linux, real browser):
   pieces above and below the board following Flip board
 - the macOS/Linux install script (on Linux)
 - importing the real `saved_positions.json` (492 entries, none skipped)
-- puzzles in the page (`tests/puzzles.test.mjs`): when puzzles come back
+- puzzles in the page (`tests/puzzles.test.mjs`): when puzzles come back;
+  deleted puzzles (never due, and merging an import's copy)
 - puzzles in the engine bridge (`npm run test:bridge`, Windows 11): the chess
   rules against the same perft counts as chesslib.js; Lichess's judgements and
   both kinds of puzzle with a scripted engine; the searches with a stand-in
@@ -682,6 +690,12 @@ Puzzles, checked by hand on Windows 11:
   phone layout
 - fetching a chess.com player's games in that browser (232 months, 36 rated
   rapid games read)
+- **Delete this puzzle** in that browser, with stand-in puzzles: not offered
+  before the puzzle is done nor after a wrong move, offered once the
+  solution was shown; the next puzzle shown, Undo, two deleted and listed,
+  one opened from the list (no delete button) and brought back while on the
+  board (a miss then recorded with it kept in the list), all of it still
+  there after a reload
 
 Not yet run anywhere:
 
