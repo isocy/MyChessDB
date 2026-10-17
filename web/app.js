@@ -1028,7 +1028,7 @@ function showPromotion() {
     chooser.appendChild(button);
   }
   const cancel=document.createElement("button");
-  cancel.type="button"; cancel.textContent="×"; cancel.title="Cancel";
+  cancel.type="button"; cancel.className="cancel"; cancel.textContent="×"; cancel.title="Cancel";
   cancel.onclick=e=>choose(e,cancelPromotion);
   chooser.appendChild(cancel);
   // From the edge the pawn arrives at.

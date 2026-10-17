@@ -190,8 +190,10 @@
     .board .square.check { background-image:radial-gradient(ellipse at center, #ff0000 0%, #e70000 25%, rgba(169,0,0,0) 89%); }
     .mark { position:absolute; z-index:4; top:-7%; right:-7%; width:36%; height:36%; border-radius:50%; display:flex; align-items:center; justify-content:center; font:700 clamp(9px, calc(var(--board) * .028), 16px)/1 Segoe UI,sans-serif; color:#fff; box-shadow:0 1px 3px rgba(0,0,0,.5); pointer-events:none; }
     .mark.good { background:#629924; } .mark.bad { background:#df5353; }
-    .promotion { position:absolute; z-index:6; width:12.5%; height:62.5%; display:flex; background:#f4f4f4; box-shadow:0 2px 12px rgba(0,0,0,.7); border-radius:4px; overflow:hidden; }
-    .promotion button { flex:1 1 0; min-height:0; padding:0; border:0; border-radius:0; background:transparent; display:flex; align-items:center; justify-content:center; color:#333; font-size:22px; }
+    /* The four pieces are a square each; × below them is a flat strip. */
+    .promotion { position:absolute; z-index:6; width:12.5%; display:flex; background:#f4f4f4; box-shadow:0 2px 12px rgba(0,0,0,.7); border-radius:4px; overflow:hidden; }
+    .promotion button { flex:0 0 auto; aspect-ratio:1; min-height:0; padding:0; border:0; border-radius:0; background:transparent; display:flex; align-items:center; justify-content:center; color:#333; font-size:22px; }
+    .promotion button.cancel { aspect-ratio:auto; height:max(18px, calc(var(--board) * .034)); font-size:max(13px, calc(var(--board) * .026)); line-height:1; color:#666; background:#e4e4e4; }
     @media (hover: hover) { .promotion button:hover { background:#d6e6ff; } }
     .promotion img { width:86%; height:86%; object-fit:contain; pointer-events:none; }
     .to-move { flex:0 0 auto; display:flex; align-items:center; gap:6px; color:#ccc; min-height:30px; white-space:nowrap; }

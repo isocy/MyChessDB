@@ -387,6 +387,7 @@ export class PuzzleBoard {
     }
     const cancel = document.createElement("button");
     cancel.type = "button";
+    cancel.className = "cancel";
     cancel.textContent = "×";
     cancel.title = "Cancel";
     cancel.onclick = event => { if (chosen(event)) { this.promotion = null; chooser.remove(); } };
