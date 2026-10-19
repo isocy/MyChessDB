@@ -26,6 +26,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -449,12 +450,7 @@ func (m *puzzleManager) loop() {
 		m.mu.Lock()
 		m.running, m.cancel, m.task = profile, cancel, &puzzleTaskView{Step: step}
 		m.mu.Unlock()
-		var retry bool
-		if step == "analyse" {
-			retry = m.analyse(ctx, profile, gameID)
-		} else {
-			retry = m.fetch(ctx, profile, step)
-		}
+		retry := m.runStep(ctx, profile, step, gameID)
 		cancel()
 		m.mu.Lock()
 		m.running, m.task, m.cancel = "", nil, nil
@@ -464,6 +460,41 @@ func (m *puzzleManager) loop() {
 			return
 		}
 	}
+}
+
+// runStep fetches or analyses. Something the bridge did not foresee in what a
+// site sent (a panic) stops this account's update, with the reason, instead
+// of the whole bridge; a game the finder fails on is marked failed (analyse).
+func (m *puzzleManager) runStep(ctx context.Context, profile, step, gameID string) (retry bool) {
+	defer func() {
+		if failure := recover(); failure != nil {
+			logf("Puzzles: %s: %s failed: %v", profile, step, failure)
+			m.mu.Lock()
+			if entry := m.profiles[profile]; entry != nil {
+				entry.Wanted, entry.Problem = false, fmt.Sprintf("The engine bridge failed on this account's games (%v).", failure)
+			}
+			m.problem = ""
+			m.mu.Unlock()
+			retry = false
+		}
+	}()
+	if step == "analyse" {
+		return m.analyse(ctx, profile, gameID)
+	}
+	return m.fetch(ctx, profile, step)
+}
+
+// analyseSafely runs the puzzle finder on a game; if it fails unforeseen (a
+// panic), the game is rejected rather than the bridge stopped.
+func analyseSafely(ctx context.Context, input gameInput, search engineSearch, effort puzzleEffort,
+	progress func(phase string, done, total int)) (result gameAnalysis, err error) {
+	defer func() {
+		if failure := recover(); failure != nil {
+			logf("Puzzles: the finder failed on a game: %v", failure)
+			result, err = gameAnalysis{}, fmt.Errorf("%w: the puzzle finder failed on it (%v)", errGameRejected, failure)
+		}
+	}()
+	return analyseGame(ctx, input, search, effort, progress, nil)
 }
 
 func (m *puzzleManager) setTask(change func(task *puzzleTaskView)) {
@@ -564,11 +595,11 @@ func (m *puzzleManager) analyse(ctx context.Context, profile, gameID string) boo
 		return m.searcher.search(ctx, request)
 	}
 	started := time.Now()
-	result, err := analyseGame(ctx, gameInput{Color: game.Color, Moves: game.Moves, Evals: game.Evals},
+	result, err := analyseSafely(ctx, gameInput{Color: game.Color, Moves: game.Moves, Evals: game.Evals},
 		search, puzzleEfforts[effortName],
 		func(phase string, done, total int) {
 			m.setTask(func(task *puzzleTaskView) { task.Phase, task.Done, task.Total = phase, done, total })
-		}, nil)
+		})
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	entry = m.profiles[profile]

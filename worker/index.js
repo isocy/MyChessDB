@@ -648,7 +648,8 @@ async function handleKeys(request, env) {
   if (request.method === "GET") {
     const { results } = await env.DB.prepare(
       `SELECT k.id, k.label, k.created_at, k.revoked_at,
-              (SELECT COUNT(*) FROM saved_positions s WHERE s.saved_by = 'key:' || k.id) AS entries
+              (SELECT COUNT(*) FROM saved_positions s WHERE s.saved_by = 'key:' || k.id) AS entries,
+              COALESCE((SELECT rows FROM puzzle_totals t WHERE t.owner = 'key:' || k.id), 0) AS puzzle_rows
        FROM contributor_keys k ORDER BY k.id DESC`).all();
     return json(200, { keys: results });
   }
@@ -751,20 +752,39 @@ async function handleExport(request, env) {
 // for the admin and for each contributor key apart. The page sends what
 // changed in the browser and gets back what changed on the server since its
 // last sync; of two changes to one item, the later one wins.
+//
+// A key that leaks must not be able to use up what the free plan allows the
+// whole site (rows written and read a day, the database's size), so each key
+// has limits: requests and items written an hour, accounts, rows and bytes
+// kept (puzzle_totals, migrations/0006_puzzle_totals.sql). And one request
+// makes a dozen queries at most, well under the free plan's 50, however many
+// items it carries.
 
 const PUZZLE_PROFILE = /^(chesscom|lichess):[a-z0-9][a-z0-9_-]{1,29}$/;
 const PUZZLE_KINDS = ["profile", "game", "puzzle"];
-const PUZZLE_SYNC_ITEMS = 200;       // items sent in one request
-const PUZZLE_PULL_ROWS = 500;        // items answered in one response
-const PUZZLE_ITEM_BYTES = 32 * 1024;
+const PUZZLE_SYNC_ITEMS = 30;        // items sent in one request
+const PUZZLE_PULL_ROWS = 200;        // items answered in one response
+const PUZZLE_ITEM_BYTES = 16 * 1024;
+const PUZZLE_MAX_PROFILES = 10;      // accounts per key
+const PUZZLE_MAX_ROWS = 20_000;      // rows per key (accounts, games, puzzles)
+const PUZZLE_MAX_BYTES = 20 * 1024 * 1024;
+const PUZZLE_REQUESTS_PER_HOUR = 300;
+const PUZZLE_WRITES_PER_HOUR = 3000;
 // A browser whose clock runs ahead must not win every later change.
 const PUZZLE_CLOCK_SLACK_MS = 60_000;
 
-// Whose lists: "admin" or "key:<id>".
+// Whose lists: "admin" or "key:<id>". Counts the request against the key's
+// hourly limit.
 async function puzzleOwner(request, env) {
   const who = await identify(request, env);
   if (!who.role) {
     throw new HttpError(who.sentKey ? 401 : 403, who.sentKey ? "That key is not recognised." : "Only the admin and contributors keep puzzles on the server.");
+  }
+  const hour = Math.floor(Date.now() / 3600000);
+  const requests = await countThisHour(env, `puzzles:${who.savedBy}:${hour}`, hour);
+  if (requests === 1) await env.DB.prepare("DELETE FROM rate_limits WHERE hour < ?").bind(hour - 1).run();
+  if (requests > PUZZLE_REQUESTS_PER_HOUR) {
+    throw new HttpError(429, "Too many puzzle requests with this key in the last hour. Try again later.", { code: "PUZZLE_RATE_LIMIT" });
   }
   return who.savedBy;
 }
@@ -799,11 +819,23 @@ async function handlePuzzleProfiles(request, env) {
   return json(200, { profiles: results });
 }
 
+// Adds `amount` to a counter for this hour and returns the new count.
+async function addThisHour(env, bucket, hour, amount) {
+  return (await env.DB.prepare(
+    `INSERT INTO rate_limits (bucket, hour, count) VALUES (?, ?, ?)
+     ON CONFLICT(bucket) DO UPDATE SET count = count + excluded.count RETURNING count`,
+  ).bind(bucket, hour, amount).first()).count;
+}
+
+const puzzleKey = item => `${item.kind}|${item.id}`;
+
 // POST /api/puzzles/sync {profile, since, items: [{kind, id, changed_at, data}]}
 // Stores each item unless the server has a later change of it, then answers
 // {rev, items, more}: what changed since `since` (the rev of the browser's
-// last sync, 0 the first time), apart from what was just sent, at most
-// PUZZLE_PULL_ROWS at a time (more: ask again from the rev answered).
+// last sync, 0 the first time), apart from what was just sent and kept, and
+// the server's later version of what it did not keep; at most
+// PUZZLE_PULL_ROWS of what changed at a time (more: ask again from the rev
+// answered).
 //   {gone: true}: the account was deleted (in another browser) after the
 //     browser's last sync; nothing is stored.
 //   {missing: true}: the server has nothing for an account the browser has
@@ -811,46 +843,76 @@ async function handlePuzzleProfiles(request, env) {
 // Sent from scratch (since 0), a deleted account starts again.
 async function handlePuzzleSync(request, env) {
   const owner = await puzzleOwner(request, env);
-  const body = await readJson(request, 2 * 1024 * 1024);
+  const body = await readJson(request, 1024 * 1024);
   const profile = puzzleProfile(body.profile);
   if (!Number.isSafeInteger(body.since) || body.since < 0) throw new HttpError(400, "since must be a whole number");
   const since = body.since;
   const raw = body.items === undefined ? [] : body.items;
   if (!Array.isArray(raw) || raw.length > PUZZLE_SYNC_ITEMS) throw new HttpError(400, `items must be a list of at most ${PUZZLE_SYNC_ITEMS}`);
   const items = raw.map(cleanPuzzleItem);
+  if (new Set(items.map(puzzleKey)).size !== items.length) throw new HttpError(400, "An item is sent twice.");
   const head = await env.DB.prepare(
     "SELECT data IS NULL AS gone FROM puzzle_store WHERE owner = ? AND profile = ? AND kind = 'profile' AND id = ''",
   ).bind(owner, profile).first();
   if (since > 0 && !head) return json(200, { missing: true });
   if (since > 0 && head.gone) return json(200, { gone: true });
+  if (!head || head.gone) {
+    const { n } = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM puzzle_store WHERE owner = ? AND kind = 'profile' AND data IS NOT NULL",
+    ).bind(owner).first();
+    if (n >= PUZZLE_MAX_PROFILES) throw new HttpError(413, `A key keeps at most ${PUZZLE_MAX_PROFILES} accounts on the server.`, { code: "PUZZLE_LIMIT" });
+  }
   // Every account has its profile row, which also outlives the account.
   if (!head && !items.some(item => item.kind === "profile")) items.unshift({ kind: "profile", id: "", changed_at: 0, data: "{}" });
-  const statements = items.map(item => env.DB.prepare(
-    `INSERT INTO puzzle_store (owner, profile, kind, id, data, changed_at, rev)
-     VALUES (?, ?, ?, ?, ?, ?, ${NEXT_PUZZLE_REV})
-     ON CONFLICT(owner, profile, kind, id) DO UPDATE SET
-       data = excluded.data, changed_at = excluded.changed_at, rev = excluded.rev
-     WHERE excluded.changed_at > puzzle_store.changed_at OR puzzle_store.data IS NULL
-     RETURNING rev`,
-  ).bind(owner, profile, item.kind, item.id, item.data, item.changed_at, owner, profile));
-  const stored = statements.length ? await env.DB.batch(statements) : [];
+
+  // What the server has of the items sent, in one query: which are kept
+  // (newer than the server's, or new), and the server's version of the rest.
+  const { results: had } = items.length ? await env.DB.prepare(
+    `SELECT p.kind, p.id, p.data, p.changed_at FROM json_each(?) AS j
+     JOIN puzzle_store AS p ON p.owner = ? AND p.profile = ?
+       AND p.kind = json_extract(j.value, '$.kind') AND p.id = json_extract(j.value, '$.id')`,
+  ).bind(JSON.stringify(items.map(({ kind, id }) => ({ kind, id }))), owner, profile).all() : { results: [] };
+  const server = new Map(had.map(row => [puzzleKey(row), row]));
+  const kept = [], later = [];
+  for (const item of items) {
+    const there = server.get(puzzleKey(item));
+    if (!there || there.data === null || item.changed_at > there.changed_at) kept.push(item);
+    else later.push(there);
+  }
+  const added = kept.filter(item => !server.has(puzzleKey(item))).length;
+  const bytes = kept.reduce((sum, item) => sum + item.data.length - (server.get(puzzleKey(item))?.data?.length || 0), 0);
+  if (kept.length) {
+    const totals = await env.DB.prepare("SELECT rows, bytes FROM puzzle_totals WHERE owner = ?").bind(owner).first();
+    if ((totals?.rows || 0) + added > PUZZLE_MAX_ROWS || (totals?.bytes || 0) + bytes > PUZZLE_MAX_BYTES) {
+      throw new HttpError(413, "This key's puzzles have reached what the server keeps for one key.", { code: "PUZZLE_LIMIT" });
+    }
+    const hour = Math.floor(Date.now() / 3600000);
+    if (await addThisHour(env, `puzzlewrites:${owner}:${hour}`, hour, kept.length) > PUZZLE_WRITES_PER_HOUR) {
+      throw new HttpError(429, "Too many puzzle changes with this key in the last hour. They are sent later.", { code: "PUZZLE_RATE_LIMIT" });
+    }
+    await env.DB.batch([
+      ...kept.map(item => env.DB.prepare(
+        `INSERT INTO puzzle_store (owner, profile, kind, id, data, changed_at, rev)
+         VALUES (?, ?, ?, ?, ?, ?, ${NEXT_PUZZLE_REV})
+         ON CONFLICT(owner, profile, kind, id) DO UPDATE SET
+           data = excluded.data, changed_at = excluded.changed_at, rev = excluded.rev
+         WHERE excluded.changed_at > puzzle_store.changed_at OR puzzle_store.data IS NULL`,
+      ).bind(owner, profile, item.kind, item.id, item.data, item.changed_at, owner, profile)),
+      env.DB.prepare(
+        `INSERT INTO puzzle_totals (owner, rows, bytes) VALUES (?, ?, ?)
+         ON CONFLICT(owner) DO UPDATE SET rows = rows + excluded.rows, bytes = bytes + excluded.bytes`,
+      ).bind(owner, added, bytes),
+    ]);
+  }
   const { results } = await env.DB.prepare(
     `SELECT kind, id, data, changed_at, rev FROM puzzle_store
      WHERE owner = ? AND profile = ? AND rev > ? ORDER BY rev LIMIT ?`,
   ).bind(owner, profile, since, PUZZLE_PULL_ROWS + 1).all();
   const more = results.length > PUZZLE_PULL_ROWS;
   const rows = results.slice(0, PUZZLE_PULL_ROWS);
-  // What was just sent and kept is not sent back; where the server had a
-  // later change, that one is, even when the browser had it before.
-  const sent = new Map(items.map(item => [`${item.kind}|${item.id}`, item.changed_at]));
-  const answer = rows.filter(row => row.data !== null && sent.get(`${row.kind}|${row.id}`) !== row.changed_at);
-  for (const [index, item] of items.entries()) {
-    if (stored[index].results?.length || answer.some(row => row.kind === item.kind && row.id === item.id)) continue;
-    const later = await env.DB.prepare(
-      "SELECT kind, id, data, changed_at FROM puzzle_store WHERE owner = ? AND profile = ? AND kind = ? AND id = ?",
-    ).bind(owner, profile, item.kind, item.id).first();
-    if (later?.data != null) answer.push(later);
-  }
+  const sent = new Map(kept.map(item => [puzzleKey(item), item.changed_at]));
+  const answer = rows.filter(row => row.data !== null && sent.get(puzzleKey(row)) !== row.changed_at);
+  for (const row of later) if (row.data !== null && !answer.some(other => puzzleKey(other) === puzzleKey(row))) answer.push(row);
   return json(200, {
     rev: rows.length ? rows[rows.length - 1].rev : since,
     more,
@@ -864,17 +926,40 @@ async function handlePuzzleSync(request, env) {
 async function handlePuzzleForget(request, env) {
   const owner = await puzzleOwner(request, env);
   const profile = puzzleProfile((await readJson(request, 4096)).profile);
-  // The mark first: its rev comes after every row the account had, so the
-  // revs of an account started again later never go back.
+  const rows = "FROM puzzle_store WHERE owner = ? AND profile = ?";
   await env.DB.batch([
+    // What goes comes off the key's totals; the mark stays a row.
+    env.DB.prepare("INSERT OR IGNORE INTO puzzle_totals (owner) VALUES (?)").bind(owner),
+    env.DB.prepare(
+      `UPDATE puzzle_totals SET
+         rows = rows - (SELECT COUNT(*) ${rows} AND kind <> 'profile') + 1 - (SELECT COUNT(*) ${rows} AND kind = 'profile'),
+         bytes = bytes - (SELECT COALESCE(SUM(LENGTH(data)), 0) ${rows})
+       WHERE owner = ?`,
+    ).bind(owner, profile, owner, profile, owner, profile, owner),
+    // The mark first: its rev comes after every row the account had, so the
+    // revs of an account started again later never go back.
     env.DB.prepare(
       `INSERT INTO puzzle_store (owner, profile, kind, id, data, changed_at, rev)
        VALUES (?, ?, 'profile', '', NULL, ?, ${NEXT_PUZZLE_REV})
        ON CONFLICT(owner, profile, kind, id) DO UPDATE SET data = NULL, changed_at = excluded.changed_at, rev = excluded.rev`,
     ).bind(owner, profile, Date.now(), owner, profile),
-    env.DB.prepare("DELETE FROM puzzle_store WHERE owner = ? AND profile = ? AND kind <> 'profile'").bind(owner, profile),
+    env.DB.prepare(`DELETE ${rows} AND kind <> 'profile'`).bind(owner, profile),
   ]);
   return json(200, { forgotten: true });
+}
+
+// POST /api/keys/puzzles/delete {id} (admin): deletes everything a
+// contributor key keeps in puzzle_store, for a key that was revoked.
+async function handleKeyPuzzlesDelete(request, env) {
+  await requireAdmin(request, env);
+  const body = await readJson(request, 4096);
+  if (!Number.isInteger(body.id)) throw new HttpError(400, "id must be a number");
+  const owner = `key:${body.id}`;
+  const [deleted] = await env.DB.batch([
+    env.DB.prepare("DELETE FROM puzzle_store WHERE owner = ? RETURNING kind").bind(owner),
+    env.DB.prepare("DELETE FROM puzzle_totals WHERE owner = ?").bind(owner),
+  ]);
+  return json(200, { deleted: (deleted.results || []).length });
 }
 
 // --------------------------------------------------------------- router ----
@@ -914,6 +999,7 @@ async function route(request, env) {
   if (path === "/api/restore" && method === "POST") return handleRestore(request, env);
   if (path === "/api/keys") return handleKeys(request, env);
   if (path === "/api/keys/revoke" && method === "POST") return handleRevokeKey(request, env);
+  if (path === "/api/keys/puzzles/delete" && method === "POST") return handleKeyPuzzlesDelete(request, env);
   if (path === "/api/import" && method === "POST") return handleImport(request, env);
   if (path === "/api/export" && method === "GET") return handleExport(request, env);
   if (path === "/api/puzzles/profiles" && method === "GET") return handlePuzzleProfiles(request, env);

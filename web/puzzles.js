@@ -29,14 +29,15 @@ const SITES = { chesscom: "chess.com", lichess: "Lichess" };
 const ACCOUNTS_KEY = "chessdb_puzzles_accounts", EFFORT_KEY = "chessdb_puzzles_effort";
 const OPPONENT_DELAY_MS = 400, REPLY_DELAY_MS = 450, WRONG_SHOWN_MS = 700, SOLUTION_STEP_MS = 650;
 // The engine bridge that finds puzzles (bridge/puzzles.go).
-const PUZZLES_MIN_VERSION = "1.0.8";
+const PUZZLES_MIN_VERSION = "1.0.9";
 // How hard the bridge's engine works (bridge/puzzlegen.go, puzzleEfforts).
 const EFFORTS = { lichess: "As Lichess (1,000,000 nodes per position)", quick: "Quicker (300,000 nodes per position)" };
 const FOLLOW_MS = 1500, RECONNECT_MS = 15000;
 // The server (with a key): a change is sent this soon; what other browsers
 // changed is asked for this often while the puzzles are on screen; this many
-// items go in one request.
-const SYNC_SOON_MS = 1500, SYNC_EVERY_MS = 60_000, SYNC_PART = 200;
+// items go in one request (worker/index.js takes 30); and what the server
+// takes of one item.
+const SYNC_SOON_MS = 1500, SYNC_EVERY_MS = 60_000, SYNC_PART = 30, SYNC_ID_MOST = 120, SYNC_ITEM_BYTES = 16 * 1024;
 const $ = selector => document.querySelector(selector);
 
 const state = {
@@ -147,14 +148,17 @@ function renderSummary() {
   renderWork();
   renderCloud();
   if (!state.accounts.length) { summary.textContent = ""; renderPool(); return; }
+  // Everything put into the HTML is escaped, numbers too: what an account
+  // holds can come from an imported file, the server or the bridge.
+  const html = value => escapeHtml(String(value));
   const lines = [];
   for (const account of state.accounts) {
     const stats = account.bridge;
-    let line = `${SITES[account.site]} <b>${escapeHtml(account.username)}</b>`;
-    if (account.rating) line += `: rapid ${account.rating}, games at ${threshold(account)} or more count`;
+    let line = `${html(SITES[account.site] || "")} <b>${html(account.username)}</b>`;
+    if (account.rating) line += `: rapid ${html(account.rating)}, games at ${html(threshold(account))} or more count`;
     if (stats?.games) {
-      line += ` · ${plural(stats.games, "rated rapid game")}${stats.complete || !stats.oldest ? "" : ` since ${dateText(stats.oldest)}`}`
-        + `, ${stats.analysed} of ${stats.counted} analysed`;
+      line += ` · ${html(plural(stats.games, "rated rapid game"))}${stats.complete || !stats.oldest ? "" : ` since ${html(dateText(stats.oldest))}`}`
+        + `, ${html(stats.analysed)} of ${html(stats.counted)} analysed`;
     } else if (!account.rating) {
       line += ": not updated yet";
     }
@@ -206,9 +210,11 @@ async function openAccounts(names, { create = false, kept = null } = {}) {
   state.following = null;
   state.views = {};
   state.session = null;
-  state.accounts = loaded.map(entry => entry.profile);
-  state.games = new Map(loaded.flatMap(entry => entry.games.map(game => [game.id, game])));
-  state.puzzles = new Map(loaded.flatMap(entry => entry.puzzles.map(puzzle => [puzzle.id, puzzle])));
+  // What is stored is checked again: an earlier version took imported files
+  // as they were.
+  state.accounts = loaded.map(entry => accountFrom(entry.profile));
+  state.games = new Map(loaded.flatMap(entry => entry.games.map(store.cleanGame).filter(Boolean).map(game => [game.id, game])));
+  state.puzzles = new Map(loaded.flatMap(entry => entry.puzzles.map(store.cleanPuzzle).filter(Boolean).map(puzzle => [puzzle.id, puzzle])));
   rememberAccounts();
   $("#pz-chesscom").value = accountFor("chesscom")?.username || "";
   $("#pz-lichess").value = accountFor("lichess")?.username || "";
@@ -220,6 +226,18 @@ async function openAccounts(names, { create = false, kept = null } = {}) {
   else watchBridge();
   nextPuzzle();
   if (cloudOwner()) syncAll();
+}
+
+// An account as stored, with only the fields the page knows.
+function accountFrom(profile) {
+  const account = {
+    id: profile.id, site: profile.site, username: validUsername(profile.username) ? profile.username : profile.id.slice(profile.site.length + 1),
+    rating: null, ...store.cleanProfileData(profile),
+  };
+  const synced = profile.cloud;
+  if (typeof synced?.owner === "string" && Number.isSafeInteger(synced.rev)) account.cloud = { owner: synced.owner, rev: synced.rev };
+  if (profile.unsynced === true) account.unsynced = true;
+  return account;
 }
 
 function rememberAccounts() {
@@ -386,26 +404,31 @@ function renderRemote() {
 // account's rating and counts.
 async function collect(account, view) {
   if (!view?.known) return;
-  const stats = { games: view.games, counted: view.counted, analysed: view.analysed, pending: view.pending, oldest: view.oldest, complete: view.complete };
-  const changed = JSON.stringify(stats) !== JSON.stringify(account.bridge) || (view.rating && view.rating !== account.rating);
-  if (view.rating) { account.rating = view.rating; account.ratingAt = view.rating_at; }
+  // Whatever answers on the bridge's port is not taken at its word: only
+  // fields of the right kind are kept (store.clean*).
+  const { bridge: stats, rating, ratingAt } = store.cleanProfileData({
+    rating: view.rating, ratingAt: view.rating_at,
+    bridge: { games: view.games, counted: view.counted, analysed: view.analysed, pending: view.pending, oldest: view.oldest, complete: view.complete },
+  });
+  const changed = JSON.stringify(stats) !== JSON.stringify(account.bridge) || (rating && rating !== account.rating);
+  if (rating) { account.rating = rating; account.ratingAt = ratingAt; }
   account.bridge = stats;
   if (changed) { account.changedAt = Date.now(); account.unsynced = true; }
-  const results = view.results || [];
+  const results = Array.isArray(view.results) ? view.results : [];
   const games = [], puzzles = [];
   for (const result of results) {
-    const analysedAt = result.analysed_at || Date.now();
-    const game = {
+    const analysedAt = Number(result.analysed_at) || Date.now();
+    const game = store.cleanGame({
       ...result.game, status: result.error ? "failed" : "done", puzzles: 0, analysedAt, analysedWith: result.effort,
-      changedAt: analysedAt, unsynced: true,
-    };
-    if (result.error) game.error = result.error;
-    for (const candidate of result.puzzles || []) {
-      const id = `${game.id}#${candidate.ply}`;
-      if (state.puzzles.has(id) || [...state.puzzles.values()].some(puzzle => puzzle.key === candidate.key)) continue;
-      try { chess.parseFen(candidate.fenBefore); } catch (error) { continue; }
+      error: result.error, changedAt: analysedAt, unsynced: true,
+    });
+    if (!game || game.site !== account.site) continue;
+    for (const candidate of Array.isArray(result.puzzles) ? result.puzzles : []) {
+      const id = `${game.id}#${candidate?.ply}`;
+      if (state.puzzles.has(id) || (candidate?.key && [...state.puzzles.values()].some(puzzle => puzzle.key === candidate.key))) continue;
       const now = Date.now();
-      const puzzle = { ...candidate, id, gameId: game.id, playedAt: game.playedAt, foundAt: now, changedAt: now, unsynced: true };
+      const puzzle = store.cleanPuzzle({ ...candidate, id, gameId: game.id, playedAt: game.playedAt, foundAt: now, changedAt: now, unsynced: true });
+      if (!puzzle) continue;
       state.puzzles.set(id, puzzle);
       puzzles.push(puzzle);
       game.puzzles++;
@@ -415,7 +438,7 @@ async function collect(account, view) {
   }
   if (changed || results.length) await store.save(account, { games, puzzles });
   if (results.length) {
-    await bridge("/api/puzzles/collected", { body: { profile: account.id, games: results.map(result => result.id) } });
+    await bridge("/api/puzzles/collected", { body: { profile: account.id, games: results.map(result => result.id).filter(id => typeof id === "string") } });
     if (state.session) { state.session.finished += results.length; state.session.found += puzzles.length; }
   }
   if (changed || results.length) renderSummary();
@@ -740,20 +763,23 @@ function renderPuzzleInfo() {
   if (!current?.puzzle) { info.textContent = ""; return; }
   const puzzle = current.puzzle, game = state.games.get(puzzle.gameId);
   const fen = chess.toFen(current.positions[1]);
+  // Escaped, numbers too, and a link only to the game on Lichess or chess.com.
+  const html = value => escapeHtml(String(value));
   const lines = [];
-  const opponent = game ? `${escapeHtml(game.opponent)}${game.opponentRating ? ` (${game.opponentRating})` : ""}` : "?";
-  const link = game?.url ? ` · <a href="${escapeHtml(game.url)}" target="_blank" rel="noopener">open the game</a>` : "";
-  lines.push(`From your ${SITES[siteOf(puzzle.gameId)]} game against ${opponent}, ${dateText(puzzle.playedAt)}, move ${puzzleMoveNumber(puzzle)}${link}`);
+  const opponent = game ? `${html(game.opponent)}${game.opponentRating ? ` (${html(game.opponentRating)})` : ""}` : "?";
+  const address = store.safeGameUrl(game?.url);
+  const link = address ? ` · <a href="${html(address)}" target="_blank" rel="noopener noreferrer">open the game</a>` : "";
+  lines.push(`From your ${html(SITES[siteOf(puzzle.gameId)] || "")} game against ${opponent}, ${html(dateText(puzzle.playedAt))}, move ${html(puzzleMoveNumber(puzzle))}${link}`);
   if (current.done) {
-    lines.push(`Solution: <span class="line">${escapeHtml(sanLine(fen, puzzle.solution))}</span>`
-      + ` (${puzzle.kind === "mate" ? `mate in ${puzzle.score.mate}` : escapeHtml(scoreText(puzzle.score))})`);
+    lines.push(`Solution: <span class="line">${html(sanLine(fen, puzzle.solution))}</span>`
+      + ` (${html(puzzle.kind === "mate" ? `mate in ${puzzle.score.mate}` : scoreText(puzzle.score))})`);
     if (puzzle.played) {
-      lines.push(`In the game you played <span class="line">${escapeHtml(sanLine(fen, [puzzle.played]))}</span>`
-        + (puzzle.judgement ? `, ${puzzle.judgement.toLowerCase()}` : "")
-        + (puzzle.playedScore ? ` (${escapeHtml(scoreText(puzzle.playedScore))} after it)` : "") + ".");
+      lines.push(`In the game you played <span class="line">${html(sanLine(fen, [puzzle.played]))}</span>`
+        + (puzzle.judgement ? `, ${html(puzzle.judgement.toLowerCase())}` : "")
+        + (puzzle.playedScore ? ` (${html(scoreText(puzzle.playedScore))} after it)` : "") + ".");
     }
     const review = store.reviewOf(puzzle);
-    lines.push(`Solved at the first try ${review.streak} time${review.streak === 1 ? "" : "s"} in a row · tried ${review.attempts} time${review.attempts === 1 ? "" : "s"}, missed ${review.misses}`);
+    lines.push(html(`Solved at the first try ${review.streak} time${review.streak === 1 ? "" : "s"} in a row · tried ${review.attempts} time${review.attempts === 1 ? "" : "s"}, missed ${review.misses}`));
   }
   info.innerHTML = lines.join("<br>");
 }
@@ -881,11 +907,6 @@ function renderPool() {
 
 // What only this browser needs to know.
 const withoutLocal = ({ unsynced, cloud: synced, ...kept }) => kept;
-function validPuzzle(puzzle) {
-  if (typeof puzzle?.id !== "string" || typeof puzzle.gameId !== "string" || typeof puzzle.fenBefore !== "string"
-    || typeof puzzle.lastMove !== "string" || !Array.isArray(puzzle.solution)) return false;
-  try { chess.parseFen(puzzle.fenBefore); return true; } catch (error) { return false; }
-}
 
 // The ids of the accounts the server keeps for the key ("lichess:name"),
 // the last changed first.
@@ -937,14 +958,19 @@ async function syncAccount(account) {
   const mine = [...state.puzzles.values()].filter(puzzle => siteOf(puzzle.gameId) === account.site);
   const withPuzzles = new Set(mine.map(puzzle => puzzle.gameId));
   const sent = [];   // [record, item]
+  // An item the server would refuse is kept here only, so that it cannot
+  // stop the rest from being sent.
+  const send = (record, item) => {
+    if ((item.id || "").length <= SYNC_ID_MOST && JSON.stringify(item.data).length <= SYNC_ITEM_BYTES) sent.push([record, item]);
+  };
   const profileAt = account.changedAt || 0;
-  if (fresh || account.unsynced) sent.push([account, { kind: "profile", changed_at: profileAt, data: withoutLocal(account) }]);
+  if (fresh || account.unsynced) send(account, { kind: "profile", changed_at: profileAt, data: withoutLocal(account) });
   for (const game of state.games.values()) {
     if (game.site !== account.site || !withPuzzles.has(game.id) || !(fresh || game.unsynced)) continue;
-    sent.push([game, { kind: "game", id: game.id, changed_at: store.changedAtOf(game), data: withoutLocal(game) }]);
+    send(game, { kind: "game", id: game.id, changed_at: store.changedAtOf(game), data: withoutLocal(game) });
   }
   for (const puzzle of mine) {
-    if (fresh || puzzle.unsynced) sent.push([puzzle, { kind: "puzzle", id: puzzle.id, changed_at: store.changedAtOf(puzzle), data: withoutLocal(puzzle) }]);
+    if (fresh || puzzle.unsynced) send(puzzle, { kind: "puzzle", id: puzzle.id, changed_at: store.changedAtOf(puzzle), data: withoutLocal(puzzle) });
   }
   let rev = fresh ? 0 : account.cloud.rev;
   for (let start = 0; start === 0 || start < sent.length; start += SYNC_PART) {
@@ -978,20 +1004,21 @@ async function take(account, items = []) {
   const games = [], puzzles = [];
   let profile = false;
   const newerHere = (here, changedAt) => here?.unsynced && store.changedAtOf(here) >= changedAt;
-  for (const { kind, changed_at: changedAt, data } of items) {
+  for (const { kind, changed_at: changedAt, data } of Array.isArray(items) ? items : []) {
+    if (!Number.isFinite(changedAt)) continue;
     if (kind === "profile") {
       if (account.unsynced && (account.changedAt || 0) >= changedAt) continue;
-      const { id, site, ...rest } = withoutLocal(data);
-      Object.assign(account, rest, { changedAt });
+      // Only the fields the page knows, each of its kind.
+      Object.assign(account, store.cleanProfileData(data), { changedAt });
       profile = true;
     } else if (kind === "game") {
-      if (typeof data?.id !== "string" || siteOf(data.id) !== account.site || newerHere(state.games.get(data.id), changedAt)) continue;
-      const game = { ...withoutLocal(data), changedAt, unsynced: false };
+      const game = store.cleanGame({ ...data, changedAt, unsynced: false });
+      if (!game || game.site !== account.site || newerHere(state.games.get(game.id), changedAt)) continue;
       state.games.set(game.id, game);
       games.push(game);
     } else if (kind === "puzzle") {
-      if (!validPuzzle(data) || siteOf(data.gameId) !== account.site || newerHere(state.puzzles.get(data.id), changedAt)) continue;
-      const puzzle = { ...withoutLocal(data), changedAt, unsynced: false };
+      const puzzle = store.cleanPuzzle({ ...data, changedAt, unsynced: false });
+      if (!puzzle || siteOf(puzzle.gameId) !== account.site || newerHere(state.puzzles.get(puzzle.id), changedAt)) continue;
       state.puzzles.set(puzzle.id, puzzle);
       puzzles.push(puzzle);
     }
@@ -1102,20 +1129,22 @@ async function importAccounts(file) {
     const id = store.profileId(profile.site, profile.username);
     const existing = await store.loadProfile(id);
     const games = new Map((existing?.games || []).map(game => [game.id, game]));
-    for (const game of entry.games) {
-      if (typeof game?.id !== "string" || !Array.isArray(game.moves)) continue;
+    for (const raw of entry.games) {
+      const game = store.cleanGame(raw);
+      if (!game || game.site !== profile.site) continue;
       const mine = games.get(game.id);
       if (!mine || (mine.status !== "done" && game.status === "done")) games.set(game.id, { ...game, unsynced: true });
     }
     const puzzles = new Map((existing?.puzzles || []).map(puzzle => [puzzle.id, puzzle]));
-    for (const puzzle of entry.puzzles) {
-      if (!validPuzzle(puzzle)) continue;
+    for (const raw of entry.puzzles) {
+      const puzzle = store.cleanPuzzle(raw);
+      if (!puzzle || siteOf(puzzle.gameId) !== profile.site) continue;
       puzzles.set(puzzle.id, { ...store.mergePuzzle(puzzles.get(puzzle.id), puzzle), unsynced: true });
     }
-    // What fetching had reached is the bridge's now; how far this browser
-    // synced with the server is its own.
-    const { sync, cloud: synced, unsynced, ...kept } = profile;
-    await store.save({ ...(existing?.profile || {}), ...kept, id, unsynced: true }, { games: [...games.values()], puzzles: [...puzzles.values()] });
+    // Of the account, the fields the page knows; how far this browser synced
+    // with the server is its own.
+    await store.save({ rating: null, ...(existing?.profile || {}), ...store.cleanProfileData(profile), id, site: profile.site, username: profile.username, unsynced: true },
+      { games: [...games.values()], puzzles: [...puzzles.values()] });
     names[profile.site] = profile.username;
     puzzleCount += entry.puzzles.length;
   }

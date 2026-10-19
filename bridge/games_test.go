@@ -70,6 +70,15 @@ func TestGameRecords(t *testing.T) {
 	if chesscomGame(chesscomSample, "someoneelse") != nil {
 		t.Fatal("only the player's games")
 	}
+	// The page links to the game: only to chess.com, and the id is its last part.
+	for _, address := range []string{"https://evil.example/game/live/123", "javascript:alert(1)//www.chess.com/game/live/1",
+		"http://www.chess.com/game/live/123", "https://www.chess.com/game/live/12/../../x", "https://www.chess.com/game/live/" + strings.Repeat("1", 50)} {
+		raw := chesscomSample
+		raw.URL = address
+		if chesscomGame(raw, "me") != nil {
+			t.Fatalf("a game at %q was taken", address)
+		}
+	}
 	draw := chesscomSample
 	draw.Black = &chesscomPlayer{Username: "Them", Rating: intPointer(1480), Result: "agreed"}
 	if game := chesscomGame(draw, "them"); game == nil || game.Result != "draw" || game.Color != "b" {
@@ -90,6 +99,38 @@ func TestGameRecords(t *testing.T) {
 	aborted.Status = "aborted"
 	if lichessGame(againstComputer, "me") != nil || lichessGame(aborted, "me") != nil {
 		t.Fatal("not against the computer, not aborted")
+	}
+	oddID := raw
+	oddID.ID = "abc/../../x"
+	if lichessGame(oddID, "me") != nil {
+		t.Fatal("a game id that is not one")
+	}
+}
+
+// A site's redirect is followed on the same host only.
+func TestRedirects(t *testing.T) {
+	var elsewhere int
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { elsewhere++ }))
+	defer other.Close()
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/away":
+			http.Redirect(w, r, other.URL+"/secret", http.StatusFound)
+		case "/here":
+			http.Redirect(w, r, "/target", http.StatusFound)
+		case "/target":
+			fmt.Fprint(w, `{"ok":true}`)
+		}
+	}))
+	defer site.Close()
+	var answer struct {
+		OK bool `json:"ok"`
+	}
+	if err := siteJSON(context.Background(), "lichess", site.URL+"/away", &answer); err == nil || elsewhere != 0 {
+		t.Fatalf("a redirect to another host was followed: %v, %d", err, elsewhere)
+	}
+	if err := siteJSON(context.Background(), "lichess", site.URL+"/here", &answer); err != nil || !answer.OK {
+		t.Fatalf("a redirect on the same host: %v %+v", err, answer)
 	}
 }
 

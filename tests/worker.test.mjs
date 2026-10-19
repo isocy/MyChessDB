@@ -638,8 +638,9 @@ const at = async (env, fen) => (await call(env, "GET", "/api/position?fen=" + en
   eq((await sync(minsu.key, { profile: P, since: 0, items: [{ kind: "song", id: "x", changed_at: 1, data: {} }] })).status, 400);
   eq((await sync(minsu.key, { profile: P, since: 0, items: [puzzle("", 1)] })).status, 400, "an item needs its id");
   eq((await sync(minsu.key, { profile: P, since: 0, items: [{ ...puzzle("p", 1), data: "text" }] })).status, 400);
-  eq((await sync(minsu.key, { profile: P, since: 0, items: [puzzle("p", 1, { big: "x".repeat(40_000) })] })).status, 413);
-  eq((await sync(minsu.key, { profile: P, since: 0, items: Array.from({ length: 201 }, (_, i) => puzzle(`p${i}`, 1)) })).status, 400);
+  eq((await sync(minsu.key, { profile: P, since: 0, items: [puzzle("p", 1, { big: "x".repeat(17_000) })] })).status, 413);
+  eq((await sync(minsu.key, { profile: P, since: 0, items: Array.from({ length: 31 }, (_, i) => puzzle(`p${i}`, 1)) })).status, 400);
+  eq((await sync(minsu.key, { profile: P, since: 0, items: [puzzle("p", 1), puzzle("p", 2)] })).status, 400, "an item sent twice");
   eq(env.DB.db.prepare("SELECT COUNT(*) AS n FROM puzzle_store").get().n, 0, "nothing stored by bad requests");
 
   // The computer sends its list the first time.
@@ -665,14 +666,16 @@ const at = async (env, fen) => (await call(env, "GET", "/api/position?fen=" + en
   r = await sync(minsu.key, { profile: P, since: 5, items: [puzzle("g1#9", Date.now() + 86_400_000)] });
   ok(env.DB.db.prepare("SELECT changed_at FROM puzzle_store WHERE id = 'g1#9'").get().changed_at <= Date.now() + 60_000);
 
-  // Pages of 500.
-  for (let start = 0; start < 600; start += 200) {
-    await sync(minsu.key, { profile: P, since: 6, items: Array.from({ length: 200 }, (_, i) => puzzle(`many#${start + i}`, 300)) });
+  // Sent 30 at a time, answered 200 at a time.
+  for (let start = 0; start < 600; start += 30) {
+    eq((await sync(minsu.key, { profile: P, since: 6, items: Array.from({ length: 30 }, (_, i) => puzzle(`many#${start + i}`, 300)) })).status, 200);
   }
   r = await sync(minsu.key, { profile: P, since: 6 });
-  eq([r.data.items.length, r.data.more, r.data.rev], [500, true, 506]);
+  eq([r.data.items.length, r.data.more, r.data.rev], [200, true, 206]);
   r = await sync(minsu.key, { profile: P, since: r.data.rev });
-  eq([r.data.items.length, r.data.more, r.data.rev], [100, false, 606]);
+  eq([r.data.items.length, r.data.more, r.data.rev], [200, true, 406]);
+  r = await sync(minsu.key, { profile: P, since: r.data.rev });
+  eq([r.data.items.length, r.data.more, r.data.rev], [200, false, 606]);
 
   // Each key has its own lists.
   eq((await sync(ADMIN, { profile: P, since: 0 })).data.items, [], "the admin does not see a contributor's puzzles");
@@ -691,9 +694,83 @@ const at = async (env, fen) => (await call(env, "GET", "/api/position?fen=" + en
   // An account the server does not know, though the browser synced it before.
   eq((await sync(minsu.key, { profile: "chesscom:minsu", since: 12 })).data, { missing: true });
 
-  // A revoked key reaches nothing.
+  // The key's totals follow what it keeps.
+  const totals = owner => env.DB.db.prepare("SELECT rows, bytes FROM puzzle_totals WHERE owner = ?").get(owner);
+  const actual = owner => env.DB.db.prepare("SELECT COUNT(*) AS rows, COALESCE(SUM(LENGTH(data)), 0) AS bytes FROM puzzle_store WHERE owner = ?").get(owner);
+  eq({ ...totals(`key:${minsu.id}`) }, { ...actual(`key:${minsu.id}`) }, "totals after sending, deleting and starting again");
+  eq({ ...totals("admin") }, { ...actual("admin") });
+
+  // A revoked key reaches nothing; the admin sees what it keeps and deletes it.
   await call(env, "POST", "/api/keys/revoke", { body: { id: minsu.id }, key: ADMIN });
   eq((await sync(minsu.key, { profile: P, since: 0 })).status, 401);
+  const listed = (await call(env, "GET", "/api/keys", { key: ADMIN })).data.keys.find(key => key.id === minsu.id);
+  eq(listed.puzzle_rows, 2, "the account and its one puzzle");
+  eq((await call(env, "POST", "/api/keys/puzzles/delete", { body: { id: minsu.id }, key: minsu.key })).status, 403, "admin only");
+  eq((await call(env, "POST", "/api/keys/puzzles/delete", { body: { id: minsu.id }, key: ADMIN })).data, { deleted: 2 });
+  eq([actual(`key:${minsu.id}`).rows, totals(`key:${minsu.id}`)], [0, undefined]);
+  eq(actual("admin").rows, 1, "the admin's own lists stay");
+}
+
+// --- puzzles: limits per key, and a few queries per request ---------------
+{
+  const base = makeEnv();
+  // Counts what one request asks of the database: each query, and a batch as one.
+  let queries = 0, biggestBatch = 0;
+  const wrap = statement => ({
+    inner: statement,
+    bind: (...params) => wrap(statement.bind(...params)),
+    first: (...args) => { queries++; return statement.first(...args); },
+    all: () => { queries++; return statement.all(); },
+    run: () => { queries++; return statement.run(); },
+  });
+  const env = { ...base, DB: {
+    db: base.DB.db,
+    prepare: sql => wrap(base.DB.prepare(sql)),
+    batch: statements => { queries++; biggestBatch = Math.max(biggestBatch, statements.length); return base.DB.batch(statements.map(s => s.inner)); },
+  } };
+  const kim = (await call(env, "POST", "/api/keys", { body: { label: "Kim" }, key: ADMIN })).data;
+  const owner = `key:${kim.id}`;
+  const sync = body => call(env, "POST", "/api/puzzles/sync", { body, key: kim.key });
+  const puzzles = (from, count, changed_at, extra = {}) => Array.from({ length: count }, (_, i) => ({ kind: "puzzle", id: `p${from + i}`, changed_at, data: { n: from + i, ...extra } }));
+  const P = "lichess:kim";
+
+  queries = 0;
+  let r = await sync({ profile: P, since: 0, items: puzzles(0, 30, 500) });
+  eq(r.status, 200);
+  ok(queries <= 12 && biggestBatch <= 32, `30 new puzzles: ${queries} queries, a batch of ${biggestBatch}`);
+  // All 30 sent again, older than the server's: none kept, all 30 answered, still a few queries.
+  queries = 0; biggestBatch = 0;
+  r = await sync({ profile: P, since: r.data.rev, items: puzzles(0, 30, 100, { stale: true }) });
+  eq([r.data.items.length, r.data.items.every(item => item.changed_at === 500 && !item.data.stale)], [30, true]);
+  ok(queries <= 12 && biggestBatch === 0, `30 refused: ${queries} queries`);
+
+  // At most 10 accounts per key; deleting one makes room.
+  for (let i = 1; i < 10; i++) eq((await sync({ profile: `lichess:kim${i}`, since: 0 })).status, 200);
+  r = await sync({ profile: "lichess:kim10", since: 0 });
+  eq([r.status, r.data.code], [413, "PUZZLE_LIMIT"], "an 11th account");
+  await call(env, "POST", "/api/puzzles/forget", { body: { profile: "lichess:kim9" }, key: kim.key });
+  eq((await sync({ profile: "lichess:kim10", since: 0 })).status, 200);
+
+  // Rows and bytes kept: new items past the limit are refused, changes of kept ones are not.
+  const totals = () => env.DB.db.prepare("SELECT rows, bytes FROM puzzle_totals WHERE owner = ?").get(owner);
+  const real = { ...totals() };
+  env.DB.db.prepare("UPDATE puzzle_totals SET rows = ? WHERE owner = ?").run(19_999, owner);
+  eq((await sync({ profile: P, since: 0, items: puzzles(100, 2, 600) })).data.code, "PUZZLE_LIMIT", "two rows past 20,000");
+  eq((await sync({ profile: P, since: 0, items: puzzles(0, 2, 700) })).status, 200, "changing kept ones");
+  eq((await sync({ profile: P, since: 0, items: puzzles(100, 1, 600) })).status, 200, "the last row that fits");
+  env.DB.db.prepare("UPDATE puzzle_totals SET rows = ?, bytes = ? WHERE owner = ?").run(real.rows + 1, 20 * 1024 * 1024 - 5, owner);
+  eq((await sync({ profile: P, since: 0, items: puzzles(200, 1, 600) })).data.code, "PUZZLE_LIMIT", "past 20 MB");
+  env.DB.db.prepare("UPDATE puzzle_totals SET bytes = ? WHERE owner = ?").run(real.bytes, owner);
+
+  // Items written and requests an hour.
+  const hour = Math.floor(Date.now() / 3600000);
+  env.DB.db.prepare("INSERT OR REPLACE INTO rate_limits (bucket, hour, count) VALUES (?, ?, ?)").run(`puzzlewrites:${owner}:${hour}`, hour, 2999);
+  r = await sync({ profile: P, since: 0, items: puzzles(300, 2, 600) });
+  eq([r.status, r.data.code], [429, "PUZZLE_RATE_LIMIT"], "3,000 items written an hour");
+  eq((await sync({ profile: P, since: 0 })).status, 200, "asking without sending goes on");
+  env.DB.db.prepare("UPDATE rate_limits SET count = ? WHERE bucket = ?").run(300, `puzzles:${owner}:${hour}`);
+  eq((await sync({ profile: P, since: 0 })).data.code, "PUZZLE_RATE_LIMIT", "300 requests an hour");
+  eq((await call(env, "GET", "/api/puzzles/profiles", { key: ADMIN })).status, 200, "other keys go on");
 }
 
 // --- API answers are never sniffed as another type -------------------------

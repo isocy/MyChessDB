@@ -2444,8 +2444,21 @@ async function renderKeys() {
     const li=document.createElement("li");
     const label=document.createElement("span");
     label.className="admin-item-text";
-    label.textContent=`${key.label} · ${key.entries} saved · ${key.revoked_at?"revoked":"active"}`;
+    label.textContent=`${key.label} · ${key.entries} saved${key.puzzle_rows?` · ${key.puzzle_rows} puzzle rows`:""} · ${key.revoked_at?"revoked":"active"}`;
     li.appendChild(label);
+    // What a revoked key kept of its puzzle lists can go.
+    if(key.revoked_at && key.puzzle_rows) {
+      const button=document.createElement("button");
+      button.textContent="Delete its puzzles";
+      button.onclick=async()=>{
+        try {
+          const result=await api("/api/keys/puzzles/delete",{body:{id:key.id}});
+          adminNote(`Deleted ${result.deleted} puzzle rows of key "${key.label}".`);
+          await renderKeys();
+        } catch(error) { adminNote(error.message); }
+      };
+      li.appendChild(button);
+    }
     if(!key.revoked_at) {
       for(const [text,demote] of [["Revoke",false],["Revoke + unverify entries",true]]) {
         const button=document.createElement("button");

@@ -205,7 +205,7 @@ The second view of the page, **Puzzles from your games** (linked at the top
 of the panel; the address ends in `#puzzles`), makes puzzles from a player's
 own games: positions where one move was clearly better than every other and
 the player missed it. Finding them needs nothing from this site's server: the
-engine bridge (1.0.8 or newer) fetches the games from chess.com's and
+engine bridge (1.0.9 or newer) fetches the games from chess.com's and
 Lichess's public APIs, analyses them with Stockfish 19 and finds the puzzles
 on the player's computer, and the puzzles and how they were solved are kept
 in the browser (IndexedDB). **Export** and **Import** under *Settings and
@@ -348,12 +348,33 @@ Live analysis only runs while the best moves are shown.
   as a mark). The first sync with a key sends everything the browser has,
   also what was there before logging in; logged out, the browser keeps its
   copy and works on its own. A revoked key reaches its lists no longer; they
-  stay in the database. The admin's backup does not include them.
+  stay in the database until the admin deletes them (**Delete its puzzles**
+  in the list of contributor keys, which also shows each key's puzzle rows).
+  The admin's backup does not include them.
+- **Limits per key**, so that a key that leaks cannot use up what the free
+  plan allows the whole site: 300 puzzle requests and 3,000 items written an
+  hour, 10 accounts, 20,000 rows and 20 MB kept (`puzzle_totals`,
+  `migrations/0006_puzzle_totals.sql`, kept up to date by the Worker), at
+  most 16 KB an item. A request carries 30 items at most and is answered 200
+  at a time, and it makes a dozen queries at most (D1 allows 50 a request on
+  the free plan): what the server has of the items sent is read in one query.
+  What the server would refuse stays in the browser rather than stopping the
+  rest; a limit reached shows under the summary ("Not synced with the
+  server: ...").
+- What comes from elsewhere (an imported file, the server, whatever answers
+  on the bridge's port) is rebuilt from the fields the page knows, each of
+  its kind (`cleanPuzzle`, `cleanGame`, `cleanProfileData` in
+  `web/puzzlestore.js`), and everything put into the page's HTML is escaped;
+  "open the game" links only to `https://lichess.org/` or
+  `https://www.chess.com/`.
 - The server's API for it (key only): `GET /api/puzzles/profiles` (the key's
-  accounts), `POST /api/puzzles/sync` (`{profile, since, items}`, at most 200
-  items in, 500 out; `{gone}` for an account deleted elsewhere, `{missing}`
+  accounts), `POST /api/puzzles/sync` (`{profile, since, items}`, at most 30
+  items in, 200 out; `{gone}` for an account deleted elsewhere, `{missing}`
   for one to send again) and `POST /api/puzzles/forget` (`{profile}`);
-  `/api/session` tells whose lists the key reaches (`owner`).
+  `/api/session` tells whose lists the key reaches (`owner`). For the admin:
+  `POST /api/keys/puzzles/delete` (`{id}`).
+- On a computer others use too: log out, then **Delete these accounts'
+  data** removes only that browser's copy.
 - **Delete this puzzle**, offered once the puzzle on the board is solved or
   its solution shown, takes it out of the list and shows the next one. It
   stays in the browser, marked deleted (with how it was solved), so the
@@ -455,10 +476,11 @@ npx wrangler secret put ADMIN_TOKEN
 
 When a later version adds a file to `migrations/` (as the per-engine storage
 did with `0002_engines.sql`, and the puzzles kept for keys with
-`0005_puzzles.sql`), download a backup from the admin tools first, then run
-the first two of these commands again, one right after the other: between
-them the old site code meets the new tables and saving fails.
-(`0005_puzzles.sql` only adds a table, so there the old code goes on working.)
+`0005_puzzles.sql` and `0006_puzzle_totals.sql`), download a backup from the
+admin tools first, then run the first two of these commands again, one right
+after the other: between them the old site code meets the new tables and
+saving fails. (`0005` and `0006` only add tables, so there the old code goes
+on working.)
 
 `deploy` prints the site address, something like
 `https://mychessdb.<your-subdomain>.workers.dev`. For `ADMIN_TOKEN` enter a
@@ -635,7 +657,7 @@ kept in the repository).
 plus `SHA256SUMS`. To rebuild after changing `bridge/*.go`, install Go and run
 `scripts\build_bridge.ps1` (Windows) or `sh scripts/build_bridge.sh`, then
 deploy. Builds are reproducible: the same Go version gives byte-identical
-files. The current ones (1.0.8) were built with Go 1.24.7.
+files. The current ones (1.0.9) were built with Go 1.24.7.
 
 The site names the bridge version it expects (`BRIDGE_MIN_VERSION` in
 `web/app.js`). An older bridge keeps working, and the site shows an **Update**
@@ -643,8 +665,13 @@ button with the install command. Bridges before 1.0.4 do not report the search
 as it goes, so with them the page is not updated during an analysis and Stop
 saves nothing. Bridges before 1.0.5 cannot hold an analysis that is waiting in
 the queue; with them its Pause button stays disabled. Bridges before 1.0.6 have
-no live analysis, and bridges before 1.0.8 cannot find puzzles (1.0.7, the
-first with puzzles, gave them only a share of the processor).
+no live analysis, and bridges before 1.0.9 cannot find puzzles (1.0.7, the
+first with puzzles, gave them only a share of the processor; 1.0.8 followed a
+site's redirects anywhere, took a chess.com game's address as it came, and
+stopped altogether on a game the finder failed on). 1.0.9 follows a site's
+redirects on the same host only, takes only chess.com addresses and Lichess
+ids of the expected shape, and marks a game the finder fails on as failed
+(or stops that account's update, with the reason) instead of stopping.
 
 If you deploy from another copy of the repository, make sure `web/bridge/` is
 there (commit it, or build it), otherwise the install command has nothing to
@@ -687,13 +714,21 @@ Automated tests (Linux, real browser):
 - importing the real `saved_positions.json` (492 entries, none skipped)
 - puzzles in the page (`tests/puzzles.test.mjs`): when puzzles come back;
   deleted puzzles (never due, and merging an import's copy); when each one
-  last changed
+  last changed; records from a file, the server or the bridge (unknown
+  fields dropped, text where a number belongs, a bad move, FEN or score, a
+  link that is not to the game, an account's fields, no prototype from a
+  file)
 - puzzles kept for keys (`tests/worker.test.mjs`, Windows 11): no key or a
   wrong or revoked one, bad requests, the first sync, another browser getting
   everything and then only what changed, an older change losing (and the
-  newer one sent back), a clock far ahead, pages of 500, each key's lists
-  apart, an account deleted (other browsers told, revs going on when it is
-  sent again), an account the server does not know
+  newer one sent back), a clock far ahead, 30 items in and 200 out, each
+  key's lists apart, an account deleted (other browsers told, revs going on
+  when it is sent again), an account the server does not know, the key's
+  totals following what it keeps, the admin deleting a revoked key's
+  puzzles; the limits per key (an 11th account, rows and bytes, items
+  written and requests an hour), and the queries one request makes (counted
+  with a stand-in for D1: a dozen at most for 30 new items and for 30 the
+  server refuses)
 - puzzles in the engine bridge (`npm run test:bridge`, Windows 11): the chess
   rules against the same perft counts as chesslib.js; Lichess's judgements and
   both kinds of puzzle with a scripted engine; the searches with a stand-in
@@ -704,7 +739,10 @@ Automated tests (Linux, real browser):
   month chess.com cannot find; an update to the end (rating, games, newest
   first, collecting, a second update analysing nothing twice, a player who
   is not there, forgetting), two accounts taking turns, Stop, and carrying on
-  after the bridge was closed
+  after the bridge was closed; a site's redirect to another host not
+  followed (one on the same host is), chess.com addresses and Lichess ids not
+  of the expected shape dropped, and a finder that fails unforeseen (a
+  panic) rejecting the game
 
 Checked by hand on the live site, Windows 11 with Firefox:
 
@@ -772,7 +810,7 @@ Puzzles, checked by hand on Windows 11:
 
 Not yet run anywhere:
 
-- bridge 1.0.8 on macOS and Linux, and its install over 1.0.6 with the
+- bridge 1.0.9 on macOS and Linux, and its install over 1.0.6 with the
   install command (on Windows it was run from a build, not installed)
 - the puzzle animations seen on screen (the desktop app's browser was hidden
   while it was tested, so the animations were checked to start, not watched)

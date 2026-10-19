@@ -20,6 +20,8 @@
 // marks what changed here and has not reached the server yet (only for those
 // logged in with a key; see the sync in puzzles.js).
 
+import { parseFen } from "./chesslib.js";
+
 export const DAY = 86_400_000;
 export const REVIEW_DAYS = [1, 3, 7];
 export const MASTER_AFTER = REVIEW_DAYS.length + 1;
@@ -116,6 +118,105 @@ export function pickPractice(puzzles, recent = []) {
   const blocked = new Set(recent.slice(-RETRY_GAP));
   const pool = active.filter(puzzle => !blocked.has(puzzle.id));
   return (pool.length ? pool : active).sort((a, b) => reviewOf(a).due - reviewOf(b).due)[0] || null;
+}
+
+// ------------------------------------------------ records from outside ----
+// Puzzles, games and accounts also come from an imported file, from the
+// server (with a key) and from the engine bridge. Each is rebuilt from the
+// fields the page knows, each of the right type, and dropped when one it
+// needs is missing; so nothing else, and no text where a number belongs,
+// reaches the page.
+
+const UCI = /^[a-h][1-8][a-h][1-8][qrbn]?$/;
+const USERNAME = /^[A-Za-z0-9][A-Za-z0-9_-]{1,29}$/;
+const JUDGEMENTS = ["Inaccuracy", "Mistake", "Blunder"];
+const isNumber = value => typeof value === "number" && Number.isFinite(value);
+const number = (value, fallback = 0) => isNumber(value) ? value : fallback;
+const count = value => isNumber(value) ? Math.max(0, Math.round(value)) : 0;
+const text = (value, most) => typeof value === "string" && value.length <= most ? value : "";
+
+function cleanScore(score) {
+  if (Number.isInteger(score?.mate)) return { mate: score.mate };
+  if (isNumber(score?.cp)) return { cp: Math.round(score.cp) };
+  return null;
+}
+
+/** The address of a game on Lichess or chess.com, or "" for anything else. */
+export function safeGameUrl(address) {
+  try {
+    const url = new URL(address);
+    return url.protocol === "https:" && (url.hostname === "lichess.org" || url.hostname === "www.chess.com") ? url.href : "";
+  } catch (error) {
+    return "";
+  }
+}
+
+/** A puzzle as the page keeps it, or null. */
+export function cleanPuzzle(raw) {
+  if (raw === null || typeof raw !== "object") return null;
+  const id = text(raw.id, 120), gameId = text(raw.gameId, 120), score = cleanScore(raw.score);
+  if (!id || !gameId.includes(":") || !score || (raw.color !== "w" && raw.color !== "b") || !UCI.test(raw.lastMove)) return null;
+  if (!Array.isArray(raw.solution) || !raw.solution.length || raw.solution.length > 60 || !raw.solution.every(move => UCI.test(move))) return null;
+  try { parseFen(raw.fenBefore); } catch (error) { return null; }
+  const puzzle = {
+    id, gameId, key: text(raw.key, 120), ply: Math.max(1, count(raw.ply)), color: raw.color,
+    fenBefore: raw.fenBefore, lastMove: raw.lastMove, solution: [...raw.solution],
+    kind: text(raw.kind, 20), source: text(raw.source, 20), score,
+    playedAt: number(raw.playedAt), foundAt: number(raw.foundAt),
+  };
+  if (UCI.test(raw.played)) puzzle.played = raw.played;
+  if (cleanScore(raw.playedScore)) puzzle.playedScore = cleanScore(raw.playedScore);
+  if (JUDGEMENTS.includes(raw.judgement)) puzzle.judgement = raw.judgement;
+  if (raw.review !== null && typeof raw.review === "object") {
+    const review = raw.review;
+    puzzle.review = {
+      streak: count(review.streak), due: number(review.due), attempts: count(review.attempts), misses: count(review.misses),
+      lastAt: number(review.lastAt), results: /^[WL]{0,10}$/.test(review.results) ? review.results : "",
+    };
+  }
+  if (raw.mastered === true) puzzle.mastered = true;
+  if (typeof raw.deleted === "boolean") { puzzle.deleted = raw.deleted; puzzle.deletedChangedAt = number(raw.deletedChangedAt); }
+  if (isNumber(raw.changedAt)) puzzle.changedAt = raw.changedAt;
+  if (raw.unsynced === true) puzzle.unsynced = true;
+  return puzzle;
+}
+
+/** A game as the page keeps it, or null. */
+export function cleanGame(raw) {
+  if (raw === null || typeof raw !== "object") return null;
+  const id = text(raw.id, 120), site = raw.site;
+  if ((site !== "chesscom" && site !== "lichess") || !id.startsWith(`${site}:`)) return null;
+  const moves = Array.isArray(raw.moves) && raw.moves.length <= 1000 && raw.moves.every(move => UCI.test(move)) ? [...raw.moves] : [];
+  const game = {
+    id, site, url: safeGameUrl(raw.url), playedAt: number(raw.playedAt), color: raw.color === "b" ? "b" : "w",
+    rating: count(raw.rating), opponent: text(raw.opponent, 60) || "?",
+    opponentRating: isNumber(raw.opponentRating) ? Math.round(raw.opponentRating) : null,
+    result: text(raw.result, 10), moves, status: text(raw.status, 10), puzzles: count(raw.puzzles),
+    analysedAt: number(raw.analysedAt), analysedWith: text(raw.analysedWith, 20),
+  };
+  if (text(raw.error, 300)) game.error = raw.error;
+  if (isNumber(raw.changedAt)) game.changedAt = raw.changedAt;
+  if (raw.unsynced === true) game.unsynced = true;
+  return game;
+}
+
+/** The fields of an account (profile) that may come from elsewhere. */
+export function cleanProfileData(raw) {
+  const out = {};
+  if (raw === null || typeof raw !== "object") return out;
+  if (USERNAME.test(raw.username)) out.username = raw.username;
+  if (isNumber(raw.rating) && raw.rating > 0) out.rating = Math.round(raw.rating);
+  if (isNumber(raw.ratingAt)) out.ratingAt = raw.ratingAt;
+  if (isNumber(raw.createdAt)) out.createdAt = raw.createdAt;
+  if (isNumber(raw.changedAt)) out.changedAt = raw.changedAt;
+  const stats = raw.bridge;
+  if (stats !== null && typeof stats === "object") {
+    out.bridge = {
+      games: count(stats.games), counted: count(stats.counted), analysed: count(stats.analysed),
+      pending: count(stats.pending), oldest: number(stats.oldest), complete: stats.complete === true,
+    };
+  }
+  return out;
 }
 
 // ------------------------------------------------------------- storage ----

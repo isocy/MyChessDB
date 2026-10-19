@@ -32,7 +32,27 @@ var (
 	chesscomBase = "https://api.chess.com/pub"
 )
 
-var gamesClient = &http.Client{Timeout: 2 * time.Minute}
+var gamesClient = &http.Client{Timeout: 2 * time.Minute, CheckRedirect: sameSiteRedirect}
+
+// sameSiteRedirect follows a site's redirects only on the same scheme and
+// host, so that an answer cannot send the bridge anywhere else (another
+// site, or a service on this computer or its network).
+func sameSiteRedirect(request *http.Request, via []*http.Request) error {
+	if len(via) >= 5 {
+		return errors.New("too many redirects")
+	}
+	if first := via[0].URL; request.URL.Scheme != first.Scheme || request.URL.Host != first.Host {
+		return fmt.Errorf("a redirect to %s was not followed", request.URL.Host)
+	}
+	return nil
+}
+
+// A chess.com game's address, whose last part is the game's id, and a
+// Lichess game's id (the site builds the game's address from it).
+var (
+	chesscomGameURL = regexp.MustCompile(`^https://www\.chess\.com/game/(?:live|daily)/([A-Za-z0-9-]{1,40})$`)
+	lichessGameID   = regexp.MustCompile(`^[A-Za-z0-9]{1,20}$`)
+)
 
 var usernameShape = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{1,29}$`)
 
@@ -210,7 +230,12 @@ type chesscomRaw struct {
 }
 
 func chesscomGame(raw chesscomRaw, username string) *gameRecord {
-	if raw.Rules != "chess" || raw.TimeClass != "rapid" || !raw.Rated || raw.White == nil || raw.Black == nil || raw.URL == "" {
+	if raw.Rules != "chess" || raw.TimeClass != "rapid" || !raw.Rated || raw.White == nil || raw.Black == nil {
+		return nil
+	}
+	// The site links to the game, and its id is the address's last part.
+	address := chesscomGameURL.FindStringSubmatch(raw.URL)
+	if address == nil {
 		return nil
 	}
 	if raw.InitialSetup != "" {
@@ -243,7 +268,7 @@ func chesscomGame(raw chesscomRaw, username string) *gameRecord {
 		opponent = "?"
 	}
 	return &gameRecord{
-		ID: "chesscom:" + raw.URL[strings.LastIndex(raw.URL, "/")+1:], Site: "chesscom", URL: raw.URL,
+		ID: "chesscom:" + address[1], Site: "chesscom", URL: raw.URL,
 		PlayedAt: raw.EndTime * 1000, Color: color, Rating: *me.Rating, Opponent: opponent, OpponentRating: them.Rating,
 		Result: result, Moves: moves,
 	}
@@ -280,7 +305,8 @@ type lichessRaw struct {
 var lichessUnplayed = map[string]bool{"created": true, "started": true, "aborted": true, "noStart": true, "unknownFinish": true}
 
 func lichessGame(raw lichessRaw, username string) *gameRecord {
-	if raw.Variant != "standard" || raw.Speed != "rapid" || !raw.Rated || lichessUnplayed[raw.Status] || raw.InitialFen != "" {
+	if raw.Variant != "standard" || raw.Speed != "rapid" || !raw.Rated || lichessUnplayed[raw.Status] || raw.InitialFen != "" ||
+		!lichessGameID.MatchString(raw.ID) {
 		return nil
 	}
 	idOf := func(player lichessPlayer) string {

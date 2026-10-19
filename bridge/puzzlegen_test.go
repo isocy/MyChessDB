@@ -233,3 +233,14 @@ func TestMatePuzzleFromLichessEvaluations(t *testing.T) {
 		t.Fatal("an illegal move")
 	}
 }
+
+// A failure the finder did not foresee (a panic) rejects the game instead of
+// stopping the bridge.
+func TestFinderFailureRejectsTheGame(t *testing.T) {
+	panicking := func(ctx context.Context, request searchRequest) (searchResult, error) { panic("something unforeseen") }
+	_, err := analyseSafely(context.Background(), gameInput{Color: "w", Moves: strings.Fields("e2e4 e7e5 g1f3")},
+		panicking, puzzleEfforts["quick"], nil)
+	if !errors.Is(err, errGameRejected) || !strings.Contains(err.Error(), "something unforeseen") {
+		t.Fatalf("the game is rejected: %v", err)
+	}
+}
